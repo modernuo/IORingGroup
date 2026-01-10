@@ -33,16 +33,12 @@
         <None Include="..\LICENSE" Pack="true" PackagePath="" />
     </ItemGroup>
 
-    <ItemGroup Condition="Exists('runtimes\win-x64\native\ioring.dll')">
-        <Content Include="runtimes\win-x64\native\ioring.dll">
-            <Pack>true</Pack>
-            <PackagePath>runtimes/win-x64/native</PackagePath>
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
+    <ItemGroup>
+        <InternalsVisibleTo Include="IORingGroup.Tests" />
     </ItemGroup>
 
     <ItemGroup>
-        <InternalsVisibleTo Include="IORingGroup.Tests" />
+      <Folder Include="runtimes\win-x64\native\" />
     </ItemGroup>
 
     <PropertyGroup Condition="'$(Configuration)' == 'Debug'">

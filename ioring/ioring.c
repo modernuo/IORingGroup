@@ -7,6 +7,7 @@
 #include <mswsock.h>
 #include <stdlib.h>
 #include <string.h>
+#include <intrin.h>  // For _mm_pause()
 
 /*
  * Windows IORing Implementation
@@ -29,6 +30,42 @@ static __declspec(thread) int last_error = 0;
 // Note: We always use RIO backend for socket operations since Windows IoRing
 // doesn't support sockets. The ioring_backend enum is retained for API
 // compatibility and future expansion.
+
+// Poll mask translation between Linux io_uring style and Windows WSAPoll
+// Linux poll values (used by our API):
+#define LINUX_POLLIN    0x0001
+#define LINUX_POLLPRI   0x0002
+#define LINUX_POLLOUT   0x0004
+#define LINUX_POLLERR   0x0008
+#define LINUX_POLLHUP   0x0010
+#define LINUX_POLLNVAL  0x0020
+
+// Windows poll values (used by WSAPoll):
+// POLLRDNORM = 0x0100, POLLIN = POLLRDNORM
+// POLLWRNORM = 0x0010, POLLOUT = POLLWRNORM
+// POLLERR = 0x0001, POLLHUP = 0x0002, POLLNVAL = 0x0004
+
+static SHORT linux_to_windows_poll(uint32_t linux_mask) {
+    SHORT win_mask = 0;
+    if (linux_mask & LINUX_POLLIN)  win_mask |= POLLRDNORM;  // 0x0001 -> 0x0100
+    if (linux_mask & LINUX_POLLPRI) win_mask |= POLLRDBAND;  // 0x0002 -> 0x0200
+    if (linux_mask & LINUX_POLLOUT) win_mask |= POLLWRNORM;  // 0x0004 -> 0x0010
+    if (linux_mask & LINUX_POLLERR) win_mask |= POLLERR;     // 0x0008 -> 0x0001
+    if (linux_mask & LINUX_POLLHUP) win_mask |= POLLHUP;     // 0x0010 -> 0x0002
+    if (linux_mask & LINUX_POLLNVAL) win_mask |= POLLNVAL;   // 0x0020 -> 0x0004
+    return win_mask;
+}
+
+static uint32_t windows_to_linux_poll(SHORT win_mask) {
+    uint32_t linux_mask = 0;
+    if (win_mask & POLLRDNORM) linux_mask |= LINUX_POLLIN;   // 0x0100 -> 0x0001
+    if (win_mask & POLLRDBAND) linux_mask |= LINUX_POLLPRI;  // 0x0200 -> 0x0002
+    if (win_mask & POLLWRNORM) linux_mask |= LINUX_POLLOUT;  // 0x0010 -> 0x0004
+    if (win_mask & POLLERR)    linux_mask |= LINUX_POLLERR;  // 0x0001 -> 0x0008
+    if (win_mask & POLLHUP)    linux_mask |= LINUX_POLLHUP;  // 0x0002 -> 0x0010
+    if (win_mask & POLLNVAL)   linux_mask |= LINUX_POLLNVAL; // 0x0004 -> 0x0020
+    return linux_mask;
+}
 
 // Internal ring structure
 struct ioring {
@@ -354,13 +391,20 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
                 // Set new socket to non-blocking
                 u_long mode = 1;
                 ioctlsocket(client, FIONBIO, &mode);
+                // Set SO_LINGER to 0 to avoid TIME_WAIT accumulation
+                struct linger lin = { 1, 0 };
+                setsockopt(client, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
                 complete_op(ring, sqe->user_data, (int32_t)client, 0);
                 return 1;
             }
             err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) {
                 // Defer accept - add to pending
-                add_pending_op(ring, sqe->user_data, sqe->opcode, fd, NULL, 0, 0, addr, addrlen ? *addrlen : 0);
+                if (!add_pending_op(ring, sqe->user_data, sqe->opcode, fd, NULL, 0, 0, addr, addrlen ? *addrlen : 0)) {
+                    // Pending queue full - return error instead of silent drop
+                    complete_op(ring, sqe->user_data, -WSAENOBUFS, 0);
+                    return 1;
+                }
                 return 0;
             }
             complete_op(ring, sqe->user_data, -err, 0);
@@ -393,11 +437,7 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
                 return 1;
             }
             err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                // Defer send
-                add_pending_op(ring, sqe->user_data, sqe->opcode, fd, (void*)buf, len, flags, NULL, 0);
-                return 0;
-            }
+            // Don't defer - return error immediately, let caller use poll to retry
             complete_op(ring, sqe->user_data, -err, 0);
             return 1;
         }
@@ -411,11 +451,7 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
                 return 1;
             }
             err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                // Defer recv
-                add_pending_op(ring, sqe->user_data, sqe->opcode, fd, buf, len, flags, NULL, 0);
-                return 0;
-            }
+            // Don't defer - return error immediately, let caller use poll to retry
             complete_op(ring, sqe->user_data, -err, 0);
             return 1;
         }
@@ -458,10 +494,12 @@ static void process_pending_ops(ioring_t* ring) {
 
         switch (op->opcode) {
             case IORING_OP_POLL_ADD: {
-                WSAPOLLFD pfd = { op->fd, (SHORT)op->flags, 0 };
+                // Translate Linux-style poll mask to Windows poll mask
+                WSAPOLLFD pfd = { op->fd, linux_to_windows_poll(op->flags), 0 };
                 int result = WSAPoll(&pfd, 1, 0);
                 if (result > 0) {
-                    complete_op(ring, op->user_data, pfd.revents, 0);
+                    // Translate Windows revents back to Linux-style for the caller
+                    complete_op(ring, op->user_data, windows_to_linux_poll(pfd.revents), 0);
                     completed = TRUE;
                 } else if (result < 0) {
                     complete_op(ring, op->user_data, -WSAGetLastError(), 0);
@@ -475,6 +513,9 @@ static void process_pending_ops(ioring_t* ring) {
                 if (client != INVALID_SOCKET) {
                     u_long mode = 1;
                     ioctlsocket(client, FIONBIO, &mode);
+                    // Set SO_LINGER to 0 to avoid TIME_WAIT accumulation
+                    struct linger lin = { 1, 0 };
+                    setsockopt(client, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
                     complete_op(ring, op->user_data, (int32_t)client, 0);
                     completed = TRUE;
                 } else {
@@ -572,11 +613,7 @@ IORING_API int ioring_submit_and_wait(ioring_t* ring, uint32_t wait_nr) {
     // If we need more completions, poll pending operations
     while (ioring_cq_ready(ring) < wait_nr && ring->pending_count > 0) {
         process_pending_ops(ring);
-
-        if (ioring_cq_ready(ring) < wait_nr) {
-            // Brief sleep to avoid busy-waiting
-            Sleep(1);
-        }
+        // No sleep - let caller control timing
     }
 
     return submitted;
@@ -600,6 +637,7 @@ IORING_API uint32_t ioring_wait_cqe(ioring_t* ring, ioring_cqe_t* cqes, uint32_t
 
     DWORD start = GetTickCount();
     DWORD elapsed = 0;
+    int spin_count = 0;
 
     while (ioring_cq_ready(ring) < min_complete) {
         // Process all pending operations
@@ -610,7 +648,13 @@ IORING_API uint32_t ioring_wait_cqe(ioring_t* ring, ioring_cqe_t* cqes, uint32_t
         elapsed = GetTickCount() - start;
         if (timeout_ms >= 0 && elapsed >= (DWORD)timeout_ms) break;
 
-        Sleep(1);
+        // Spin briefly before yielding (reduces latency for quick operations)
+        if (++spin_count < 100) {
+            _mm_pause();  // CPU hint for spin-wait
+        } else {
+            spin_count = 0;
+            SwitchToThread();  // Yield without adding latency like Sleep(1)
+        }
     }
 
     return ioring_peek_cqe(ring, cqes, count);

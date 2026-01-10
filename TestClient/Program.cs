@@ -1,25 +1,55 @@
-using System.Net;
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2025, ModernUO
+
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 
 namespace TestClient;
 
-/// <summary>
-/// Simple TCP client for testing the IORingGroup echo server.
-/// </summary>
 public class Program
 {
     private const int DefaultPort = 5000;
     private const string DefaultHost = "127.0.0.1";
 
-    // Flag to pause background receiver during stress test
-    private static volatile bool _inStressTest = false;
-
     public static async Task Main(string[] args)
     {
-        var host = args.Length > 0 ? args[0] : DefaultHost;
-        var port = args.Length > 1 && int.TryParse(args[1], out var p) ? p : DefaultPort;
+        var host = DefaultHost;
+        var port = DefaultPort;
+        var benchmarkCount = 0;
+        var benchmarkConnections = 1;
 
+        for (var i = 0; i < args.Length; i++)
+        {
+            if ((args[i] == "--host" || args[i] == "-h") && i + 1 < args.Length)
+            {
+                host = args[++i];
+            }
+            else if ((args[i] == "--port" || args[i] == "-P") && i + 1 < args.Length)
+            {
+                port = int.Parse(args[++i]);
+            }
+            else if ((args[i] == "--benchmark" || args[i] == "-b") && i + 1 < args.Length)
+            {
+                benchmarkCount = int.Parse(args[++i]);
+            }
+            else if ((args[i] == "--connections" || args[i] == "-c") && i + 1 < args.Length)
+            {
+                benchmarkConnections = int.Parse(args[++i]);
+            }
+        }
+
+        if (benchmarkCount > 0)
+        {
+            await RunBenchmark(host, port, benchmarkCount, benchmarkConnections);
+            return;
+        }
+
+        await RunInteractive(host, port);
+    }
+
+    private static async Task RunInteractive(string host, int port)
+    {
         Console.WriteLine("IORingGroup Test Client");
         Console.WriteLine($"Connecting to {host}:{port}...");
         Console.WriteLine("Commands:");
@@ -37,12 +67,7 @@ public class Program
 
             using var stream = client.GetStream();
             var buffer = new byte[4096];
-            using var cts = new CancellationTokenSource();
 
-            // Start receive task for interactive mode
-            var receiveTask = ReceiveAsync(stream, buffer, cts.Token);
-
-            // Read user input and send
             while (true)
             {
                 Console.Write("> ");
@@ -55,7 +80,6 @@ public class Program
                     input.Equals("exit", StringComparison.OrdinalIgnoreCase))
                 {
                     Console.WriteLine("Disconnecting...");
-                    cts.Cancel();
                     break;
                 }
 
@@ -63,11 +87,7 @@ public class Program
                 {
                     if (int.TryParse(input.AsSpan(7), out var count))
                     {
-                        // Pause background receiver and run stress test
-                        _inStressTest = true;
-                        await Task.Delay(50); // Give receiver time to pause
-                        await StressTest(stream, count);
-                        _inStressTest = false;
+                        await StressTest(stream, buffer, count);
                     }
                     else
                     {
@@ -79,7 +99,11 @@ public class Program
                 // Send the message
                 var data = Encoding.UTF8.GetBytes(input);
                 await stream.WriteAsync(data);
-                Console.WriteLine($"Sent: {input} ({data.Length} bytes)");
+
+                // Wait for response
+                var bytesRead = await stream.ReadAsync(buffer);
+                var response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                Console.WriteLine($"Response: {response}");
             }
         }
         catch (SocketException ex)
@@ -94,110 +118,145 @@ public class Program
         Console.WriteLine("Goodbye!");
     }
 
-    private static async Task ReceiveAsync(NetworkStream stream, byte[] buffer, CancellationToken ct)
-    {
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                // Skip reading when stress test is running
-                if (_inStressTest)
-                {
-                    await Task.Delay(10, ct);
-                    continue;
-                }
-
-                // Use a short read timeout so we can check the stress test flag
-                if (!stream.DataAvailable)
-                {
-                    await Task.Delay(10, ct);
-                    continue;
-                }
-
-                var bytesRead = await stream.ReadAsync(buffer, ct);
-                if (bytesRead == 0)
-                {
-                    Console.WriteLine("\nServer disconnected.");
-                    break;
-                }
-
-                var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"\nReceived: {message} ({bytesRead} bytes)");
-                Console.Write("> ");
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected on shutdown
-        }
-        catch (IOException)
-        {
-            // Stream closed
-        }
-    }
-
-    private static async Task StressTest(NetworkStream stream, int count)
+    private static async Task StressTest(NetworkStream stream, byte[] buffer, int count)
     {
         Console.WriteLine($"Starting stress test with {count} messages...");
-        Console.WriteLine($"[DEBUG] Stream.DataAvailable before test: {stream.DataAvailable}");
 
-        // Drain any pending data first
-        var drainBuffer = new byte[4096];
-        while (stream.DataAvailable)
-        {
-            var drained = await stream.ReadAsync(drainBuffer);
-            Console.WriteLine($"[DEBUG] Drained {drained} bytes of stale data");
-        }
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var buffer = new byte[4096];
+        var sw = Stopwatch.StartNew();
         var totalSent = 0;
         var totalReceived = 0;
 
         for (var i = 0; i < count; i++)
         {
-            var message = $"Stress test message {i + 1}/{count}";
+            var message = $"Stress message {i + 1:D6}";
             var data = Encoding.UTF8.GetBytes(message);
 
-            Console.WriteLine($"[DEBUG] Sending message {i + 1}/{count} ({data.Length} bytes)");
             await stream.WriteAsync(data);
-            await stream.FlushAsync();
             totalSent += data.Length;
 
-            Console.WriteLine($"[DEBUG] Awaiting response {i + 1}/{count}");
-
-            // Read with timeout
-            using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            try
-            {
-                var bytesRead = await stream.ReadAsync(buffer, readCts.Token);
-                if (bytesRead == 0)
-                {
-                    Console.WriteLine($"[DEBUG] Server closed connection!");
-                    break;
-                }
-                totalReceived += bytesRead;
-                var response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"[DEBUG] Received response {i + 1}/{count}: {response} ({bytesRead} bytes)");
-            }
-            catch (OperationCanceledException)
-            {
-                Console.WriteLine($"[DEBUG] Timeout waiting for response {i + 1}/{count}!");
-                break;
-            }
+            var bytesRead = await stream.ReadAsync(buffer);
+            totalReceived += bytesRead;
         }
 
         sw.Stop();
 
         Console.WriteLine("Stress test complete!");
-        Console.WriteLine($"  Messages: {count}");
+        Console.WriteLine($"  Messages: {count:N0}");
         Console.WriteLine($"  Sent: {totalSent:N0} bytes");
         Console.WriteLine($"  Received: {totalReceived:N0} bytes");
+        Console.WriteLine($"  Time: {sw.ElapsedMilliseconds:N0} ms");
         if (sw.ElapsedMilliseconds > 0)
         {
-            Console.WriteLine($"  Time: {sw.ElapsedMilliseconds:N0} ms");
-            Console.WriteLine($"  Rate: {count * 1000.0 / sw.ElapsedMilliseconds:N0} messages/sec");
-            Console.WriteLine($"  Throughput: {(totalSent + totalReceived) * 1000.0 / sw.ElapsedMilliseconds / 1024:N2} KB/sec");
+            Console.WriteLine($"  Rate: {count * 1000.0 / sw.ElapsedMilliseconds:N0} msg/s");
+            Console.WriteLine($"  Throughput: {(totalSent + totalReceived) * 1000.0 / sw.ElapsedMilliseconds / 1024:N2} KB/s");
         }
+    }
+
+    private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount)
+    {
+        Console.WriteLine("IORingGroup Benchmark Client");
+        Console.WriteLine($"Host: {host}:{port}");
+        Console.WriteLine($"Connections: {connectionCount}");
+        Console.WriteLine($"Messages per connection: {messagesPerConnection:N0}");
+        Console.WriteLine();
+
+        // Use semaphore to limit concurrent connection attempts
+        // This prevents overwhelming the server's listen backlog
+        const int maxConcurrentConnections = 500;
+        using var semaphore = new SemaphoreSlim(maxConcurrentConnections);
+
+        var tasks = new Task<BenchmarkResult>[connectionCount];
+        var sw = Stopwatch.StartNew();
+
+        for (var i = 0; i < connectionCount; i++)
+        {
+            var connId = i;
+            tasks[i] = Task.Run(async () =>
+            {
+                await semaphore.WaitAsync();
+                try
+                {
+                    return await RunBenchmarkConnection(host, port, messagesPerConnection, connId);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+        }
+
+        var results = await Task.WhenAll(tasks);
+        sw.Stop();
+
+        var totalMessages = results.Sum(r => r.Messages);
+        var totalBytes = results.Sum(r => r.Bytes);
+        var successfulConnections = results.Count(r => r.Success);
+
+        Console.WriteLine();
+        Console.WriteLine("=== Benchmark Results ===");
+        Console.WriteLine($"Successful connections: {successfulConnections}/{connectionCount}");
+        Console.WriteLine($"Total messages: {totalMessages:N0}");
+        Console.WriteLine($"Total bytes: {totalBytes:N0}");
+        Console.WriteLine($"Total time: {sw.ElapsedMilliseconds:N0} ms");
+        if (sw.ElapsedMilliseconds > 0)
+        {
+            Console.WriteLine($"Rate: {totalMessages * 1000.0 / sw.ElapsedMilliseconds:N0} msg/s");
+            Console.WriteLine($"Throughput: {totalBytes * 1000.0 / sw.ElapsedMilliseconds / 1024 / 1024:N2} MB/s");
+        }
+    }
+
+    private static async Task<BenchmarkResult> RunBenchmarkConnection(string host, int port, int messageCount, int connectionId)
+    {
+        var result = new BenchmarkResult();
+        const int maxRetries = 5;
+
+        for (var retry = 0; retry < maxRetries; retry++)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                client.NoDelay = true;
+                // Set SO_LINGER to 0 to avoid TIME_WAIT accumulation
+                client.LingerState = new LingerOption(true, 0);
+                await client.ConnectAsync(host, port);
+
+                using var stream = client.GetStream();
+                var buffer = new byte[4096];
+                var message = $"Benchmark message from connection {connectionId:D4}";
+                var data = Encoding.UTF8.GetBytes(message);
+
+                for (var i = 0; i < messageCount; i++)
+                {
+                    await stream.WriteAsync(data);
+                    result.Bytes += data.Length;
+
+                    var bytesRead = await stream.ReadAsync(buffer);
+                    result.Bytes += bytesRead;
+                    result.Messages++;
+                }
+
+                result.Success = true;
+                return result;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused && retry < maxRetries - 1)
+            {
+                // Retry with exponential backoff
+                await Task.Delay(10 * (1 << retry));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Connection {connectionId} error: {ex.Message}");
+                return result;
+            }
+        }
+
+        return result;
+    }
+
+    private struct BenchmarkResult
+    {
+        public bool Success;
+        public long Messages;
+        public long Bytes;
     }
 }
