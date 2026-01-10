@@ -63,6 +63,11 @@
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>ws2_32.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\" mkdir "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\"
+copy /Y "$(TargetPath)" "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\ioring.dll"</Command>
+      <Message>Copying ioring.dll to IORingGroup\runtimes\win-x64\native\</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -81,6 +86,11 @@
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>ws2_32.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\" mkdir "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\"
+copy /Y "$(TargetPath)" "$(ProjectDir)..\IORingGroup\runtimes\win-x64\native\ioring.dll"</Command>
+      <Message>Copying ioring.dll to IORingGroup\runtimes\win-x64\native\</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="ioring.c" />
