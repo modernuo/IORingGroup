@@ -84,11 +84,9 @@ public sealed partial class Linux_x64 : ILinuxArch
     nint ILinuxArch.mmap(nint addr, nuint length, int prot, int flags, int fd, long offset)
         => mmap_native(addr, length, prot, flags, fd, offset);
 
-    int ILinuxArch.munmap(nint addr, nuint length)
-        => munmap_native(addr, length);
+    int ILinuxArch.munmap(nint addr, nuint length) => munmap_native(addr, length);
 
-    int ILinuxArch.close(int fd)
-        => close_native(fd);
+    int ILinuxArch.close(int fd) => close_native(fd);
 
     // Raw syscall implementation
     [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
