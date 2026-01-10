@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2025, ModernUO
+
 using System.Runtime.InteropServices;
 
 namespace System.Network;

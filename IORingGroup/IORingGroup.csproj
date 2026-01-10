@@ -21,11 +21,17 @@
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>
         <Description>io_uring/IoRing/RIO bindings for .NET 10+ - high-performance async socket I/O</Description>
-        <Copyright>Copyright 2025</Copyright>
+        <Copyright>Copyright (c) 2025, ModernUO</Copyright>
         <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
         <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
         <PackageProjectUrl>https://github.com/modernuo/IORingGroup</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/modernuo/IORingGroup</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="..\LICENSE" Pack="true" PackagePath="" />
+    </ItemGroup>
 
     <ItemGroup Condition="Exists('runtimes\win-x64\native\ioring.dll')">
         <Content Include="runtimes\win-x64\native\ioring.dll">
