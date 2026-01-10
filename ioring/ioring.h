@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2025, ModernUO
+
 #ifndef IORING_H
 #define IORING_H
 
