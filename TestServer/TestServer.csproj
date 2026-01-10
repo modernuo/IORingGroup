@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>Preview</LangVersion>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\IORingGroup\IORingGroup.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\IORingGroup\runtimes\win-x64\native\ioring.dll')">
+    <Content Include="..\IORingGroup\runtimes\win-x64\native\ioring.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ioring.dll</Link>
+    </Content>
+  </ItemGroup>
+
+</Project>
