@@ -11,7 +11,6 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private readonly ILinuxArch _arch;
     private readonly int _ringFd;
     private readonly uint _sqEntries;
-    private readonly uint _cqEntries;
     private readonly uint _sqMask;
     private readonly uint _cqMask;
 
@@ -54,12 +53,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         _sqEntries = p.sq_entries;
-        _cqEntries = p.cq_entries;
         _sqMask = p.sq_off.ring_mask;
         _cqMask = p.cq_off.ring_mask;
 
         // Map submission queue ring
-        _sqRingSize = (nuint)(p.sq_off.array + p.sq_entries * sizeof(uint));
+        _sqRingSize = p.sq_off.array + p.sq_entries * sizeof(uint);
         _sqRingPtr = arch.mmap(
             0,
             _sqRingSize,
@@ -76,7 +74,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         // Map completion queue ring
-        _cqRingSize = (nuint)(p.cq_off.cqes + p.cq_entries * (uint)sizeof(io_uring_cqe));
+        _cqRingSize = p.cq_off.cqes + p.cq_entries * (uint)sizeof(io_uring_cqe);
         _cqRingPtr = arch.mmap(
             0,
             _cqRingSize,
@@ -121,6 +119,9 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         _cqHead = (uint*)(_cqRingPtr + (nint)p.cq_off.head);
         _cqTail = (uint*)(_cqRingPtr + (nint)p.cq_off.tail);
         _cqes = (io_uring_cqe*)(_cqRingPtr + (nint)p.cq_off.cqes);
+
+        // Initialize local tail from shared memory
+        _sqTailLocal = *_sqTail;
     }
 
     /// <inheritdoc/>
@@ -130,8 +131,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         get
         {
             var head = Volatile.Read(ref *_sqHead);
-            var tail = *_sqTail;
-            return (int)(_sqEntries - (tail - head));
+            return (int)(_sqEntries - (_sqTailLocal - head));
         }
     }
 
@@ -147,11 +147,14 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
     }
 
+    // Track local tail for batching - only written to shared memory on Submit
+    private uint _sqTailLocal;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private io_uring_sqe* GetSqe()
     {
         var head = Volatile.Read(ref *_sqHead);
-        var tail = *_sqTail;
+        var tail = _sqTailLocal;
 
         if (tail - head >= _sqEntries)
         {
@@ -164,9 +167,9 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Clear the SQE
         Unsafe.InitBlock(sqe, 0, (uint)sizeof(io_uring_sqe));
 
-        // Update the SQ array
+        // Update the SQ array and local tail (NOT shared memory yet)
         _sqArray[index] = index;
-        *_sqTail = tail + 1;
+        _sqTailLocal = tail + 1;
 
         return sqe;
     }
@@ -295,14 +298,14 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Submit()
     {
-        // Memory barrier to ensure all writes are visible
-        Thread.MemoryBarrier();
-
         var head = Volatile.Read(ref *_sqHead);
-        var tail = *_sqTail;
+        var tail = _sqTailLocal;
         var toSubmit = tail - head;
 
         if (toSubmit == 0) return 0;
+
+        // Release store: ensures all SQE writes are visible before kernel sees new tail
+        Volatile.Write(ref *_sqTail, tail);
 
         var ret = _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
         return ret;
@@ -312,11 +315,12 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int SubmitAndWait(int waitNr)
     {
-        Thread.MemoryBarrier();
-
         var head = Volatile.Read(ref *_sqHead);
-        var tail = *_sqTail;
+        var tail = _sqTailLocal;
         var toSubmit = tail - head;
+
+        // Release store: ensures all SQE writes are visible before kernel sees new tail
+        Volatile.Write(ref *_sqTail, tail);
 
         var ret = _arch.io_uring_enter(_ringFd, toSubmit, (uint)waitNr, (uint)IORING_ENTER.GETEVENTS);
         return ret;
