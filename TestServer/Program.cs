@@ -4,20 +4,22 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Network;
+using System.Network.Windows;
 
 namespace TestServer;
 
 public enum ServerBackend
 {
-    IORing,
-    PollGroup
+    RIO,        // True RIO with registered buffers
+    PollGroup   // wepoll-based polling
 }
 
 /// <summary>
-/// High-performance single-threaded echo server using synchronous polling.
-/// No async/await - tight event loop like nginx/redis for maximum throughput.
+/// High-performance single-threaded echo server comparing RIO vs PollGroup.
+/// No async/await - tight event loop for maximum throughput.
 /// </summary>
 public class Program
 {
@@ -30,7 +32,7 @@ public class Program
 
     public static void Main(string[] args)
     {
-        var backend = ServerBackend.IORing;
+        var backend = ServerBackend.RIO;
         var benchmarkMode = false;
 
         foreach (var arg in args)
@@ -40,10 +42,10 @@ public class Program
             {
                 backend = ServerBackend.PollGroup;
             }
-            else if (arg.Equals("--ioring", StringComparison.OrdinalIgnoreCase) ||
-                     arg.Equals("-i", StringComparison.OrdinalIgnoreCase))
+            else if (arg.Equals("--rio", StringComparison.OrdinalIgnoreCase) ||
+                     arg.Equals("-r", StringComparison.OrdinalIgnoreCase))
             {
-                backend = ServerBackend.IORing;
+                backend = ServerBackend.RIO;
             }
             else if (arg.Equals("--benchmark", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-b", StringComparison.OrdinalIgnoreCase))
@@ -52,11 +54,11 @@ public class Program
             }
         }
 
-        Console.WriteLine("IORingGroup/PollGroup Benchmark Server (Single-threaded)");
+        Console.WriteLine("RIO vs PollGroup Benchmark Server (Single-threaded)");
         Console.WriteLine($"Backend: {backend}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}");
         Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--ioring|-i] [--pollgroup|-p] [--benchmark|-b]");
+        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b]");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
         Console.CancelKeyPress += (_, e) =>
@@ -65,9 +67,9 @@ public class Program
             _running = false;
         };
 
-        if (backend == ServerBackend.IORing)
+        if (backend == ServerBackend.RIO)
         {
-            RunIORingServer(benchmarkMode);
+            RunRIOServer(benchmarkMode);
         }
         else
         {
@@ -75,24 +77,29 @@ public class Program
         }
     }
 
-    #region IORing Server
+    #region RIO Server (True Registered I/O)
 
-    // User data encoding for IORing
+    // User data encoding for RIO operations
     private const ulong OpAccept = 0x1000_0000_0000_0000UL;
-    private const ulong OpPollRecv = 0x2000_0000_0000_0000UL;  // Poll for readable, then recv
-    private const ulong OpRecv = 0x3000_0000_0000_0000UL;
-    private const ulong OpSend = 0x4000_0000_0000_0000UL;
+    private const ulong OpRecv = 0x2000_0000_0000_0000UL;
+    private const ulong OpSend = 0x3000_0000_0000_0000UL;
     private const ulong OpMask = 0xF000_0000_0000_0000UL;
     private const ulong IndexMask = 0x0FFF_FFFF_FFFF_FFFFUL;
 
-    // Number of accepts to keep queued at all times (handles burst connections)
+    // Number of accepts to keep queued
     private const int PendingAccepts = 128;
 
-    private static readonly ClientState[] _ioringClients = new ClientState[MaxClients];
-    private static readonly byte[][] _ioringRecvBuffers = new byte[MaxClients][];
-    private static readonly byte[][] _ioringSendBuffers = new byte[MaxClients][];
-    private static GCHandle[] _ioringRecvHandles = new GCHandle[MaxClients];
-    private static GCHandle[] _ioringSendHandles = new GCHandle[MaxClients];
+    // Client state for RIO
+    private struct RIOClientState
+    {
+        public nint Socket;
+        public int ConnId;          // RIO connection ID from RegisterSocket
+        public nint RecvBuffer;     // Pointer to registered recv buffer
+        public nint SendBuffer;     // Pointer to registered send buffer
+        public bool Active;
+    }
+
+    private static readonly RIOClientState[] _rioClients = new RIOClientState[MaxClients];
 
     // Benchmark stats
     private static long _totalMessages;
@@ -100,32 +107,23 @@ public class Program
     private static long _lastReportedMessages;
     private static readonly Stopwatch _benchmarkStopwatch = new();
 
-    private struct ClientState
-    {
-        public nint Socket;
-        public int RecvLen;
-        public bool Active;
-    }
-
-    // Track how many accepts are currently queued
+    // Track pending accepts
     private static int _pendingAcceptCount;
 
-    private static void RunIORingServer(bool benchmarkMode)
+    private static void RunRIOServer(bool benchmarkMode)
     {
-        // Initialize buffers
-        for (var i = 0; i < MaxClients; i++)
-        {
-            _ioringRecvBuffers[i] = new byte[BufferSize];
-            _ioringSendBuffers[i] = new byte[BufferSize];
-            _ioringRecvHandles[i] = GCHandle.Alloc(_ioringRecvBuffers[i], GCHandleType.Pinned);
-            _ioringSendHandles[i] = GCHandle.Alloc(_ioringSendBuffers[i], GCHandleType.Pinned);
-        }
-
-        _pendingAcceptCount = 0;
-
         try
         {
-            using var ring = IORingGroup.Create(16384);
+            // Create RIO ring with pre-allocated buffers for max clients
+            using var ring = new WindowsRIOGroup(
+                queueSize: 16384,
+                maxConnections: MaxClients,
+                recvBufferSize: BufferSize,
+                sendBufferSize: BufferSize
+            );
+
+            Console.WriteLine($"RIO ring created: MaxConnections={ring.MaxConnections}, RecvBuf={ring.RecvBufferSize}, SendBuf={ring.SendBufferSize}");
+
             using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
             listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
@@ -134,13 +132,12 @@ public class Program
             listener.NoDelay = true;
             listener.Listen(ListenBacklog);
 
-            Console.WriteLine($"IORing server listening on port {Port}");
-            if (ring is System.Network.Windows.WindowsIORingGroup winRing)
-            {
-                Console.WriteLine($"Backend: {winRing.Backend}");
-            }
+            Console.WriteLine($"RIO server listening on port {Port}");
+            Console.WriteLine($"Backend: {ring.Backend} (IsRIO: {ring.IsRIO})");
 
-            // Pre-post multiple accepts to handle burst connections
+            _pendingAcceptCount = 0;
+
+            // Pre-post multiple accepts
             for (var i = 0; i < PendingAccepts; i++)
             {
                 ring.PrepareAccept(listener.Handle, 0, 0, OpAccept);
@@ -155,12 +152,11 @@ public class Program
             while (_running)
             {
                 ring.Submit();
-                // Use short timeout (1ms) for responsive polling
                 var count = ring.WaitCompletions(completions, 1, 1);
 
                 for (var i = 0; i < count; i++)
                 {
-                    ProcessIORingCompletion(ring, listener.Handle, ref completions[i], benchmarkMode);
+                    ProcessRIOCompletion(ring, listener.Handle, ref completions[i], benchmarkMode);
                 }
 
                 ring.AdvanceCompletionQueue(count);
@@ -171,26 +167,23 @@ public class Program
                     var elapsedMs = _benchmarkStopwatch.ElapsedMilliseconds;
                     if (elapsedMs - lastStatsMs >= 1000)
                     {
-                        PrintStats("IORing");
+                        PrintStats("RIO");
                         lastStatsMs = elapsedMs;
                     }
                 }
             }
 
             _benchmarkStopwatch.Stop();
-            PrintFinalStats("IORing");
+            PrintFinalStats("RIO", ring);
         }
-        finally
+        catch (Exception ex)
         {
-            for (var i = 0; i < MaxClients; i++)
-            {
-                if (_ioringRecvHandles[i].IsAllocated) _ioringRecvHandles[i].Free();
-                if (_ioringSendHandles[i].IsAllocated) _ioringSendHandles[i].Free();
-            }
+            Console.WriteLine($"RIO server error: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
         }
     }
 
-    private static void ProcessIORingCompletion(IIORingGroup ring, nint listenerFd, ref Completion cqe, bool benchmarkMode)
+    private static void ProcessRIOCompletion(WindowsRIOGroup ring, nint listenerFd, ref Completion cqe, bool benchmarkMode)
     {
         var op = cqe.UserData & OpMask;
         var index = (int)(cqe.UserData & IndexMask);
@@ -198,51 +191,69 @@ public class Program
         switch (op)
         {
             case OpAccept:
-                HandleIORingAccept(ring, listenerFd, cqe.Result, benchmarkMode);
-                break;
-            case OpPollRecv:
-                HandleIORingPollRecv(ring, index, cqe.Result, benchmarkMode);
+                HandleRIOAccept(ring, listenerFd, cqe.Result, benchmarkMode);
                 break;
             case OpRecv:
-                HandleIORingRecv(ring, index, cqe.Result, benchmarkMode);
+                HandleRIORecv(ring, index, cqe.Result, benchmarkMode);
                 break;
             case OpSend:
-                HandleIORingSend(ring, index, cqe.Result, benchmarkMode);
+                HandleRIOSend(ring, index, cqe.Result, benchmarkMode);
                 break;
         }
     }
 
-    private static void HandleIORingAccept(IIORingGroup ring, nint listenerFd, int result, bool benchmarkMode)
+    private static void HandleRIOAccept(WindowsRIOGroup ring, nint listenerFd, int result, bool benchmarkMode)
     {
-        // One accept completed
         _pendingAcceptCount--;
 
         if (result >= 0)
         {
-            var clientIndex = FindFreeIORingSlot();
+            var clientSocket = (nint)result;
+            var clientIndex = FindFreeRIOSlot();
+
             if (clientIndex >= 0)
             {
-                _ioringClients[clientIndex].Socket = result;
-                _ioringClients[clientIndex].Active = true;
-                if (!benchmarkMode)
-                    Console.WriteLine($"[IORing] Client {clientIndex} connected (fd={result})");
+                // Register socket with RIO to get buffer pointers
+                var connId = ring.RegisterSocket(clientSocket, out var recvBuf, out var sendBuf);
 
-                // Queue poll for readable - don't recv until we know data is available
-                ring.PreparePollAdd(_ioringClients[clientIndex].Socket, PollMask.In, OpPollRecv | (uint)clientIndex);
+                if (connId >= 0)
+                {
+                    _rioClients[clientIndex] = new RIOClientState
+                    {
+                        Socket = clientSocket,
+                        ConnId = connId,
+                        RecvBuffer = recvBuf,
+                        SendBuffer = sendBuf,
+                        Active = true
+                    };
+
+                    if (!benchmarkMode)
+                        Console.WriteLine($"[RIO] Client {clientIndex} connected (socket={result}, connId={connId})");
+
+                    // Post initial receive using registered buffer
+                    ring.PrepareRecvRegistered(connId, BufferSize, OpRecv | (uint)clientIndex);
+                }
+                else
+                {
+                    var error = Win_x64.ioring_get_last_error();
+                    Console.WriteLine($"[RIO] Failed to register socket {result}, error={error} (0x{error:X})");
+                    closesocket(clientSocket);
+                }
             }
             else
             {
-                Console.WriteLine($"[IORing] No free slot for client, closing socket {result}");
-                closesocket(result);
+                Console.WriteLine($"[RIO] No free slot for client, closing socket {result}");
+                closesocket(clientSocket);
             }
         }
         else
         {
-            // Accept returned an error
-            Console.WriteLine($"[IORing] Accept error: {result} (pending={_pendingAcceptCount})");
+            // Accept error - but don't log WSAEWOULDBLOCK spam
+            if (result != -10035) // WSAEWOULDBLOCK
+                Console.WriteLine($"[RIO] Accept error: {result}");
         }
 
-        // Replenish accepts to maintain the pool
+        // Replenish accepts
         while (_pendingAcceptCount < PendingAccepts)
         {
             ring.PrepareAccept(listenerFd, 0, 0, OpAccept);
@@ -250,137 +261,68 @@ public class Program
         }
     }
 
-    private static long _pollRecvCount;
-    private static long _pollErrCount;
-
-    // Linux-style poll event flags (our API uses these, C library translates to/from Windows)
-    private const int POLLIN = 0x0001;
-    private const int POLLPRI = 0x0002;
-    private const int POLLOUT = 0x0004;
-    private const int POLLERR = 0x0008;
-    private const int POLLHUP = 0x0010;
-    private const int POLLNVAL = 0x0020;
-
-    private static void HandleIORingPollRecv(IIORingGroup ring, int index, int result, bool benchmarkMode)
+    private static void HandleRIORecv(WindowsRIOGroup ring, int index, int result, bool benchmarkMode)
     {
-        _pollRecvCount++;
-        if (_pollRecvCount <= 20)
-            Console.WriteLine($"[POLL] Client {index} poll result=0x{result:X4} (total polls: {_pollRecvCount})");
-
-        // Check for errors first - result is poll revents
-        if (result < 0)
-        {
-            Console.WriteLine($"[IORing] Client {index} poll error: {result}");
-            CloseIORingClient(index);
-            return;
-        }
-
-        // Check for socket errors or hangup in the poll events
-        if ((result & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-        {
-            _pollErrCount++;
-            if (_pollErrCount <= 20)
-                Console.WriteLine($"[POLL] Client {index} error/hangup: 0x{result:X4} (total errs: {_pollErrCount})");
-            CloseIORingClient(index);
-            return;
-        }
-
-        // Socket is readable - now do the actual recv
-        ring.PrepareRecv(_ioringClients[index].Socket, _ioringRecvHandles[index].AddrOfPinnedObject(), BufferSize, MsgFlags.None, OpRecv | (uint)index);
-    }
-
-    // WSAEWOULDBLOCK error code
-    private const int WSAEWOULDBLOCK = 10035;
-
-    private static long _wouldBlockRecvCount;
-    private static long _wouldBlockSendCount;
-    private static long _recvSuccessCount;
-    private static long _sendSuccessCount;
-    private static long _recvErrorCount;
-    private static long _sendErrorCount;
-
-    private static void HandleIORingRecv(IIORingGroup ring, int index, int result, bool benchmarkMode)
-    {
-        if (result == -WSAEWOULDBLOCK)
-        {
-            _wouldBlockRecvCount++;
-            if (_wouldBlockRecvCount <= 10)
-                Console.WriteLine($"[WOULDBLOCK] Recv on client {index} (total recv blocks: {_wouldBlockRecvCount})");
-            // Poll said readable but recv got WOULDBLOCK - re-poll
-            ring.PreparePollAdd(_ioringClients[index].Socket, PollMask.In, OpPollRecv | (uint)index);
-            return;
-        }
-
         if (result <= 0)
         {
-            _recvErrorCount++;
-            if (_recvErrorCount <= 20)
-                Console.WriteLine($"[RECV] Client {index} error/disconnect (result={result}, total errors: {_recvErrorCount})");
-            CloseIORingClient(index);
+            // Error or disconnect
+            CloseRIOClient(ring, index, benchmarkMode);
             return;
         }
-
-        _recvSuccessCount++;
-        if (_recvSuccessCount <= 10)
-            Console.WriteLine($"[RECV] Client {index} received {result} bytes (total: {_recvSuccessCount})");
 
         _totalBytes += result;
 
-        // Copy to send buffer and echo back
-        Buffer.BlockCopy(_ioringRecvBuffers[index], 0, _ioringSendBuffers[index], 0, result);
-        _ioringClients[index].RecvLen = result;
+        ref var client = ref _rioClients[index];
 
-        ring.PrepareSend(_ioringClients[index].Socket, _ioringSendHandles[index].AddrOfPinnedObject(), result, MsgFlags.None, OpSend | (uint)index);
+        // Copy from recv buffer to send buffer for echo
+        // Both buffers are in the RIO registered memory pool
+        unsafe
+        {
+            Buffer.MemoryCopy((void*)client.RecvBuffer, (void*)client.SendBuffer, BufferSize, result);
+        }
+
+        // Queue send using registered buffer
+        ring.PrepareSendRegistered(client.ConnId, result, OpSend | (uint)index);
     }
 
-    private static void HandleIORingSend(IIORingGroup ring, int index, int result, bool benchmarkMode)
+    private static void HandleRIOSend(WindowsRIOGroup ring, int index, int result, bool benchmarkMode)
     {
-        if (result == -WSAEWOULDBLOCK)
-        {
-            _wouldBlockSendCount++;
-            if (_wouldBlockSendCount <= 10)
-                Console.WriteLine($"[WOULDBLOCK] Send on client {index} (total send blocks: {_wouldBlockSendCount})");
-            // Can't send yet - re-queue send (send buffers are usually available quickly)
-            ring.PrepareSend(_ioringClients[index].Socket, _ioringSendHandles[index].AddrOfPinnedObject(), _ioringClients[index].RecvLen, MsgFlags.None, OpSend | (uint)index);
-            return;
-        }
-
         if (result <= 0)
         {
-            _sendErrorCount++;
-            if (_sendErrorCount <= 20)
-                Console.WriteLine($"[SEND] Client {index} error (result={result}, total errors: {_sendErrorCount})");
-            CloseIORingClient(index);
+            CloseRIOClient(ring, index, benchmarkMode);
             return;
         }
-
-        _sendSuccessCount++;
-        if (_sendSuccessCount <= 10)
-            Console.WriteLine($"[SEND] Client {index} sent {result} bytes (total: {_sendSuccessCount})");
 
         _totalBytes += result;
         _totalMessages++;
 
-        // Queue poll for next recv - wait until data available
-        ring.PreparePollAdd(_ioringClients[index].Socket, PollMask.In, OpPollRecv | (uint)index);
+        ref var client = ref _rioClients[index];
+
+        // Queue next receive using registered buffer
+        ring.PrepareRecvRegistered(client.ConnId, BufferSize, OpRecv | (uint)index);
     }
 
-    private static int FindFreeIORingSlot()
+    private static int FindFreeRIOSlot()
     {
         for (var i = 0; i < MaxClients; i++)
-            if (!_ioringClients[i].Active)
+            if (!_rioClients[i].Active)
                 return i;
         return -1;
     }
 
-    private static void CloseIORingClient(int index)
+    private static void CloseRIOClient(WindowsRIOGroup ring, int index, bool benchmarkMode)
     {
-        if (_ioringClients[index].Active)
-        {
-            closesocket(_ioringClients[index].Socket);
-            _ioringClients[index].Socket = 0;
-            _ioringClients[index].Active = false;
-        }
+        ref var client = ref _rioClients[index];
+        if (!client.Active) return;
+
+        if (!benchmarkMode)
+            Console.WriteLine($"[RIO] Client {index} disconnected");
+
+        // Unregister from RIO before closing socket
+        ring.UnregisterSocket(client.ConnId);
+        closesocket(client.Socket);
+
+        client = default;
     }
 
     #endregion
@@ -422,7 +364,6 @@ public class Program
         var handles = new GCHandle[256];
         var lastStatsMs = 0L;
 
-        // Track clients with pending sends (avoid O(n) scan)
         var pendingSendCount = 0;
 
         _benchmarkStopwatch.Start();
@@ -471,12 +412,11 @@ public class Program
                 }
                 else
                 {
-                    // Handle client data - recv and immediate send attempt
                     HandlePollClient(pollGroup, state, ref pendingSendCount, benchmarkMode);
                 }
             }
 
-            // Retry pending sends if any
+            // Retry pending sends
             if (pendingSendCount > 0)
             {
                 for (var i = 0; i < MaxClients && pendingSendCount > 0; i++)
@@ -484,15 +424,12 @@ public class Program
                     var client = _pollClients[i];
                     if (client?.NeedsSend == true)
                     {
-                        if (TryPollSend(pollGroup, client, ref pendingSendCount, benchmarkMode))
-                        {
-                            // Successfully sent, counter already decremented
-                        }
+                        TryPollSend(pollGroup, client, ref pendingSendCount, benchmarkMode);
                     }
                 }
             }
 
-            // Print stats every second in benchmark mode
+            // Print stats every second
             if (benchmarkMode)
             {
                 var elapsedMs = _benchmarkStopwatch.ElapsedMilliseconds;
@@ -503,7 +440,6 @@ public class Program
                 }
             }
 
-            // Brief yield when idle to avoid 100% CPU
             if (count == 0 && pendingSendCount == 0)
             {
                 Thread.Sleep(1);
@@ -511,7 +447,7 @@ public class Program
         }
 
         _benchmarkStopwatch.Stop();
-        PrintFinalStats("PollGroup");
+        PrintFinalStats("PollGroup", null);
 
         // Cleanup
         listenerState.Handle.Free();
@@ -541,12 +477,10 @@ public class Program
 
             _totalBytes += bytesRead;
 
-            // Copy to send buffer
             Buffer.BlockCopy(state.RecvBuffer, 0, state.SendBuffer, 0, bytesRead);
             state.SendOffset = 0;
             state.SendLength = bytesRead;
 
-            // Try immediate send
             if (!state.NeedsSend)
             {
                 state.NeedsSend = true;
@@ -628,7 +562,6 @@ public class Program
     {
         var messages = Interlocked.Read(ref _totalMessages);
 
-        // Only print if there's been activity since last report
         if (messages == _lastReportedMessages)
             return;
 
@@ -643,7 +576,7 @@ public class Program
         Console.WriteLine($"[{backend}] Messages: {messages:N0} | Rate: {msgPerSec:N0} msg/s | Throughput: {mbPerSec:N2} MB/s");
     }
 
-    private static void PrintFinalStats(string backend)
+    private static void PrintFinalStats(string backend, WindowsRIOGroup? rioRing)
     {
         var elapsed = _benchmarkStopwatch.Elapsed.TotalSeconds;
         var messages = Interlocked.Read(ref _totalMessages);
@@ -660,19 +593,12 @@ public class Program
             Console.WriteLine($"Average throughput: {(bytes / 1024.0 / 1024.0) / elapsed:N2} MB/s");
         }
 
-        // Debug counters (IORing only)
-        if (backend == "IORing")
+        if (rioRing != null)
         {
             Console.WriteLine();
-            Console.WriteLine("=== Debug Counters ===");
-            Console.WriteLine($"Poll completions: {_pollRecvCount:N0}");
-            Console.WriteLine($"Poll errors: {_pollErrCount:N0}");
-            Console.WriteLine($"Recv success: {_recvSuccessCount:N0}");
-            Console.WriteLine($"Recv errors: {_recvErrorCount:N0}");
-            Console.WriteLine($"Recv WOULDBLOCK: {_wouldBlockRecvCount:N0}");
-            Console.WriteLine($"Send success: {_sendSuccessCount:N0}");
-            Console.WriteLine($"Send errors: {_sendErrorCount:N0}");
-            Console.WriteLine($"Send WOULDBLOCK: {_wouldBlockSendCount:N0}");
+            Console.WriteLine("=== RIO Ring Info ===");
+            Console.WriteLine($"Active connections: {rioRing.ActiveConnections}");
+            Console.WriteLine($"Max connections: {rioRing.MaxConnections}");
         }
     }
 
