@@ -52,7 +52,7 @@ typedef struct ioring_sqe {
     uint8_t opcode;         // ioring_op_t
     uint8_t flags;          // Submission flags
     uint16_t ioprio;        // I/O priority
-    int32_t fd;             // File descriptor (socket)
+    int32_t fd;             // File descriptor (socket) or connection ID
     uint64_t off;           // Offset (union with addr2)
     uint64_t addr;          // Buffer address
     uint32_t len;           // Buffer length
@@ -81,11 +81,15 @@ typedef struct ioring_cqe {
 // Backend type
 typedef enum ioring_backend {
     IORING_BACKEND_NONE = 0,
-    IORING_BACKEND_IORING = 1,  // Windows 11+ IoRing
+    IORING_BACKEND_IORING = 1,  // Windows 11+ IoRing (not used - no socket support)
     IORING_BACKEND_RIO = 2,     // Windows 8+ Registered I/O
 } ioring_backend_t;
 
-// Create/destroy ring
+// =============================================================================
+// LEGACY API (synchronous fallback, for compatibility)
+// =============================================================================
+
+// Create/destroy ring (legacy - no RIO buffer registration)
 IORING_API ioring_t* ioring_create(uint32_t entries);
 IORING_API void ioring_destroy(ioring_t* ring);
 
@@ -126,6 +130,157 @@ IORING_API void ioring_cq_advance(ioring_t* ring, uint32_t count);
 // Error handling
 IORING_API int ioring_get_last_error(void);
 IORING_API const char* ioring_strerror(int error);
+
+// =============================================================================
+// HIGH-PERFORMANCE RIO API (true async with registered buffers)
+// =============================================================================
+
+/*
+ * RIO (Registered I/O) provides high-performance async socket I/O with:
+ * - Pre-registered buffer pools (zero-copy between user/kernel)
+ * - Batched submissions and completions (fewer syscalls)
+ * - True async operations (don't block waiting for data)
+ *
+ * Usage pattern:
+ * 1. Create ring with ioring_create_rio() specifying max connections and buffer sizes
+ * 2. Accept connections normally (listener doesn't need RIO)
+ * 3. Register each connected socket with ioring_rio_register() to get buffer pointers
+ * 4. Post recv/send ops with ioring_prep_recv_registered/ioring_prep_send_registered
+ * 5. Submit with ioring_submit(), wait/peek completions as usual
+ * 6. Unregister socket before closing with ioring_rio_unregister()
+ * 7. Destroy ring with ioring_destroy()
+ */
+
+// Create ring with RIO buffer pool pre-allocated
+// - entries: SQ/CQ size (power of 2 recommended)
+// - max_connections: maximum concurrent registered sockets
+// - recv_buffer_size: size of receive buffer per connection
+// - send_buffer_size: size of send buffer per connection
+// Returns NULL on failure (check ioring_get_last_error())
+IORING_API ioring_t* ioring_create_rio(
+    uint32_t entries,
+    uint32_t max_connections,
+    uint32_t recv_buffer_size,
+    uint32_t send_buffer_size
+);
+
+// Extended version with configurable outstanding operations
+// - outstanding_per_socket: max outstanding ops per direction (recv/send) per socket
+//   Default is 2 (enough for request-response patterns like echo)
+//   Higher values (4-8) for pipelined protocols
+//   CQ is auto-sized to max_connections * outstanding_per_socket * 2
+IORING_API ioring_t* ioring_create_rio_ex(
+    uint32_t entries,
+    uint32_t max_connections,
+    uint32_t recv_buffer_size,
+    uint32_t send_buffer_size,
+    uint32_t outstanding_per_socket
+);
+
+// Register a connected socket for RIO operations
+// - socket: the connected socket (not the listener!)
+// - recv_buf: output - pointer to pre-allocated receive buffer
+// - send_buf: output - pointer to pre-allocated send buffer
+// Returns: connection ID (>= 0) on success, -1 on error
+// The returned buffers are valid until ioring_rio_unregister() is called
+IORING_API int ioring_rio_register(
+    ioring_t* ring,
+    SOCKET socket,
+    void** recv_buf,
+    void** send_buf
+);
+
+// Unregister a connection (call BEFORE closing the socket)
+// This frees the connection slot for reuse
+IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
+
+// Get buffer sizes for this ring
+IORING_API uint32_t ioring_rio_get_recv_buffer_size(ioring_t* ring);
+IORING_API uint32_t ioring_rio_get_send_buffer_size(ioring_t* ring);
+
+// Prepare receive on registered connection
+// Data will be placed in the recv_buf returned from ioring_rio_register()
+IORING_API void ioring_prep_recv_registered(
+    ioring_sqe_t* sqe,
+    int conn_id,        // Connection ID from ioring_rio_register()
+    uint32_t max_len,   // Maximum bytes to receive (up to recv_buffer_size)
+    uint64_t user_data  // User data returned with completion
+);
+
+// Prepare send on registered connection
+// Data must already be written to send_buf from ioring_rio_register()
+IORING_API void ioring_prep_send_registered(
+    ioring_sqe_t* sqe,
+    int conn_id,        // Connection ID from ioring_rio_register()
+    uint32_t len,       // Bytes to send (already in send_buf)
+    uint64_t user_data  // User data returned with completion
+);
+
+// Check if ring was created with RIO support
+IORING_API int ioring_is_rio(ioring_t* ring);
+
+// Get maximum connections for RIO ring
+IORING_API uint32_t ioring_rio_get_max_connections(ioring_t* ring);
+
+// Get number of active (registered) connections
+IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
+
+// Diagnostic: Check if RIO is properly initialized
+// Returns 0 if all RIO functions are available, negative error code otherwise
+IORING_API int ioring_rio_check_init(void);
+
+// Diagnostic: Test complete RIO setup with connected sockets
+// Returns:
+// 0: Full success - both client and accepted sockets work with RIO
+// 1: Partial success - client sockets work but accepted sockets need AcceptEx (expected)
+// Negative: Error codes
+// -1: RIO init failed
+// -2: Listener socket creation failed
+// -3: Bind failed
+// -4: Buffer allocation failed
+// -5: Buffer registration failed
+// -6: Completion queue creation failed
+// -7: Request queue creation failed on accepted socket (expected)
+// -8: Listen failed
+// -9: Client socket creation failed
+// -10: Connect failed
+// -11: Accept failed
+// -12: Request queue creation failed on CLIENT socket (real problem)
+IORING_API int ioring_rio_test_setup(void);
+
+// =============================================================================
+// RIO AcceptEx Support (for server-side RIO)
+// =============================================================================
+
+/*
+ * IMPORTANT: Sockets returned by accept() do NOT inherit WSA_FLAG_REGISTERED_IO.
+ * For server-side RIO, you must:
+ * 1. Create sockets with ioring_rio_create_accept_socket()
+ * 2. Use AcceptEx (from Windows) to accept into these pre-created sockets
+ * 3. Then register them with ioring_rio_register()
+ *
+ * Example pattern:
+ *   // Create accept socket pool
+ *   SOCKET acceptSock = ioring_rio_create_accept_socket();
+ *
+ *   // Use AcceptEx (get via WSAIoctl with WSAID_ACCEPTEX)
+ *   AcceptEx(listenSock, acceptSock, buffer, 0, addrLen, addrLen, &bytes, &overlapped);
+ *
+ *   // After AcceptEx completes, update socket context
+ *   setsockopt(acceptSock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+ *              (char*)&listenSock, sizeof(listenSock));
+ *
+ *   // Now register for RIO
+ *   ioring_rio_register(ring, acceptSock, &recvBuf, &sendBuf);
+ */
+
+// Create a socket suitable for AcceptEx that has WSA_FLAG_REGISTERED_IO
+// Returns INVALID_SOCKET on failure
+IORING_API SOCKET ioring_rio_create_accept_socket(void);
+
+// Get AcceptEx function pointer (convenience helper)
+// Returns NULL on failure
+IORING_API void* ioring_get_acceptex(SOCKET listen_socket);
 
 #ifdef __cplusplus
 }
