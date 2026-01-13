@@ -29,6 +29,29 @@ static BOOL rio_initialized = FALSE;
 // Thread-local error
 static __declspec(thread) int last_error = 0;
 
+// Build version for verifying correct DLL is loaded
+#define IORING_BUILD_VERSION 14
+
+// Diagnostic counters for debugging RIO operations
+static volatile LONG g_rio_recv_calls = 0;
+static volatile LONG g_rio_recv_success = 0;
+static volatile LONG g_rio_recv_fail = 0;
+static volatile LONG g_rio_dequeue_calls = 0;
+static volatile LONG g_rio_dequeue_total = 0;
+static volatile int g_rio_last_recv_error = 0;
+static volatile RIO_CQ g_rio_cq_used = RIO_INVALID_CQ;
+static volatile RIO_RQ g_rio_rq_created = RIO_INVALID_RQ;
+static volatile RIO_RQ g_rio_rq_used = RIO_INVALID_RQ;
+static volatile RIO_BUFFERID g_rio_buf_id_used = RIO_INVALID_BUFFERID;
+static volatile uint32_t g_rio_buf_offset_used = 0xFFFFFFFF;
+static volatile int g_rio_conn_slot_created = -1;
+static volatile int g_rio_conn_id_used = -1;
+static volatile RIO_CQ g_rio_cq_at_rq_create = RIO_INVALID_CQ;
+static volatile int g_rio_update_accept_ctx_result = -999;
+static volatile SOCKET g_rio_listen_socket_used = INVALID_SOCKET;
+static volatile SOCKET g_rio_accept_socket_used = INVALID_SOCKET;
+static volatile LONG g_rio_notify_calls = 0;
+
 // Poll mask translation between Linux io_uring style and Windows WSAPoll
 #define LINUX_POLLIN    0x0001
 #define LINUX_POLLPRI   0x0002
@@ -59,13 +82,59 @@ static uint32_t windows_to_linux_poll(SHORT win_mask) {
     return linux_mask;
 }
 
-// Connection state for RIO mode
+// =============================================================================
+// Buffer Pool (LIFO Slab Allocator)
+// =============================================================================
+
+#define DEFAULT_SLAB_SIZE 4096
+#define MAX_OUTSTANDING_RECV 4
+#define MAX_OUTSTANDING_SEND 4
+
+typedef struct buffer_pool {
+    char* base;                     // VirtualAlloc'd region
+    RIO_BUFFERID buffer_id;         // Registered with RIO
+    uint32_t slab_size;             // Size of each slab (default 4096)
+    uint32_t slab_count;            // Total number of slabs
+
+    // LIFO stack for O(1) allocation
+    uint32_t* free_stack;           // Array of free slab indices
+    uint32_t stack_top;             // Current top of stack (0 = empty)
+
+    SRWLOCK lock;                   // For thread safety (lightweight)
+} buffer_pool_t;
+
+// Forward declarations for pool functions
+static buffer_pool_t* pool_create(uint32_t slab_size, uint32_t slab_count);
+static void pool_destroy(buffer_pool_t* pool);
+static int32_t pool_alloc(buffer_pool_t* pool);
+static void pool_free(buffer_pool_t* pool, int32_t offset);
+
+// =============================================================================
+// Connection State for RIO Mode
+// =============================================================================
+
 typedef struct rio_connection {
     SOCKET socket;
-    RIO_RQ rq;              // Request queue for this socket
-    uint32_t recv_offset;   // Offset in buffer for recv
-    uint32_t send_offset;   // Offset in buffer for send
-    BOOL active;
+    RIO_RQ rq;                      // Request queue for this socket
+
+    // Legacy fixed-offset mode (for backwards compatibility)
+    uint32_t recv_offset;           // Fixed offset for recv buffer
+    uint32_t send_offset;           // Fixed offset for send buffer
+
+    // NEW: Multi-slot slab allocation mode
+    uint32_t recv_slab_offsets[MAX_OUTSTANDING_RECV];  // Offsets into pool
+    uint8_t recv_slot_mask;         // Bit set = slot has pending RIOReceive
+
+    uint32_t send_slab_offsets[MAX_OUTSTANDING_SEND];  // Offsets into pool
+    uint8_t send_slot_mask;         // Bit set = slot has pending RIOSend
+
+    // Application state
+    uint32_t recv_bytes_available;  // Bytes available in current recv buffer
+    uint32_t recv_consumed;         // Bytes already consumed by app
+    int current_recv_slot;          // Slot with data ready for app (-1 if none)
+
+    BOOL active;                    // Connection is fully registered and active
+    BOOL reserved;                  // Slot is reserved (prevents AcceptEx collision)
 } rio_connection_t;
 
 // AcceptEx context for pending accept operations
@@ -78,10 +147,13 @@ typedef struct acceptex_context {
     SOCKET listen_socket;       // The listener socket
     char buffer[ACCEPTEX_BUFFER_SIZE];  // AcceptEx output buffer (addresses)
     OVERLAPPED overlapped;      // Overlapped structure for async completion
+    HANDLE event;               // Event for completion notification (non-IOCP mode)
     uint64_t user_data;         // User data to return with completion
     BOOL pending;               // TRUE if AcceptEx is pending
     BOOL completed;             // TRUE if AcceptEx has completed (check result)
     DWORD bytes_received;       // Bytes received by AcceptEx
+    RIO_RQ rq;                  // Pre-created RQ (created before AcceptEx)
+    int conn_slot;              // Connection slot for this socket
 } acceptex_context_t;
 
 // RIO configuration defaults
@@ -110,19 +182,27 @@ struct ioring {
     uint32_t cq_tail;
 
     // RIO mode data
-    BOOL rio_mode;                  // True if created with ioring_create_rio
-    RIO_CQ rio_cq;                  // RIO completion queue
-    RIO_BUFFERID rio_buf_id;        // Registered buffer handle
-    char* rio_buffer;               // The actual buffer memory
-    uint32_t rio_buffer_size;       // Total buffer size
-    uint32_t rio_recv_buf_size;     // Per-connection recv buffer size
-    uint32_t rio_send_buf_size;     // Per-connection send buffer size
-    uint32_t rio_max_connections;   // Max concurrent connections
-    uint32_t rio_active_connections;// Current active connections
-    uint32_t rio_outstanding_per_socket; // Max outstanding ops per direction per socket
-    uint32_t rio_cq_size;           // Actual CQ size
-    rio_connection_t* rio_connections; // Per-connection state
-    HANDLE rio_event;               // Event for completion notification
+    BOOL rio_mode;                      // True if created with ioring_create_rio
+    RIO_CQ rio_cq;                      // RIO completion queue
+    buffer_pool_t* pool;                // Slab allocator for recv/send buffers (new API)
+    uint32_t rio_max_connections;       // Max concurrent connections
+    uint32_t rio_active_connections;    // Current active connections
+    uint32_t rio_outstanding_per_socket;// Max outstanding ops per direction per socket
+    uint32_t rio_cq_size;               // Actual CQ size
+    rio_connection_t* rio_connections;  // Per-connection state
+    HANDLE rio_event;                   // Event for completion notification
+    HANDLE rio_iocp;                    // IOCP for RIO completions (if using IOCP mode)
+
+    // Legacy fixed-buffer mode (for backwards compatibility with existing API)
+    char* rio_buffer;                   // Contiguous buffer for all connections
+    RIO_BUFFERID rio_buf_id;            // Registered buffer ID
+    uint32_t rio_recv_buf_size;         // Receive buffer size per connection
+    uint32_t rio_send_buf_size;         // Send buffer size per connection
+
+    // Owned listener sockets (library creates these)
+    SOCKET* owned_listeners;            // Array of listener sockets we created
+    uint32_t owned_listener_count;
+    uint32_t owned_listener_capacity;
 
     // AcceptEx support (RIO mode only)
     acceptex_context_t* accept_pool;    // Pool of pending AcceptEx contexts
@@ -190,6 +270,93 @@ static BOOL init_rio(void) {
     }
     closesocket(sock);
     return rio_initialized;
+}
+
+// =============================================================================
+// Buffer Pool Implementation (LIFO Slab Allocator)
+// =============================================================================
+
+static buffer_pool_t* pool_create(uint32_t slab_size, uint32_t slab_count) {
+    buffer_pool_t* pool = (buffer_pool_t*)calloc(1, sizeof(buffer_pool_t));
+    if (!pool) return NULL;
+
+    pool->slab_size = slab_size;
+    pool->slab_count = slab_count;
+
+    // Allocate the buffer memory (page-aligned for optimal DMA)
+    size_t total_size = (size_t)slab_size * slab_count;
+    pool->base = (char*)VirtualAlloc(NULL, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pool->base) {
+        free(pool);
+        return NULL;
+    }
+
+    // Register with RIO
+    pool->buffer_id = rio.RIORegisterBuffer(pool->base, (DWORD)total_size);
+    if (pool->buffer_id == RIO_INVALID_BUFFERID) {
+        VirtualFree(pool->base, 0, MEM_RELEASE);
+        free(pool);
+        return NULL;
+    }
+
+    // Allocate free stack
+    pool->free_stack = (uint32_t*)malloc(slab_count * sizeof(uint32_t));
+    if (!pool->free_stack) {
+        rio.RIODeregisterBuffer(pool->buffer_id);
+        VirtualFree(pool->base, 0, MEM_RELEASE);
+        free(pool);
+        return NULL;
+    }
+
+    // Initialize free stack with all indices (LIFO: push in reverse order)
+    for (uint32_t i = 0; i < slab_count; i++) {
+        pool->free_stack[i] = i;
+    }
+    pool->stack_top = slab_count;  // All slabs are free
+
+    InitializeSRWLock(&pool->lock);
+    return pool;
+}
+
+static void pool_destroy(buffer_pool_t* pool) {
+    if (!pool) return;
+
+    if (pool->buffer_id != RIO_INVALID_BUFFERID) {
+        rio.RIODeregisterBuffer(pool->buffer_id);
+    }
+    if (pool->base) {
+        VirtualFree(pool->base, 0, MEM_RELEASE);
+    }
+    if (pool->free_stack) {
+        free(pool->free_stack);
+    }
+    free(pool);
+}
+
+// O(1) allocation - returns offset into pool, or -1 if empty
+static int32_t pool_alloc(buffer_pool_t* pool) {
+    AcquireSRWLockExclusive(&pool->lock);
+
+    if (pool->stack_top == 0) {
+        ReleaseSRWLockExclusive(&pool->lock);
+        return -1;  // Pool exhausted (backpressure)
+    }
+
+    uint32_t index = pool->free_stack[--pool->stack_top];
+    ReleaseSRWLockExclusive(&pool->lock);
+
+    return (int32_t)(index * pool->slab_size);
+}
+
+// O(1) free - returns slab to pool
+static void pool_free(buffer_pool_t* pool, int32_t offset) {
+    if (offset < 0) return;
+
+    uint32_t index = (uint32_t)offset / pool->slab_size;
+
+    AcquireSRWLockExclusive(&pool->lock);
+    pool->free_stack[pool->stack_top++] = index;
+    ReleaseSRWLockExclusive(&pool->lock);
 }
 
 // =============================================================================
@@ -265,11 +432,24 @@ IORING_API void ioring_destroy(ioring_t* ring) {
     if (!ring) return;
 
     if (ring->rio_mode) {
+        // Cleanup owned listener sockets
+        if (ring->owned_listeners) {
+            for (uint32_t i = 0; i < ring->owned_listener_count; i++) {
+                if (ring->owned_listeners[i] != INVALID_SOCKET) {
+                    closesocket(ring->owned_listeners[i]);
+                }
+            }
+            free(ring->owned_listeners);
+        }
+
         // Cleanup AcceptEx pool
         if (ring->accept_pool) {
             for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
                 if (ring->accept_pool[i].accept_socket != INVALID_SOCKET) {
                     closesocket(ring->accept_pool[i].accept_socket);
+                }
+                if (ring->accept_pool[i].event) {
+                    CloseHandle(ring->accept_pool[i].event);
                 }
             }
             free(ring->accept_pool);
@@ -278,23 +458,53 @@ IORING_API void ioring_destroy(ioring_t* ring) {
             CloseHandle(ring->accept_iocp);
         }
 
-        // Cleanup RIO resources
+        // Cleanup RIO connections (close sockets, free slabs)
         if (ring->rio_connections) {
             for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
-                if (ring->rio_connections[i].active && ring->rio_connections[i].rq != RIO_INVALID_RQ) {
-                    // RQ is automatically cleaned up when socket closes
+                rio_connection_t* conn = &ring->rio_connections[i];
+                if (conn->active || conn->reserved) {
+                    // Free any allocated recv slabs
+                    for (int j = 0; j < MAX_OUTSTANDING_RECV; j++) {
+                        if (conn->recv_slot_mask & (1 << j)) {
+                            pool_free(ring->pool, (int32_t)conn->recv_slab_offsets[j]);
+                        }
+                    }
+                    // Free any allocated send slabs
+                    for (int j = 0; j < MAX_OUTSTANDING_SEND; j++) {
+                        if (conn->send_slot_mask & (1 << j)) {
+                            pool_free(ring->pool, (int32_t)conn->send_slab_offsets[j]);
+                        }
+                    }
+                    // Close socket if we own it
+                    if (conn->socket != INVALID_SOCKET) {
+                        closesocket(conn->socket);
+                    }
                 }
             }
             free(ring->rio_connections);
         }
+
+        // Close RIO completion queue
         if (ring->rio_cq != RIO_INVALID_CQ) {
             rio.RIOCloseCompletionQueue(ring->rio_cq);
         }
-        if (ring->rio_buf_id != RIO_INVALID_BUFFERID) {
+
+        // Destroy buffer pool (deregisters and frees memory)
+        if (ring->pool) {
+            pool_destroy(ring->pool);
+        }
+
+        // Cleanup legacy buffer
+        if (ring->rio_buf_id != RIO_INVALID_BUFFERID && rio.RIODeregisterBuffer) {
             rio.RIODeregisterBuffer(ring->rio_buf_id);
         }
         if (ring->rio_buffer) {
             VirtualFree(ring->rio_buffer, 0, MEM_RELEASE);
+        }
+
+        // Close handles
+        if (ring->rio_iocp) {
+            CloseHandle(ring->rio_iocp);
         }
         if (ring->rio_event) {
             CloseHandle(ring->rio_event);
@@ -492,8 +702,9 @@ static int legacy_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
     }
 }
 
-// Forward declaration
+// Forward declarations
 static void check_acceptex_completions(ioring_t* ring);
+static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_data);
 
 // Execute operation in RIO mode
 static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
@@ -533,10 +744,22 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
             buf.Offset = conn->recv_offset;
             buf.Length = sqe->len;
 
+            // Diagnostic: track what we're using
+            g_rio_conn_id_used = conn_id;
+            g_rio_rq_used = conn->rq;
+            g_rio_buf_id_used = buf.BufferId;
+            g_rio_buf_offset_used = buf.Offset;
+
             while (!success && retries < max_retries) {
+                InterlockedIncrement(&g_rio_recv_calls);
+                WSASetLastError(0);
                 success = rio.RIOReceive(conn->rq, &buf, 1, 0, (PVOID)sqe->user_data);
-                if (!success) {
+                if (success) {
+                    InterlockedIncrement(&g_rio_recv_success);
+                } else {
+                    InterlockedIncrement(&g_rio_recv_fail);
                     int err = WSAGetLastError();
+                    g_rio_last_recv_error = err;
                     if (err == WSAENOBUFS && retries < max_retries - 1) {
                         // CQ might be full, drain completions and retry
                         dequeue_rio_completions(ring);
@@ -626,8 +849,8 @@ static void process_pending_polls(ioring_t* ring) {
 static void dequeue_rio_completions(ioring_t* ring) {
     if (!ring->rio_mode) return;
 
-    // First check for AcceptEx completions
-    if (ring->accept_iocp) {
+    // First check for AcceptEx completions (now using event-based notification)
+    if (ring->accept_pool) {
         check_acceptex_completions(ring);
     }
 
@@ -645,7 +868,10 @@ static void dequeue_rio_completions(ioring_t* ring) {
     uint32_t max_dequeue = cq_space < 256 ? cq_space : 256;
 
     RIORESULT results[256];
+    InterlockedIncrement(&g_rio_dequeue_calls);
+    g_rio_cq_used = ring->rio_cq;  // Track which CQ we're using
     ULONG count = rio.RIODequeueCompletion(ring->rio_cq, results, max_dequeue);
+    InterlockedAdd(&g_rio_dequeue_total, count);
 
     if (count == RIO_CORRUPT_CQ) {
         // CQ is corrupt, nothing we can do
@@ -657,6 +883,7 @@ static void dequeue_rio_completions(ioring_t* ring) {
         int32_t res = (results[i].Status == 0) ? (int32_t)results[i].BytesTransferred : -(int32_t)results[i].Status;
         complete_op(ring, user_data, res, 0);
     }
+
 }
 
 IORING_API int ioring_submit(ioring_t* ring) {
@@ -809,6 +1036,8 @@ IORING_API ioring_t* ioring_create_rio_ex(
     // Clamp outstanding_per_socket to valid range
     if (outstanding_per_socket == 0) outstanding_per_socket = RIO_DEFAULT_OUTSTANDING_PER_SOCKET;
     if (outstanding_per_socket > RIO_MAX_OUTSTANDING_PER_SOCKET) outstanding_per_socket = RIO_MAX_OUTSTANDING_PER_SOCKET;
+    // Also clamp to MAX_OUTSTANDING_RECV/SEND
+    if (outstanding_per_socket > MAX_OUTSTANDING_RECV) outstanding_per_socket = MAX_OUTSTANDING_RECV;
 
     ioring_t* ring = calloc(1, sizeof(ioring_t));
     if (!ring) {
@@ -827,12 +1056,9 @@ IORING_API ioring_t* ioring_create_rio_ex(
     ring->cq_mask = ring->cq_entries - 1;
     ring->rio_mode = TRUE;
     ring->backend = IORING_BACKEND_RIO;
-    ring->rio_recv_buf_size = recv_buffer_size;
-    ring->rio_send_buf_size = send_buffer_size;
     ring->rio_max_connections = max_connections;
     ring->rio_outstanding_per_socket = outstanding_per_socket;
     ring->rio_cq = RIO_INVALID_CQ;
-    ring->rio_buf_id = RIO_INVALID_BUFFERID;
 
     // Allocate user-space queues
     ring->sq = (ioring_sqe_t*)calloc(entries, sizeof(ioring_sqe_t));
@@ -849,55 +1075,90 @@ IORING_API ioring_t* ioring_create_rio_ex(
     if (!ring->rio_connections) {
         goto fail;
     }
+    // Initialize connections
     for (uint32_t i = 0; i < max_connections; i++) {
+        ring->rio_connections[i].socket = INVALID_SOCKET;
         ring->rio_connections[i].rq = RIO_INVALID_RQ;
+        ring->rio_connections[i].recv_slot_mask = 0;
+        ring->rio_connections[i].send_slot_mask = 0;
+        ring->rio_connections[i].current_recv_slot = -1;
+        ring->rio_connections[i].active = FALSE;
+        ring->rio_connections[i].reserved = FALSE;
     }
 
-    // Calculate total buffer size (recv + send per connection)
-    uint32_t per_connection = recv_buffer_size + send_buffer_size;
-    ring->rio_buffer_size = per_connection * max_connections;
+    // ==========================================================================
+    // Create Buffer Pool (LIFO Slab Allocator)
+    // ==========================================================================
+    // Calculate number of slabs needed:
+    // - Each connection can have up to outstanding_per_socket recv + outstanding_per_socket send
+    // - Total slabs = max_connections * outstanding_per_socket * 2
+    // - Add 20% headroom for flexibility
+    uint32_t slab_size = recv_buffer_size > send_buffer_size ? recv_buffer_size : send_buffer_size;
+    if (slab_size < DEFAULT_SLAB_SIZE) slab_size = DEFAULT_SLAB_SIZE;
+    // Round up to page size for optimal DMA
+    slab_size = (slab_size + 4095) & ~4095;
 
-    // Allocate RIO buffer (must be page-aligned)
-    ring->rio_buffer = (char*)VirtualAlloc(NULL, ring->rio_buffer_size,
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    uint32_t total_slabs = max_connections * outstanding_per_socket * 2;
+    total_slabs = (total_slabs * 120) / 100;  // 20% headroom
+    if (total_slabs < 256) total_slabs = 256;  // Minimum pool size
+
+    ring->pool = pool_create(slab_size, total_slabs);
+    if (!ring->pool) {
+        goto fail;
+    }
+
+    // ==========================================================================
+    // Legacy Fixed-Offset Buffer (for backwards compatibility)
+    // ==========================================================================
+    ring->rio_recv_buf_size = recv_buffer_size;
+    ring->rio_send_buf_size = send_buffer_size;
+    uint32_t per_connection_size = recv_buffer_size + send_buffer_size;
+    size_t legacy_buffer_size = (size_t)max_connections * per_connection_size;
+
+    ring->rio_buffer = (char*)VirtualAlloc(NULL, legacy_buffer_size,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!ring->rio_buffer) {
         goto fail;
     }
 
-    // Register buffer with RIO
-    ring->rio_buf_id = rio.RIORegisterBuffer(ring->rio_buffer, ring->rio_buffer_size);
+    ring->rio_buf_id = rio.RIORegisterBuffer(ring->rio_buffer, (DWORD)legacy_buffer_size);
     if (ring->rio_buf_id == RIO_INVALID_BUFFERID) {
         goto fail;
     }
 
-    // Create completion event
-    ring->rio_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!ring->rio_event) {
-        goto fail;
+    // Initialize per-connection offsets
+    for (uint32_t i = 0; i < max_connections; i++) {
+        uint32_t base_offset = i * per_connection_size;
+        ring->rio_connections[i].recv_offset = base_offset;
+        ring->rio_connections[i].send_offset = base_offset + recv_buffer_size;
     }
+
+    // Create IOCP for RIO completions (optional, can use polling)
+    ring->rio_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+    // Not fatal if this fails - we can use polling
 
     // Create RIO completion queue
     // CQ must be large enough for all outstanding operations across all RQs
-    // CQ size = max_connections * outstanding_per_socket * 2 (recv + send)
     uint32_t rio_cq_size = max_connections * outstanding_per_socket * 2;
     if (rio_cq_size < ring->cq_entries) {
         rio_cq_size = ring->cq_entries;
     }
-    // RIO CQ max is typically around 8 million, but let's cap at something reasonable
     if (rio_cq_size > 2000000) {
         rio_cq_size = 2000000;
     }
     ring->rio_cq_size = rio_cq_size;
 
-    // Use polling mode (no notification) - we'll poll with RIODequeueCompletion
-    // Event-based notification can cause issues on some systems
+    // Use polling mode for RIO CQ - simpler and works without RIONotify
     ring->rio_cq = rio.RIOCreateCompletionQueue(rio_cq_size, NULL);
+
     if (ring->rio_cq == RIO_INVALID_CQ) {
         goto fail;
     }
 
+    // Create event for fallback notification (not used in polling mode)
+    ring->rio_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+
     // Initialize AcceptEx pool for server-side RIO support
-    // Size the pool to handle a reasonable number of concurrent accepts
     uint32_t accept_pool_size = max_connections < 64 ? max_connections : 64;
     ring->accept_pool_size = accept_pool_size;
     ring->accept_pool = calloc(accept_pool_size, sizeof(acceptex_context_t));
@@ -908,19 +1169,26 @@ IORING_API ioring_t* ioring_create_rio_ex(
         ring->accept_pool[i].accept_socket = INVALID_SOCKET;
         ring->accept_pool[i].pending = FALSE;
         ring->accept_pool[i].completed = FALSE;
+        ring->accept_pool[i].rq = RIO_INVALID_RQ;
+        ring->accept_pool[i].conn_slot = -1;
+        // Create event for this accept context (event-based notification instead of IOCP)
+        ring->accept_pool[i].event = CreateEventW(NULL, TRUE, FALSE, NULL);  // Manual reset
+        if (!ring->accept_pool[i].event) {
+            goto fail;
+        }
     }
 
-    // Create IOCP for AcceptEx completion notifications
-    ring->accept_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
-    if (!ring->accept_iocp) {
+    // NOTE: We no longer use IOCP for AcceptEx - using events instead
+    // This avoids potential interference with RIO
+    ring->accept_iocp = NULL;
+
+    // Initialize owned listeners array
+    ring->owned_listener_capacity = 16;
+    ring->owned_listeners = calloc(ring->owned_listener_capacity, sizeof(SOCKET));
+    if (!ring->owned_listeners) {
         goto fail;
     }
-
-    // Initialize connection buffer offsets
-    for (uint32_t i = 0; i < max_connections; i++) {
-        ring->rio_connections[i].recv_offset = i * per_connection;
-        ring->rio_connections[i].send_offset = i * per_connection + recv_buffer_size;
-    }
+    ring->owned_listener_count = 0;
 
     return ring;
 
@@ -929,178 +1197,6 @@ fail:
     if (last_error == 0) last_error = ERROR_OUTOFMEMORY;
     ioring_destroy(ring);
     return NULL;
-}
-
-// Diagnostic: Check if RIO is properly initialized
-IORING_API int ioring_rio_check_init(void) {
-    if (!rio_initialized) return -1;
-    if (!rio.RIOCreateRequestQueue) return -2;
-    if (!rio.RIOCreateCompletionQueue) return -3;
-    if (!rio.RIORegisterBuffer) return -4;
-    if (!rio.RIOReceive) return -5;
-    if (!rio.RIOSend) return -6;
-    if (!rio.RIODequeueCompletion) return -7;
-    return 0;  // All good
-}
-
-// Diagnostic: Test RIO setup with a fresh socket we create ourselves
-// Returns 0 on success, negative error code on failure
-// This helps diagnose if the issue is with RIO setup or with external sockets
-//
-// Return codes:
-// -1: RIO init failed
-// -2: Socket creation failed
-// -3: Bind failed
-// -4: Buffer alloc failed
-// -5: Buffer registration failed
-// -6: CQ creation failed
-// -7: RQ creation failed on accepted socket (expected - accept() doesn't inherit WSA_FLAG_REGISTERED_IO)
-// -8: Listen failed
-// -9: Client socket creation failed
-// -10: Connect failed
-// -11: Accept failed
-// -12: RQ creation failed on CLIENT socket (this would indicate a real problem)
-// 1: RQ works on client but not accepted socket (expected behavior)
-IORING_API int ioring_rio_test_setup(void) {
-    if (!init_rio()) {
-        last_error = 1;  // RIO init failed
-        return -1;
-    }
-
-    // Allocate a small buffer first
-    char* buffer = (char*)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!buffer) {
-        last_error = GetLastError();
-        return -4;  // Buffer alloc failed
-    }
-
-    // Register buffer
-    RIO_BUFFERID buf_id = rio.RIORegisterBuffer(buffer, 4096);
-    if (buf_id == RIO_INVALID_BUFFERID) {
-        last_error = WSAGetLastError();
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -5;  // Buffer registration failed
-    }
-
-    // Create completion queue (polling mode)
-    RIO_CQ cq = rio.RIOCreateCompletionQueue(256, NULL);
-    if (cq == RIO_INVALID_CQ) {
-        last_error = WSAGetLastError();
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -6;  // CQ creation failed
-    }
-
-    // Create listener socket
-    SOCKET listener = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_REGISTERED_IO);
-    if (listener == INVALID_SOCKET) {
-        last_error = WSAGetLastError();
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -2;  // Socket creation failed
-    }
-
-    // Bind listener
-    struct sockaddr_in addr = { 0 };
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        last_error = WSAGetLastError();
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -3;  // Bind failed
-    }
-
-    // Listen
-    if (listen(listener, 1) == SOCKET_ERROR) {
-        last_error = WSAGetLastError();
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -8;  // Listen failed
-    }
-
-    // Get the port we bound to
-    int addrlen = sizeof(addr);
-    getsockname(listener, (struct sockaddr*)&addr, &addrlen);
-
-    // Create client socket and connect
-    SOCKET client = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_REGISTERED_IO);
-    if (client == INVALID_SOCKET) {
-        last_error = WSAGetLastError();
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -9;  // Client socket creation failed
-    }
-
-    // Connect (non-blocking would be better but for test this is fine)
-    if (connect(client, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        last_error = WSAGetLastError();
-        closesocket(client);
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -10;  // Connect failed
-    }
-
-    // Accept
-    SOCKET server = accept(listener, NULL, NULL);
-    if (server == INVALID_SOCKET) {
-        last_error = WSAGetLastError();
-        closesocket(client);
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -11;  // Accept failed
-    }
-
-    // First, try to create RQ on the CLIENT socket (created with WSA_FLAG_REGISTERED_IO)
-    // This SHOULD work
-    WSASetLastError(0);
-    RIO_RQ client_rq = rio.RIOCreateRequestQueue(client, 2, 1, 2, 1, cq, cq, NULL);
-    if (client_rq == RIO_INVALID_RQ) {
-        // If even the client socket fails, there's a fundamental RIO problem
-        last_error = WSAGetLastError();
-        closesocket(server);
-        closesocket(client);
-        closesocket(listener);
-        rio.RIOCloseCompletionQueue(cq);
-        rio.RIODeregisterBuffer(buf_id);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return -12;  // RQ creation failed on CLIENT socket - real problem!
-    }
-
-    // Now try to create RQ on the accepted server socket
-    // This is expected to FAIL with 10045 because accept() doesn't inherit WSA_FLAG_REGISTERED_IO
-    WSASetLastError(0);
-    RIO_RQ server_rq = rio.RIOCreateRequestQueue(server, 2, 1, 2, 1, cq, cq, NULL);
-    BOOL server_rq_works = (server_rq != RIO_INVALID_RQ);
-    if (!server_rq_works) {
-        last_error = WSAGetLastError();  // Save error for diagnostics
-    }
-
-    // Clean up
-    closesocket(server);
-    closesocket(client);
-    closesocket(listener);
-    rio.RIOCloseCompletionQueue(cq);
-    rio.RIODeregisterBuffer(buf_id);
-    VirtualFree(buffer, 0, MEM_RELEASE);
-
-    if (server_rq_works) {
-        return 0;  // Both worked - full RIO support!
-    } else {
-        return 1;  // Client works, server doesn't - expected (need AcceptEx with pre-created sockets)
-    }
 }
 
 IORING_API int ioring_rio_register(
@@ -1123,6 +1219,21 @@ IORING_API int ioring_rio_register(
     if (socket == INVALID_SOCKET) {
         last_error = WSAENOTSOCK;
         return -1;
+    }
+
+    // Check if this socket is already registered (e.g., from AcceptEx)
+    for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
+        if (ring->rio_connections[i].active && ring->rio_connections[i].socket == socket) {
+            // Socket already registered - just return buffer pointers
+            rio_connection_t* conn = &ring->rio_connections[i];
+            if (recv_buf) {
+                *recv_buf = ring->rio_buffer + conn->recv_offset;
+            }
+            if (send_buf) {
+                *send_buf = ring->rio_buffer + conn->send_offset;
+            }
+            return (int)i;
+        }
     }
 
     // Find free slot
@@ -1222,6 +1333,243 @@ IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring) {
     return ring && ring->rio_mode ? ring->rio_active_connections : 0;
 }
 
+// Diagnostic: Get connection state for debugging
+// Returns packed value: (active << 0) | (rq_valid << 1) | (socket_valid << 2)
+// Negative value indicates error
+IORING_API int ioring_rio_get_conn_state(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    int state = 0;
+    if (conn->active) state |= 1;
+    if (conn->rq != RIO_INVALID_RQ) state |= 2;
+    if (conn->socket != INVALID_SOCKET) state |= 4;
+    return state;
+}
+
+// Diagnostic: Check if RIOReceive parameters are valid (does NOT actually post)
+// Returns: 1 if all parameters valid, negative error code if invalid
+IORING_API int ioring_rio_check_recv_params(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+    if (ring->rio_cq == RIO_INVALID_CQ) return -3;
+    if (ring->rio_buf_id == RIO_INVALID_BUFFERID) return -4;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    if (!conn->active) return -5;
+    if (conn->rq == RIO_INVALID_RQ) return -6;
+    if (!rio.RIOReceive) return -7;
+
+    return 1;  // All parameters valid
+}
+
+// Diagnostic: Get number of completions waiting in RIO CQ
+IORING_API int ioring_rio_peek_cq_count(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (ring->rio_cq == RIO_INVALID_CQ) return -2;
+
+    // Return the user-space CQ count
+    return (int)(ring->cq_tail - ring->cq_head);
+}
+
+// Diagnostic: Get RIO operation stats
+// Returns packed: recv_calls | (recv_success << 16)
+IORING_API uint32_t ioring_rio_get_recv_stats(void) {
+    return (uint32_t)((g_rio_recv_success << 16) | (g_rio_recv_calls & 0xFFFF));
+}
+
+// Diagnostic: Get last RIOReceive error
+IORING_API int ioring_rio_get_last_recv_error(void) {
+    return g_rio_last_recv_error;
+}
+
+// Diagnostic: Get dequeue stats
+// Returns packed: dequeue_calls | (dequeue_total << 16)
+IORING_API uint32_t ioring_rio_get_dequeue_stats(void) {
+    return (uint32_t)((g_rio_dequeue_total << 16) | (g_rio_dequeue_calls & 0xFFFF));
+}
+
+// Diagnostic: Reset all counters
+IORING_API void ioring_rio_reset_stats(void) {
+    g_rio_recv_calls = 0;
+    g_rio_recv_success = 0;
+    g_rio_recv_fail = 0;
+    g_rio_dequeue_calls = 0;
+    g_rio_dequeue_total = 0;
+    g_rio_last_recv_error = 0;
+    g_rio_cq_used = RIO_INVALID_CQ;
+    g_rio_rq_created = RIO_INVALID_RQ;
+    g_rio_rq_used = RIO_INVALID_RQ;
+    g_rio_buf_id_used = RIO_INVALID_BUFFERID;
+    g_rio_buf_offset_used = 0xFFFFFFFF;
+    g_rio_conn_slot_created = -1;
+    g_rio_conn_id_used = -1;
+    g_rio_cq_at_rq_create = RIO_INVALID_CQ;
+    g_rio_update_accept_ctx_result = -999;
+    g_rio_listen_socket_used = INVALID_SOCKET;
+    g_rio_accept_socket_used = INVALID_SOCKET;
+    g_rio_notify_calls = 0;
+}
+
+// Diagnostic: Get build version (to verify correct DLL is loaded)
+IORING_API int ioring_get_build_version(void) {
+    return IORING_BUILD_VERSION;
+}
+
+// Diagnostic: Get the CQ handle being used (0 = invalid/not set)
+IORING_API uint64_t ioring_rio_get_cq_handle(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return 0;
+    return (uint64_t)ring->rio_cq;
+}
+
+// Diagnostic: Get the RQ handle that was created (for AcceptEx sockets)
+IORING_API uint64_t ioring_rio_get_rq_created(void) {
+    return (uint64_t)g_rio_rq_created;
+}
+
+// Diagnostic: Get the RQ handle used in RIOReceive
+IORING_API uint64_t ioring_rio_get_rq_used(void) {
+    return (uint64_t)g_rio_rq_used;
+}
+
+// Diagnostic: Get the buffer ID used in RIOReceive
+IORING_API uint64_t ioring_rio_get_buf_id_used(void) {
+    return (uint64_t)g_rio_buf_id_used;
+}
+
+// Diagnostic: Get the buffer offset used in RIOReceive
+IORING_API uint32_t ioring_rio_get_buf_offset_used(void) {
+    return g_rio_buf_offset_used;
+}
+
+// Diagnostic: Verify buffer registration is valid for the ring
+IORING_API int ioring_rio_check_buffer_registration(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (ring->rio_buf_id == RIO_INVALID_BUFFERID) return -2;
+    if (!ring->rio_buffer) return -3;
+    return 1;  // All good
+}
+
+// Diagnostic: Get the connection slot that was created (during AcceptEx)
+IORING_API int ioring_rio_get_conn_slot_created(void) {
+    return g_rio_conn_slot_created;
+}
+
+// Diagnostic: Get the connection ID used in RIOReceive
+IORING_API int ioring_rio_get_conn_id_used(void) {
+    return g_rio_conn_id_used;
+}
+
+// Diagnostic: Get the CQ used when creating the RQ (to compare with polling CQ)
+IORING_API uint64_t ioring_rio_get_cq_at_rq_create(void) {
+    return (uint64_t)g_rio_cq_at_rq_create;
+}
+
+// Diagnostic: Check if socket has data available using WSAPoll
+// Returns: 1 if readable, 0 if not, -error on error
+IORING_API int ioring_rio_check_socket_readable(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    if (!conn->active || conn->socket == INVALID_SOCKET) return -3;
+
+    WSAPOLLFD pfd;
+    pfd.fd = conn->socket;
+    pfd.events = POLLRDNORM;
+    pfd.revents = 0;
+
+    int result = WSAPoll(&pfd, 1, 0);  // Non-blocking poll
+    if (result < 0) return -WSAGetLastError();
+    if (result == 0) return 0;  // No data
+    return (pfd.revents & POLLRDNORM) ? 1 : 0;
+}
+
+// Diagnostic: Get the raw socket handle stored for a connection
+IORING_API uint64_t ioring_rio_get_conn_socket(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return 0;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return 0;
+    return (uint64_t)ring->rio_connections[conn_id].socket;
+}
+
+// Diagnostic: Verify socket is valid using getsockopt (SO_TYPE)
+// Returns: socket type (SOCK_STREAM=1, SOCK_DGRAM=2) on success, -error on failure
+IORING_API int ioring_rio_verify_socket_valid(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    if (!conn->active || conn->socket == INVALID_SOCKET) return -3;
+
+    int sock_type = 0;
+    int optlen = sizeof(sock_type);
+    WSASetLastError(0);
+    if (getsockopt(conn->socket, SOL_SOCKET, SO_TYPE, (char*)&sock_type, &optlen) == SOCKET_ERROR) {
+        return -WSAGetLastError();
+    }
+    return sock_type;
+}
+
+// Diagnostic: Check how much data is pending on the socket using FIONREAD
+IORING_API int ioring_rio_get_socket_pending_bytes(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    if (!conn->active || conn->socket == INVALID_SOCKET) return -3;
+
+    u_long bytes_available = 0;
+    WSASetLastError(0);
+    if (ioctlsocket(conn->socket, FIONREAD, &bytes_available) == SOCKET_ERROR) {
+        return -WSAGetLastError();
+    }
+    return (int)bytes_available;
+}
+
+// Diagnostic: Get the buffer ID registered with the ring
+IORING_API uint64_t ioring_rio_get_buffer_id(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return 0;
+    return (uint64_t)ring->rio_buf_id;
+}
+
+// Diagnostic: Get SO_UPDATE_ACCEPT_CONTEXT result (0=success, >0=WSA error)
+IORING_API int ioring_rio_get_update_accept_ctx_result(void) {
+    return g_rio_update_accept_ctx_result;
+}
+
+// Diagnostic: Get the listener socket used in SO_UPDATE_ACCEPT_CONTEXT
+IORING_API uint64_t ioring_rio_get_listen_socket_used(void) {
+    return (uint64_t)g_rio_listen_socket_used;
+}
+
+// Diagnostic: Get the accept socket used in SO_UPDATE_ACCEPT_CONTEXT
+IORING_API uint64_t ioring_rio_get_accept_socket_at_update(void) {
+    return (uint64_t)g_rio_accept_socket_used;
+}
+
+// Diagnostic: Get RIONotify call count
+IORING_API int ioring_rio_get_notify_calls(void) {
+    return (int)g_rio_notify_calls;
+}
+
+// Diagnostic: Check if any data was written to the receive buffer
+// Returns: first 4 bytes of buffer as int, or -1 if invalid
+IORING_API int ioring_rio_peek_recv_buffer(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return -1;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return -2;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    if (!conn->active) return -3;
+
+    // Get pointer to the recv buffer for this connection
+    char* recv_buf = ring->rio_buffer + conn->recv_offset;
+
+    // Return first 4 bytes as an integer (to see if any data was written)
+    // "Hell" = 0x6C6C6548 in little-endian
+    return *(int*)recv_buf;
+}
+
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
 // =============================================================================
@@ -1262,6 +1610,8 @@ static int find_free_accept_slot(ioring_t* ring) {
 }
 
 // Post an AcceptEx operation
+// NOTE: RQ creation is deferred to check_acceptex_completions (after SO_UPDATE_ACCEPT_CONTEXT)
+// This matches the pattern used by RioSharp and is required for proper RIO initialization
 static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_data) {
     // Load AcceptEx if not already done
     if (!load_acceptex_functions(ring, listen_socket)) {
@@ -1278,28 +1628,44 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 
     acceptex_context_t* ctx = &ring->accept_pool[slot];
 
-    // Create accept socket with RIO flag
+    // Create accept socket with RIO flag ONLY (no OVERLAPPED - that's for the operation, not the socket)
+    // The working client socket test uses only WSA_FLAG_REGISTERED_IO
     ctx->accept_socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
-                                     WSA_FLAG_REGISTERED_IO | WSA_FLAG_OVERLAPPED);
+                                     WSA_FLAG_REGISTERED_IO);
     if (ctx->accept_socket == INVALID_SOCKET) {
         last_error = WSAGetLastError();
         return FALSE;
     }
 
-    // Associate accept socket with IOCP for completion notification
-    if (CreateIoCompletionPort((HANDLE)listen_socket, ring->accept_iocp, (ULONG_PTR)slot, 0) == NULL) {
-        // Might already be associated, that's OK
-        DWORD err = GetLastError();
-        if (err != ERROR_INVALID_PARAMETER) {
-            closesocket(ctx->accept_socket);
-            ctx->accept_socket = INVALID_SOCKET;
-            last_error = err;
-            return FALSE;
+    // Reserve a connection slot (RQ will be created after AcceptEx completes)
+    // BUG FIX: Must check BOTH active AND reserved flags to prevent slot collision
+    int conn_slot = -1;
+    for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
+        if (!ring->rio_connections[i].active && !ring->rio_connections[i].reserved) {
+            conn_slot = i;
+            break;
         }
     }
 
-    // Initialize overlapped structure
+    if (conn_slot < 0) {
+        closesocket(ctx->accept_socket);
+        ctx->accept_socket = INVALID_SOCKET;
+        last_error = WSAENOBUFS;
+        return FALSE;
+    }
+
+    // IMMEDIATELY mark slot as reserved to prevent collision with concurrent AcceptEx calls
+    ring->rio_connections[conn_slot].reserved = TRUE;
+
+    // Store connection slot in context (RQ created later in check_acceptex_completions)
+    ctx->rq = RIO_INVALID_RQ;  // Will be created after AcceptEx completes
+    ctx->conn_slot = conn_slot;
+
+    // Use event-based notification instead of IOCP (avoids potential RIO interference)
+    // Initialize overlapped structure with event
     memset(&ctx->overlapped, 0, sizeof(ctx->overlapped));
+    ResetEvent(ctx->event);  // Reset before use
+    ctx->overlapped.hEvent = ctx->event;  // Event-based notification
     ctx->listen_socket = listen_socket;
     ctx->user_data = user_data;
     ctx->bytes_received = 0;
@@ -1322,10 +1688,12 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     if (!result) {
         DWORD err = WSAGetLastError();
         if (err != ERROR_IO_PENDING) {
-            // Real error
+            // Real error - clear reservation
+            ring->rio_connections[conn_slot].reserved = FALSE;
             closesocket(ctx->accept_socket);
             ctx->accept_socket = INVALID_SOCKET;
             ctx->pending = FALSE;
+            ctx->conn_slot = -1;
             last_error = err;
             return FALSE;
         }
@@ -1337,65 +1705,118 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 
 // Check for completed AcceptEx operations and add to completion queue
 static void check_acceptex_completions(ioring_t* ring) {
-    if (!ring->accept_iocp) return;
+    if (!ring->accept_pool) return;
 
-    DWORD bytes_transferred;
-    ULONG_PTR completion_key;
-    LPOVERLAPPED overlapped;
+    // Iterate through all pending accept contexts and check for completion via events
+    for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
+        acceptex_context_t* found_ctx = &ring->accept_pool[i];
 
-    // Non-blocking check for completions
-    while (GetQueuedCompletionStatus(ring->accept_iocp, &bytes_transferred,
-                                      &completion_key, &overlapped, 0)) {
-        if (!overlapped) continue;
+        if (!found_ctx->pending) continue;
 
-        // Find the accept context from the overlapped pointer
-        for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
-            acceptex_context_t* ctx = &ring->accept_pool[i];
-            if (&ctx->overlapped == overlapped && ctx->pending) {
-                // AcceptEx completed
-                ctx->pending = FALSE;
-                ctx->completed = TRUE;
-                ctx->bytes_received = bytes_transferred;
+        // Check if the event is signaled (non-blocking)
+        DWORD wait_result = WaitForSingleObject(found_ctx->event, 0);
+        if (wait_result != WAIT_OBJECT_0) continue;  // Not completed yet
 
-                // Update socket context so getsockname/getpeername work
-                setsockopt(ctx->accept_socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                           (char*)&ctx->listen_socket, sizeof(ctx->listen_socket));
+        // Event is signaled - AcceptEx has completed
+        found_ctx->pending = FALSE;
 
-                // Set non-blocking and linger options
-                u_long mode = 1;
-                ioctlsocket(ctx->accept_socket, FIONBIO, &mode);
-                struct linger lin = { 1, 0 };
-                setsockopt(ctx->accept_socket, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
+        // Get the result using GetOverlappedResult
+        DWORD bytes_transferred = 0;
+        BOOL result = GetOverlappedResult((HANDLE)found_ctx->listen_socket,
+                                          &found_ctx->overlapped,
+                                          &bytes_transferred,
+                                          FALSE);  // Don't wait
+
+        if (result) {
+            // AcceptEx completed successfully
+            found_ctx->completed = TRUE;
+            found_ctx->bytes_received = bytes_transferred;
+
+            // Update socket context so getsockname/getpeername work
+            // NOTE: This does NOT interfere with RIO - the fix was creating the
+            // listener socket with WSA_FLAG_REGISTERED_IO (see ioring_rio_create_listener)
+            g_rio_listen_socket_used = found_ctx->listen_socket;
+            g_rio_accept_socket_used = found_ctx->accept_socket;
+            WSASetLastError(0);
+            int update_result = setsockopt(found_ctx->accept_socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                       (char*)&found_ctx->listen_socket, sizeof(found_ctx->listen_socket));
+            g_rio_update_accept_ctx_result = (update_result == 0) ? 0 : WSAGetLastError();
+
+            int conn_slot = found_ctx->conn_slot;
+            if (conn_slot >= 0 && (uint32_t)conn_slot < ring->rio_max_connections) {
+                rio_connection_t* conn = &ring->rio_connections[conn_slot];
+
+                // NOW create the RQ - AFTER SO_UPDATE_ACCEPT_CONTEXT (per Gemini/RioSharp pattern)
+                // This is the key timing change from the previous implementation
+                WSASetLastError(0);
+                RIO_RQ rq = rio.RIOCreateRequestQueue(
+                    found_ctx->accept_socket,
+                    ring->rio_outstanding_per_socket,
+                    1,
+                    ring->rio_outstanding_per_socket,
+                    1,
+                    ring->rio_cq,
+                    ring->rio_cq,
+                    (PVOID)(uintptr_t)conn_slot
+                );
+
+                if (rq == RIO_INVALID_RQ) {
+                    // RQ creation failed - report error and clean up
+                    int rq_error = WSAGetLastError();
+                    conn->reserved = FALSE;
+                    closesocket(found_ctx->accept_socket);
+                    complete_op(ring, found_ctx->user_data, -rq_error, 0);
+
+                    found_ctx->accept_socket = INVALID_SOCKET;
+                    found_ctx->conn_slot = -1;
+                    found_ctx->completed = FALSE;
+                    continue;  // Process next completion
+                }
+
+                // Success - activate the connection
+                conn->socket = found_ctx->accept_socket;
+                conn->rq = rq;
+                conn->active = TRUE;
+                conn->reserved = FALSE;  // Clear reservation now that it's active
+                ring->rio_active_connections++;
+
+                // Diagnostic: track the RQ, slot, and CQ used at creation time
+                g_rio_rq_created = rq;
+                g_rio_conn_slot_created = conn_slot;
+                g_rio_cq_at_rq_create = ring->rio_cq;
 
                 // Add completion to user-space CQ
-                // Result is the accepted socket handle
-                complete_op(ring, ctx->user_data, (int32_t)ctx->accept_socket, 0);
-
-                // Reset context for reuse (socket ownership transferred to user)
-                ctx->accept_socket = INVALID_SOCKET;
-                ctx->completed = FALSE;
-                break;
+                // Result is the accepted socket handle (users can also use conn_slot)
+                complete_op(ring, found_ctx->user_data, (int32_t)found_ctx->accept_socket, 0);
+            } else {
+                // Invalid conn_slot - shouldn't happen, but handle gracefully
+                closesocket(found_ctx->accept_socket);
+                complete_op(ring, found_ctx->user_data, -EINVAL, 0);
             }
-        }
-    }
 
-    // Check for failed completions
-    DWORD err = GetLastError();
-    if (err != WAIT_TIMEOUT && overlapped) {
-        // Find and handle the failed accept
-        for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
-            acceptex_context_t* ctx = &ring->accept_pool[i];
-            if (&ctx->overlapped == overlapped && ctx->pending) {
-                ctx->pending = FALSE;
-                complete_op(ring, ctx->user_data, -(int32_t)err, 0);
+            // Reset context for reuse (socket now owned by connection slot)
+            found_ctx->accept_socket = INVALID_SOCKET;
+            found_ctx->conn_slot = -1;
+            found_ctx->completed = FALSE;
+        } else {
+            // AcceptEx failed (client disconnected during handshake, etc.)
+            DWORD err = GetLastError();
+            complete_op(ring, found_ctx->user_data, -(int32_t)err, 0);
 
-                // Clean up the socket
-                if (ctx->accept_socket != INVALID_SOCKET) {
-                    closesocket(ctx->accept_socket);
-                    ctx->accept_socket = INVALID_SOCKET;
-                }
-                break;
+            // Clean up the socket
+            if (found_ctx->accept_socket != INVALID_SOCKET) {
+                closesocket(found_ctx->accept_socket);
+                found_ctx->accept_socket = INVALID_SOCKET;
             }
+
+            // Clear reservation on the connection slot so it can be reused
+            int conn_slot = found_ctx->conn_slot;
+            if (conn_slot >= 0 && (uint32_t)conn_slot < ring->rio_max_connections) {
+                ring->rio_connections[conn_slot].reserved = FALSE;
+            }
+
+            found_ctx->rq = RIO_INVALID_RQ;
+            found_ctx->conn_slot = -1;
         }
     }
 }
@@ -1412,6 +1833,28 @@ IORING_API SOCKET ioring_rio_create_accept_socket(void) {
     }
 
     return sock;
+}
+
+// Connect a socket to the specified address (for testing RIO on client sockets)
+IORING_API int ioring_connect_socket(SOCKET sock, const char* ip_address, uint16_t port) {
+    init_winsock();
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, ip_address, &addr.sin_addr) != 1) {
+        last_error = WSAEINVAL;
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        last_error = WSAGetLastError();
+        return -1;
+    }
+
+    return 0;
 }
 
 // Cached AcceptEx function pointer
@@ -1456,4 +1899,162 @@ IORING_API void* ioring_get_acceptex(SOCKET listen_socket) {
     }
 
     return cached_acceptex;
+}
+
+// =============================================================================
+// RIO Listener Support
+// =============================================================================
+
+IORING_API SOCKET ioring_rio_create_listener(
+    ioring_t* ring,
+    const char* bind_addr,
+    uint16_t port,
+    int backlog
+) {
+    if (!ring) {
+        last_error = WSAEINVAL;
+        return INVALID_SOCKET;
+    }
+
+    init_winsock();
+
+    // CRITICAL: Listener MUST have WSA_FLAG_REGISTERED_IO for AcceptEx sockets to work with RIO
+    // Without this flag on the listener, RIO operations on accepted sockets silently fail
+    // (RIOReceive returns success but completions never appear in the CQ)
+    SOCKET listener = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_REGISTERED_IO);
+    if (listener == INVALID_SOCKET) {
+        last_error = WSAGetLastError();
+        return INVALID_SOCKET;
+    }
+
+    // Set SO_REUSEADDR to allow quick restarts
+    int opt = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+
+    // Set non-blocking mode
+    u_long mode = 1;
+    ioctlsocket(listener, FIONBIO, &mode);
+
+    // Bind to address
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (bind_addr && bind_addr[0]) {
+        // Use InetPtonA (modern replacement for inet_addr)
+        if (InetPtonA(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+            closesocket(listener);
+            last_error = WSAGetLastError();
+            return INVALID_SOCKET;
+        }
+    } else {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+
+    if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        last_error = WSAGetLastError();
+        closesocket(listener);
+        return INVALID_SOCKET;
+    }
+
+    // Start listening
+    if (listen(listener, backlog) == SOCKET_ERROR) {
+        last_error = WSAGetLastError();
+        closesocket(listener);
+        return INVALID_SOCKET;
+    }
+
+    // Associate with our AcceptEx IOCP (NOT the .NET runtime's IOCP)
+    if (ring->accept_iocp) {
+        if (!CreateIoCompletionPort((HANDLE)listener, ring->accept_iocp, (ULONG_PTR)listener, 0)) {
+            last_error = GetLastError();
+            closesocket(listener);
+            return INVALID_SOCKET;
+        }
+    }
+
+    // Track the listener in our owned_listeners array
+    if (ring->owned_listener_count >= ring->owned_listener_capacity) {
+        // Grow the array
+        uint32_t new_capacity = ring->owned_listener_capacity ? ring->owned_listener_capacity * 2 : 4;
+        SOCKET* new_array = (SOCKET*)realloc(ring->owned_listeners, new_capacity * sizeof(SOCKET));
+        if (!new_array) {
+            last_error = WSAENOBUFS;
+            closesocket(listener);
+            return INVALID_SOCKET;
+        }
+        ring->owned_listeners = new_array;
+        ring->owned_listener_capacity = new_capacity;
+    }
+    ring->owned_listeners[ring->owned_listener_count++] = listener;
+
+    // Cache AcceptEx function pointer if not already cached
+    if (!ring->fn_acceptex) {
+        GUID acceptex_guid = WSAID_ACCEPTEX;
+        DWORD bytes = 0;
+        WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &acceptex_guid, sizeof(acceptex_guid),
+                 &ring->fn_acceptex, sizeof(ring->fn_acceptex),
+                 &bytes, NULL, NULL);
+    }
+
+    if (!ring->fn_getacceptexsockaddrs) {
+        GUID sockaddrs_guid = WSAID_GETACCEPTEXSOCKADDRS;
+        DWORD bytes = 0;
+        WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &sockaddrs_guid, sizeof(sockaddrs_guid),
+                 &ring->fn_getacceptexsockaddrs, sizeof(ring->fn_getacceptexsockaddrs),
+                 &bytes, NULL, NULL);
+    }
+
+    return listener;
+}
+
+IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener) {
+    if (!ring || listener == INVALID_SOCKET) return;
+
+    // Cancel any pending AcceptEx operations for this listener
+    if (ring->accept_pool) {
+        for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
+            acceptex_context_t* ctx = &ring->accept_pool[i];
+            if (ctx->pending && ctx->listen_socket == listener) {
+                // Cancel the pending operation
+                CancelIoEx((HANDLE)listener, &ctx->overlapped);
+
+                // Clean up the accept socket
+                if (ctx->accept_socket != INVALID_SOCKET) {
+                    closesocket(ctx->accept_socket);
+                    ctx->accept_socket = INVALID_SOCKET;
+                }
+
+                // Clear reservation on the connection slot
+                if (ctx->conn_slot >= 0 && (uint32_t)ctx->conn_slot < ring->rio_max_connections) {
+                    ring->rio_connections[ctx->conn_slot].reserved = FALSE;
+                }
+
+                ctx->pending = FALSE;
+                ctx->rq = RIO_INVALID_RQ;
+                ctx->conn_slot = -1;
+            }
+        }
+    }
+
+    // Remove from owned_listeners array
+    for (uint32_t i = 0; i < ring->owned_listener_count; i++) {
+        if (ring->owned_listeners[i] == listener) {
+            // Shift remaining elements
+            for (uint32_t j = i; j < ring->owned_listener_count - 1; j++) {
+                ring->owned_listeners[j] = ring->owned_listeners[j + 1];
+            }
+            ring->owned_listener_count--;
+            break;
+        }
+    }
+
+    // Close the socket
+    closesocket(listener);
+}
+
+IORING_API uint32_t ioring_rio_get_listener_count(ioring_t* ring) {
+    if (!ring) return 0;
+    return ring->owned_listener_count;
 }
