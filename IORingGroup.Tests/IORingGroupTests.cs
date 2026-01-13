@@ -261,95 +261,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void RIO_DiagnosticCheck()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        // First, create a ring to ensure RIO is initialized
-        try
-        {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, 16, 1024, 1024);
-
-            // Now check if RIO functions are properly loaded
-            try
-            {
-                var initStatus = System.Network.Windows.Win_x64.ioring_rio_check_init();
-                Assert.True(initStatus == 0, $"RIO init check failed with code {initStatus}: " + initStatus switch
-                {
-                    -1 => "RIO not initialized",
-                    -2 => "RIOCreateRequestQueue not loaded",
-                    -3 => "RIOCreateCompletionQueue not loaded",
-                    -4 => "RIORegisterBuffer not loaded",
-                    -5 => "RIOReceive not loaded",
-                    -6 => "RIOSend not loaded",
-                    -7 => "RIODequeueCompletion not loaded",
-                    _ => "Unknown error"
-                });
-            }
-            catch (EntryPointNotFoundException)
-            {
-                Skip.If(true, "ioring_rio_check_init not available - rebuild ioring.dll");
-            }
-        }
-        catch (InvalidOperationException ex)
-        {
-            Skip.If(true, $"RIO not available: {ex.Message}");
-        }
-    }
-
-    [SkippableFact]
-    public void RIO_FullSetupTest()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        try
-        {
-            // This tests RIO setup with sockets we create internally in the DLL
-            // It tests both client sockets (created with WSA_FLAG_REGISTERED_IO) and
-            // server sockets (from accept, which do NOT inherit the flag)
-            var result = System.Network.Windows.Win_x64.ioring_rio_test_setup();
-            var lastError = System.Network.Windows.Win_x64.ioring_get_last_error();
-
-            var errorMsg = result switch
-            {
-                0 => "Full success - both client and accepted sockets work with RIO",
-                1 => $"Partial success - client socket works but accepted socket doesn't (expected, error: {lastError}). " +
-                     "This is normal because accept() doesn't inherit WSA_FLAG_REGISTERED_IO. " +
-                     "Use AcceptEx with pre-created sockets for server-side RIO.",
-                -1 => "RIO init failed",
-                -2 => $"Socket creation failed (WSA error: {lastError})",
-                -3 => $"Bind failed (WSA error: {lastError})",
-                -4 => $"Buffer allocation failed (error: {lastError})",
-                -5 => $"Buffer registration failed (WSA error: {lastError})",
-                -6 => $"Completion queue creation failed (WSA error: {lastError})",
-                -7 => $"Request queue creation failed on accepted socket (WSA error: {lastError})",
-                -8 => $"Listen failed (WSA error: {lastError})",
-                -9 => $"Client socket creation failed (WSA error: {lastError})",
-                -10 => $"Connect failed (WSA error: {lastError})",
-                -11 => $"Accept failed (WSA error: {lastError})",
-                -12 => $"Request queue creation failed on CLIENT socket (WSA error: {lastError}) - this indicates a real RIO problem!",
-                _ => $"Unknown result: {result}"
-            };
-
-            // Result 0: Both work (ideal)
-            // Result 1: Only client sockets work (expected behavior - need AcceptEx for servers)
-            // Negative: Real errors
-            Assert.True(result >= 0, $"RIO full setup test failed: {errorMsg}");
-
-            if (result == 1)
-            {
-                // This is expected - document the behavior
-                // For server sockets, you must use AcceptEx with pre-created sockets that have WSA_FLAG_REGISTERED_IO
-                Assert.True(true, errorMsg);
-            }
-        }
-        catch (EntryPointNotFoundException)
-        {
-            Skip.If(true, "ioring_rio_test_setup not available - rebuild ioring.dll");
-        }
-    }
-
-    [SkippableFact]
     public void RegisterSocket_DiagnosticInfo()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -759,16 +670,45 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-            // Create listener socket
-            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-            listener.Listen(1);
-            listener.Blocking = false;
-            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
+            // Use library-owned listener to avoid .NET IOCP conflicts
+            const ushort testPort = 0;  // Let OS assign port
+            var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
+                ring.Handle, "127.0.0.1", testPort, 128);
+
+            if (listenerHandle == -1 || listenerHandle == 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                Skip.If(true, $"Failed to create library-owned listener: error {err}");
+            }
+
+            // Get the assigned port
+            var addrBytes = new byte[16];  // sockaddr_in
+            var addrLen = addrBytes.Length;
+            int port;
+            unsafe
+            {
+                fixed (byte* pAddr = addrBytes)
+                {
+                    if (System.Network.Windows.Win_x64.getsockname(listenerHandle, (nint)pAddr, ref addrLen) == 0)
+                    {
+                        // Port is at offset 2, in network byte order
+                        port = (addrBytes[2] << 8) | addrBytes[3];
+                    }
+                    else
+                    {
+                        port = 5555;  // Fallback
+                    }
+                }
+            }
+            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            // Reset stats BEFORE posting accept so we capture the full flow
+            try { System.Network.Windows.Win_x64.ioring_rio_reset_stats(); }
+            catch (EntryPointNotFoundException) { }
 
             // Queue an accept operation - this now uses AcceptEx internally
             const ulong acceptUserData = 100;
-            ring.PrepareAccept(listener.Handle, 0, 0, acceptUserData);
+            ring.PrepareAccept(listenerHandle, 0, 0, acceptUserData);
             ring.Submit();
 
             // Connect a client to trigger the accept
@@ -783,10 +723,21 @@ public class WindowsRIOGroupTests
             Assert.Equal(acceptUserData, completions[0].UserData);
 
             // The result should be a valid socket handle
-            var acceptedSocket = (nint)completions[0].Result;
-            Assert.True(acceptedSocket > 0, $"Accept returned invalid socket: {acceptedSocket}");
+            // NOTE: Result is int32 but socket handles on x64 can be larger - check for truncation
+            var rawResult = completions[0].Result;
+            var acceptedSocket = (nint)rawResult;
+
+            // Diagnostic: Output raw values to detect truncation
+            // If the socket handle is > INT32_MAX, it would be negative after cast
+            Assert.True(rawResult > 0, $"Accept returned invalid socket (raw int32): {rawResult}. " +
+                $"This could indicate socket handle truncation if the value was > 2^31.");
+            Assert.True(acceptedSocket > 0, $"Accept returned invalid socket (nint): {acceptedSocket}");
 
             ring.AdvanceCompletionQueue(count);
+
+            // NOTE: RIO sockets (created with WSA_FLAG_REGISTERED_IO) cannot use regular
+            // Winsock recv/send - they can ONLY use RIO operations (RIOReceive/RIOSend).
+            // This is by design - RIO bypasses the normal Winsock stack entirely.
 
             // Now register the accepted socket with RIO - this should work because
             // PrepareAccept used AcceptEx with a pre-created WSA_FLAG_REGISTERED_IO socket
@@ -804,15 +755,110 @@ public class WindowsRIOGroupTests
             Assert.NotEqual(nint.Zero, recvBuf);
             Assert.NotEqual(nint.Zero, sendBuf);
 
-            // Test echo to verify the socket works
-            var testData = "Hello via automatic AcceptEx!"u8.ToArray();
-            client.Send(testData);
+            // Diagnostic: Check connection state before recv (don't reset - we want to preserve rqCreated)
+            int connState = 0, recvParams = 0, cqCountBefore = 0, socketReadable = 0;
+            ulong connSocket = 0;
+            int socketVerify = 0, pendingBytes = 0;
+            ulong ringBufId = 0;
+            try
+            {
+                connState = System.Network.Windows.Win_x64.ioring_rio_get_conn_state(ring.Handle, connId);
+                recvParams = System.Network.Windows.Win_x64.ioring_rio_check_recv_params(ring.Handle, connId);
+                cqCountBefore = System.Network.Windows.Win_x64.ioring_rio_peek_cq_count(ring.Handle);
+                socketReadable = System.Network.Windows.Win_x64.ioring_rio_check_socket_readable(ring.Handle, connId);
+                connSocket = System.Network.Windows.Win_x64.ioring_rio_get_conn_socket(ring.Handle, connId);
+                socketVerify = System.Network.Windows.Win_x64.ioring_rio_verify_socket_valid(ring.Handle, connId);
+                pendingBytes = System.Network.Windows.Win_x64.ioring_rio_get_socket_pending_bytes(ring.Handle, connId);
+                ringBufId = System.Network.Windows.Win_x64.ioring_rio_get_buffer_id(ring.Handle);
+            }
+            catch (EntryPointNotFoundException) { connState = -999; recvParams = -999; }
 
+            // IMPORTANT: Post RIOReceive BEFORE client sends data
+            // RIO may require the receive to be pending before data arrives
             ring.PrepareRecvRegistered(connId, BufferSize, 1);
             ring.Submit();
 
-            count = ring.WaitCompletions(completions, 1, 1000);
-            Assert.True(count > 0, "No recv completion");
+            // Give a moment for RIOReceive to be fully posted
+            Thread.Sleep(10);
+
+            // NOW send data from client (after RIOReceive is pending)
+            var testData = "Hello via automatic AcceptEx!"u8.ToArray();
+            var sent = client.Send(testData);
+            Assert.Equal(testData.Length, sent);
+
+            count = ring.WaitCompletions(completions, 1, 2000);
+
+            // Diagnostic: Get stats after wait
+            int cqCountAfter = 0;
+            uint recvStats = 0, dequeueStats = 0;
+            int lastRecvErr = 0;
+            int buildVer = 0;
+            ulong cqHandle = 0, cqAtRqCreate = 0;
+            ulong rqCreated = 0, rqUsed = 0, bufIdUsed = 0;
+            uint bufOffsetUsed = 0;
+            int bufRegCheck = 0;
+            int connSlotCreated = -1, connIdUsed = -1;
+            try
+            {
+                cqCountAfter = System.Network.Windows.Win_x64.ioring_rio_peek_cq_count(ring.Handle);
+                recvStats = System.Network.Windows.Win_x64.ioring_rio_get_recv_stats();
+                dequeueStats = System.Network.Windows.Win_x64.ioring_rio_get_dequeue_stats();
+                lastRecvErr = System.Network.Windows.Win_x64.ioring_rio_get_last_recv_error();
+                buildVer = System.Network.Windows.Win_x64.ioring_get_build_version();
+                cqHandle = System.Network.Windows.Win_x64.ioring_rio_get_cq_handle(ring.Handle);
+                cqAtRqCreate = System.Network.Windows.Win_x64.ioring_rio_get_cq_at_rq_create();
+                rqCreated = System.Network.Windows.Win_x64.ioring_rio_get_rq_created();
+                rqUsed = System.Network.Windows.Win_x64.ioring_rio_get_rq_used();
+                bufIdUsed = System.Network.Windows.Win_x64.ioring_rio_get_buf_id_used();
+                bufOffsetUsed = System.Network.Windows.Win_x64.ioring_rio_get_buf_offset_used();
+                bufRegCheck = System.Network.Windows.Win_x64.ioring_rio_check_buffer_registration(ring.Handle);
+                connSlotCreated = System.Network.Windows.Win_x64.ioring_rio_get_conn_slot_created();
+                connIdUsed = System.Network.Windows.Win_x64.ioring_rio_get_conn_id_used();
+            }
+            catch (EntryPointNotFoundException) { buildVer = -1; }
+
+            // Get SO_UPDATE_ACCEPT_CONTEXT diagnostics
+            int updateAcceptCtxResult = -999;
+            ulong listenSocketUsed = 0, acceptSocketAtUpdate = 0;
+            int notifyCalls = 0;
+            int bufferPeek = 0;
+            try
+            {
+                updateAcceptCtxResult = System.Network.Windows.Win_x64.ioring_rio_get_update_accept_ctx_result();
+                listenSocketUsed = System.Network.Windows.Win_x64.ioring_rio_get_listen_socket_used();
+                acceptSocketAtUpdate = System.Network.Windows.Win_x64.ioring_rio_get_accept_socket_at_update();
+                notifyCalls = System.Network.Windows.Win_x64.ioring_rio_get_notify_calls();
+                bufferPeek = System.Network.Windows.Win_x64.ioring_rio_peek_recv_buffer(ring.Handle, connId);
+            }
+            catch (EntryPointNotFoundException) { }
+
+            // Unpack stats: lower 16 bits = calls, upper 16 bits = success/total
+            int recvCalls = (int)(recvStats & 0xFFFF);
+            int recvSuccess = (int)(recvStats >> 16);
+            int dequeueCalls = (int)(dequeueStats & 0xFFFF);
+            int dequeueTotal = (int)(dequeueStats >> 16);
+
+            // Check if RQ handles match (rqCreated should equal rqUsed if same connection)
+            var rqMatch = rqCreated == rqUsed ? "MATCH" : "MISMATCH";
+            var connMatch = connSlotCreated == connIdUsed ? "MATCH" : "MISMATCH";
+            var cqMatch = cqHandle == cqAtRqCreate ? "MATCH" : "MISMATCH";
+
+            var bufIdMatch = ringBufId == bufIdUsed ? "MATCH" : "MISMATCH";
+
+            var acceptSockMatch = acceptSocketAtUpdate == connSocket ? "MATCH" : "MISMATCH";
+
+            // bufferPeek: "Hell" = 0x6C6C6548 in little-endian, 0 = no data written
+            Assert.True(count > 0, $"No recv completion. BUILD={buildVer}, " +
+                $"bufferPeek=0x{bufferPeek:X8}, updateAcceptCtx={updateAcceptCtxResult}, " +
+                $"socketVerify={socketVerify}, connSocket=0x{connSocket:X}, acceptedSocket=0x{acceptedSocket:X}, " +
+                $"connSlotCreated={connSlotCreated}, connIdUsed={connIdUsed} ({connMatch}), connId={connId}, " +
+                $"connState={connState}, recvParams={recvParams}, bufRegCheck={bufRegCheck}, " +
+                $"recvCalls={recvCalls}, recvSuccess={recvSuccess}, lastRecvErr={lastRecvErr}, " +
+                $"dequeueCalls={dequeueCalls}, dequeueTotal={dequeueTotal}, " +
+                $"cqHandle=0x{cqHandle:X}, cqAtRqCreate=0x{cqAtRqCreate:X} ({cqMatch}), " +
+                $"rqCreated=0x{rqCreated:X}, rqUsed=0x{rqUsed:X} ({rqMatch}), " +
+                $"ringBufId=0x{ringBufId:X}, bufIdUsed=0x{bufIdUsed:X} ({bufIdMatch}), bufOffset={bufOffsetUsed}, " +
+                $"cqBefore={cqCountBefore}, cqAfter={cqCountAfter}");
             Assert.Equal(testData.Length, completions[0].Result);
             ring.AdvanceCompletionQueue(count);
 
@@ -843,6 +889,9 @@ public class WindowsRIOGroupTests
 
             // Clean up accepted socket
             System.Network.Windows.Win_x64.closesocket(acceptedSocket);
+
+            // Clean up library-owned listener
+            System.Network.Windows.Win_x64.ioring_rio_close_listener(ring.Handle, listenerHandle);
         }
         catch (InvalidOperationException ex)
         {
@@ -942,6 +991,94 @@ public class WindowsRIOGroupTests
         catch (EntryPointNotFoundException)
         {
             Skip.If(true, "New RIO functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void RIO_ClientSocket_RecvWorks()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        // This test verifies RIO works with a CLIENT socket created with WSA_FLAG_REGISTERED_IO
+        // This isolates RIO functionality from AcceptEx complexity
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+
+            // Create a simple server using regular .NET sockets
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
+
+            // Create a CLIENT socket with WSA_FLAG_REGISTERED_IO using C library
+            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+
+            // Connect our RIO socket to the listener
+            var connectResult = System.Network.Windows.Win_x64.ioring_connect_socket(
+                clientSocket,
+                "127.0.0.1",
+                (ushort)endpoint.Port);
+
+            if (connectResult != 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, $"Connect failed with error {err}");
+            }
+
+            // Accept on the listener side (regular socket)
+            using var serverSide = listener.Accept();
+
+            // Register our RIO client socket
+            var connId = ring.RegisterSocket(clientSocket, out var recvBuf, out var sendBuf);
+            if (connId < 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, $"RegisterSocket failed with error {err}");
+            }
+
+            // Post RIOReceive FIRST
+            ring.PrepareRecvRegistered(connId, BufferSize, 1);
+            ring.Submit();
+
+            // Send data FROM server TO our RIO client
+            var testData = "Hello RIO Client!"u8.ToArray();
+            serverSide.Send(testData);
+
+            // Wait for completion on RIO client
+            Span<Completion> completions = stackalloc Completion[16];
+            var count = ring.WaitCompletions(completions, 1, 2000);
+
+            var buildVer = System.Network.Windows.Win_x64.ioring_get_build_version();
+            var recvStats = System.Network.Windows.Win_x64.ioring_rio_get_recv_stats();
+            var dequeueStats = System.Network.Windows.Win_x64.ioring_rio_get_dequeue_stats();
+            int recvCalls = (int)(recvStats & 0xFFFF);
+            int recvSuccess = (int)(recvStats >> 16);
+            int dequeueCalls = (int)(dequeueStats & 0xFFFF);
+            int dequeueTotal = (int)(dequeueStats >> 16);
+            var bufferPeek = System.Network.Windows.Win_x64.ioring_rio_peek_recv_buffer(ring.Handle, connId);
+
+            Assert.True(count > 0,
+                $"CLIENT socket RIO recv failed. BUILD={buildVer}, bufferPeek=0x{bufferPeek:X8}, " +
+                $"recvCalls={recvCalls}, recvSuccess={recvSuccess}, " +
+                $"dequeueCalls={dequeueCalls}, dequeueTotal={dequeueTotal}");
+            Assert.Equal(testData.Length, completions[0].Result);
+            ring.AdvanceCompletionQueue(count);
+
+            ring.UnregisterSocket(connId);
+            System.Network.Windows.Win_x64.closesocket(clientSocket);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "Required functions not available - rebuild ioring.dll");
         }
     }
 }

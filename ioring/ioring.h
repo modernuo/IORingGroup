@@ -225,28 +225,94 @@ IORING_API uint32_t ioring_rio_get_max_connections(ioring_t* ring);
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
 
-// Diagnostic: Check if RIO is properly initialized
-// Returns 0 if all RIO functions are available, negative error code otherwise
-IORING_API int ioring_rio_check_init(void);
+// Diagnostic: Get connection state for debugging
+// Returns packed value: (active << 0) | (rq_valid << 1) | (socket_valid << 2)
+// Value 7 = fully valid (active + rq_valid + socket_valid)
+// Negative value indicates error
+IORING_API int ioring_rio_get_conn_state(ioring_t* ring, int conn_id);
 
-// Diagnostic: Test complete RIO setup with connected sockets
-// Returns:
-// 0: Full success - both client and accepted sockets work with RIO
-// 1: Partial success - client sockets work but accepted sockets need AcceptEx (expected)
-// Negative: Error codes
-// -1: RIO init failed
-// -2: Listener socket creation failed
-// -3: Bind failed
-// -4: Buffer allocation failed
-// -5: Buffer registration failed
-// -6: Completion queue creation failed
-// -7: Request queue creation failed on accepted socket (expected)
-// -8: Listen failed
-// -9: Client socket creation failed
-// -10: Connect failed
-// -11: Accept failed
-// -12: Request queue creation failed on CLIENT socket (real problem)
-IORING_API int ioring_rio_test_setup(void);
+// Diagnostic: Check if RIOReceive parameters are valid (does NOT actually post)
+// Returns: 1 if all parameters valid, negative error code if invalid
+IORING_API int ioring_rio_check_recv_params(ioring_t* ring, int conn_id);
+
+// Diagnostic: Get number of completions waiting in user-space CQ
+IORING_API int ioring_rio_peek_cq_count(ioring_t* ring);
+
+// Diagnostic: Get RIO recv stats (packed: recv_calls | recv_success << 16)
+IORING_API uint32_t ioring_rio_get_recv_stats(void);
+
+// Diagnostic: Get last RIOReceive error
+IORING_API int ioring_rio_get_last_recv_error(void);
+
+// Diagnostic: Get dequeue stats (packed: dequeue_calls | dequeue_total << 16)
+IORING_API uint32_t ioring_rio_get_dequeue_stats(void);
+
+// Diagnostic: Reset all counters
+IORING_API void ioring_rio_reset_stats(void);
+
+// Diagnostic: Get build version (to verify correct DLL is loaded)
+IORING_API int ioring_get_build_version(void);
+
+// Diagnostic: Get the CQ handle being used
+IORING_API uint64_t ioring_rio_get_cq_handle(ioring_t* ring);
+
+// Diagnostic: Get the RQ handle that was created (for AcceptEx sockets)
+IORING_API uint64_t ioring_rio_get_rq_created(void);
+
+// Diagnostic: Get the RQ handle used in RIOReceive
+IORING_API uint64_t ioring_rio_get_rq_used(void);
+
+// Diagnostic: Get the buffer ID used in RIOReceive
+IORING_API uint64_t ioring_rio_get_buf_id_used(void);
+
+// Diagnostic: Get the buffer offset used in RIOReceive
+IORING_API uint32_t ioring_rio_get_buf_offset_used(void);
+
+// Diagnostic: Verify buffer registration is valid for the ring
+IORING_API int ioring_rio_check_buffer_registration(ioring_t* ring);
+
+// Diagnostic: Get the connection slot that was created (during AcceptEx)
+IORING_API int ioring_rio_get_conn_slot_created(void);
+
+// Diagnostic: Get the connection ID used in RIOReceive
+IORING_API int ioring_rio_get_conn_id_used(void);
+
+// Diagnostic: Get the CQ used when creating the RQ (to compare with polling CQ)
+IORING_API uint64_t ioring_rio_get_cq_at_rq_create(void);
+
+// Diagnostic: Check if socket has data available using WSAPoll
+// Returns: 1 if readable, 0 if not, -error on error
+IORING_API int ioring_rio_check_socket_readable(ioring_t* ring, int conn_id);
+
+// Diagnostic: Get the raw socket handle stored for a connection
+IORING_API uint64_t ioring_rio_get_conn_socket(ioring_t* ring, int conn_id);
+
+// Diagnostic: Verify socket is valid using getsockopt (SO_TYPE)
+// Returns: socket type (SOCK_STREAM=1, SOCK_DGRAM=2) if valid, -error if invalid
+IORING_API int ioring_rio_verify_socket_valid(ioring_t* ring, int conn_id);
+
+// Diagnostic: Check how much data is pending on the socket using FIONREAD
+// Returns: bytes available, or -error on failure
+IORING_API int ioring_rio_get_socket_pending_bytes(ioring_t* ring, int conn_id);
+
+// Diagnostic: Get the buffer ID registered with the ring (to compare with bufIdUsed)
+IORING_API uint64_t ioring_rio_get_buffer_id(ioring_t* ring);
+
+// Diagnostic: Get SO_UPDATE_ACCEPT_CONTEXT result (0=success, >0=WSA error)
+IORING_API int ioring_rio_get_update_accept_ctx_result(void);
+
+// Diagnostic: Get the listener socket used in SO_UPDATE_ACCEPT_CONTEXT
+IORING_API uint64_t ioring_rio_get_listen_socket_used(void);
+
+// Diagnostic: Get the accept socket used in SO_UPDATE_ACCEPT_CONTEXT
+IORING_API uint64_t ioring_rio_get_accept_socket_at_update(void);
+
+// Diagnostic: Get RIONotify call count
+IORING_API int ioring_rio_get_notify_calls(void);
+
+// Diagnostic: Check if any data was written to the receive buffer
+// Returns: first 4 bytes of buffer as int (e.g., "Hell" = 0x6C6C6548)
+IORING_API int ioring_rio_peek_recv_buffer(ioring_t* ring, int conn_id);
 
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
@@ -278,9 +344,51 @@ IORING_API int ioring_rio_test_setup(void);
 // Returns INVALID_SOCKET on failure
 IORING_API SOCKET ioring_rio_create_accept_socket(void);
 
+// Connect a socket to the specified address (for testing RIO on client sockets)
+// Returns 0 on success, -1 on failure (call ioring_get_last_error for details)
+IORING_API int ioring_connect_socket(SOCKET sock, const char* ip_address, uint16_t port);
+
 // Get AcceptEx function pointer (convenience helper)
 // Returns NULL on failure
 IORING_API void* ioring_get_acceptex(SOCKET listen_socket);
+
+// =============================================================================
+// RIO Listener Support (library-owned sockets to avoid IOCP conflicts)
+// =============================================================================
+
+/*
+ * For RIO mode, the library should own the listener socket to avoid IOCP
+ * association conflicts with .NET's runtime. Use these APIs:
+ *
+ *   // Create and start listening
+ *   SOCKET listener = ioring_rio_create_listener(ring, "0.0.0.0", 5000, 128);
+ *
+ *   // Queue accept operation (uses AcceptEx internally)
+ *   ioring_prep_accept(sqe, listener, NULL, NULL, user_data);
+ *
+ *   // When done
+ *   ioring_rio_close_listener(ring, listener);
+ */
+
+// Create a listener socket owned by the ring (automatically associated with ring's IOCP)
+// - ring: the RIO ring to associate with
+// - bind_addr: IP address to bind to (e.g., "0.0.0.0" or "127.0.0.1")
+// - port: port number to listen on
+// - backlog: listen queue size (e.g., SOMAXCONN or 128)
+// Returns: listener socket on success, INVALID_SOCKET on failure
+IORING_API SOCKET ioring_rio_create_listener(
+    ioring_t* ring,
+    const char* bind_addr,
+    uint16_t port,
+    int backlog
+);
+
+// Close a listener socket created by ioring_rio_create_listener
+// This properly cleans up any pending AcceptEx operations
+IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
+
+// Get the number of owned listeners
+IORING_API uint32_t ioring_rio_get_listener_count(ioring_t* ring);
 
 #ifdef __cplusplus
 }

@@ -50,6 +50,11 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public const int MaxOutstandingPerSocket = 16;
 
     /// <summary>
+    /// Native ring handle (for diagnostic purposes).
+    /// </summary>
+    public nint Handle => _ring;
+
+    /// <summary>
     /// Creates a new RIO ring with pre-allocated buffer pool.
     /// </summary>
     /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
