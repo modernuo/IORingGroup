@@ -460,6 +460,54 @@ public static partial class Win_x64
     public static partial uint ioring_rio_get_listener_count(nint ring);
 
     // =============================================================================
+    // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
+    // =============================================================================
+
+    /// <summary>
+    /// Register external buffer (e.g., VirtualAlloc'd Pipe memory) with RIO.
+    /// </summary>
+    /// <param name="ring">Ring handle from ioring_create_rio</param>
+    /// <param name="buffer">Pointer to buffer memory (e.g., Pipe.GetBufferPointer())</param>
+    /// <param name="length">Size in bytes (for double-mapped buffers, use 2x physical size)</param>
+    /// <returns>Buffer ID on success (>= 0), -1 on failure</returns>
+    /// <remarks>
+    /// External buffers allow zero-copy I/O from user-owned memory. This is useful
+    /// for circular buffers like ModernUO's Pipe where you want to send directly
+    /// from the application's buffer without copying to RIO's internal buffers.
+    /// The buffer must remain valid until ioring_rio_unregister_external_buffer() is called.
+    /// </remarks>
+    [LibraryImport(LibraryName, SetLastError = true)]
+    public static partial int ioring_rio_register_external_buffer(nint ring, nint buffer, uint length);
+
+    /// <summary>
+    /// Unregister an external buffer.
+    /// </summary>
+    /// <param name="ring">Ring handle from ioring_create_rio</param>
+    /// <param name="bufferId">Buffer ID returned by ioring_rio_register_external_buffer</param>
+    [LibraryImport(LibraryName)]
+    public static partial void ioring_rio_unregister_external_buffer(nint ring, int bufferId);
+
+    /// <summary>
+    /// Prepare send from external registered buffer.
+    /// </summary>
+    /// <param name="sqe">Submission queue entry pointer</param>
+    /// <param name="connId">Connection ID from ioring_rio_register</param>
+    /// <param name="bufferId">External buffer ID from ioring_rio_register_external_buffer</param>
+    /// <param name="offset">Offset within the registered buffer to start sending from</param>
+    /// <param name="len">Number of bytes to send</param>
+    /// <param name="userData">User data returned with completion</param>
+    [LibraryImport(LibraryName)]
+    public static partial void ioring_prep_send_external(nint sqe, int connId, int bufferId, uint offset, uint len, ulong userData);
+
+    /// <summary>
+    /// Get the number of registered external buffers.
+    /// </summary>
+    /// <param name="ring">Ring handle</param>
+    /// <returns>Number of registered external buffers</returns>
+    [LibraryImport(LibraryName)]
+    public static partial uint ioring_rio_get_external_buffer_count(nint ring);
+
+    // =============================================================================
     // Winsock2 Helpers
     // =============================================================================
 

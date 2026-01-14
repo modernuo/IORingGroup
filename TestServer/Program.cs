@@ -26,9 +26,11 @@ public class Program
     private const int BufferSize = 4096;
     private const int MaxClients = 8192;
     private const int ListenBacklog = 4096;
+    private const int PipeBufferSize = 64 * 1024;  // 64KB send pipe per connection
 
     private static volatile bool _running = true;
     private static bool _quietMode;
+    private static bool _usePipeMode;  // Use Pipe with external buffer for zero-copy sends
 
     public static void Main(string[] args)
     {
@@ -59,6 +61,10 @@ public class Program
             {
                 _quietMode = true;
             }
+            else if (arg.Equals("--pipe", StringComparison.OrdinalIgnoreCase))
+            {
+                _usePipeMode = true;
+            }
             else if ((arg.Equals("--affinity", StringComparison.OrdinalIgnoreCase) ||
                       arg.Equals("-a", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Length)
             {
@@ -87,9 +93,10 @@ public class Program
 
         Console.WriteLine("RIO vs PollGroup Benchmark Server (Single-threaded)");
         Console.WriteLine($"Backend: {backend}");
-        Console.WriteLine($"Benchmark mode: {benchmarkMode}, Quiet: {_quietMode}");
+        Console.WriteLine($"Benchmark mode: {benchmarkMode}, Quiet: {_quietMode}, Pipe mode: {_usePipeMode}");
         Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--quiet|-q] [--affinity|-a <mask>]");
+        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--quiet|-q] [--pipe] [--affinity|-a <mask>]");
+        Console.WriteLine("  --pipe: Use Pipe circular buffer with external buffer registration for zero-copy sends (RIO only)");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
         Console.CancelKeyPress += (_, e) =>
@@ -126,8 +133,12 @@ public class Program
         public nint Socket;
         public int ConnId;          // RIO connection ID from RegisterSocket
         public nint RecvBuffer;     // Pointer to registered recv buffer
-        public nint SendBuffer;     // Pointer to registered send buffer
+        public nint SendBuffer;     // Pointer to registered send buffer (not used in Pipe mode)
         public bool Active;
+
+        // Pipe mode fields (for zero-copy sends from user-owned memory)
+        public Pipe? SendPipe;       // Circular buffer for send data
+        public int ExternalBufferId; // RIO buffer ID for the pipe memory (-1 if not registered)
     }
 
     private static readonly RIOClientState[] _rioClients = new RIOClientState[MaxClients];
@@ -140,6 +151,11 @@ public class Program
     private static bool _benchmarkStarted;
     private static bool _finalStatsPrinted;
     private static int _peakConnections;
+
+    // Syscall timing stats
+    private static long _pollCallCount;
+    private static long _pollTotalTicks;
+    private static long _pollTotalCompletions;
 
     // Memory stats (captured at start)
     private static long _startAllocatedBytes;
@@ -187,6 +203,9 @@ public class Program
                 _benchmarkStarted = false;
                 _finalStatsPrinted = false;
                 _peakConnections = 0;
+                _pollCallCount = 0;
+                _pollTotalTicks = 0;
+                _pollTotalCompletions = 0;
                 _benchmarkStopwatch.Reset();
 
                 // Pre-post multiple accepts
@@ -204,7 +223,15 @@ public class Program
                 while (_running)
                 {
                     ring.Submit();
-                    var count = ring.WaitCompletions(completions, 1, 1);
+
+                    // Time the PeekCompletions syscall (non-blocking, like PollGroup)
+                    var pollStart = Stopwatch.GetTimestamp();
+                    var count = ring.PeekCompletions(completions);
+                    var pollEnd = Stopwatch.GetTimestamp();
+
+                    _pollCallCount++;
+                    _pollTotalTicks += pollEnd - pollStart;
+                    _pollTotalCompletions += count;
 
                     for (var i = 0; i < count; i++)
                     {
@@ -222,6 +249,12 @@ public class Program
                             PrintStats("RIO");
                             lastStatsMs = elapsedMs;
                         }
+                    }
+
+                    // Yield when no work (like PollGroup does)
+                    if (count == 0)
+                    {
+                        Thread.Sleep(1);
                     }
                 }
 
@@ -285,8 +318,27 @@ public class Program
                         ConnId = connId,
                         RecvBuffer = recvBuf,
                         SendBuffer = sendBuf,
-                        Active = true
+                        Active = true,
+                        SendPipe = null,
+                        ExternalBufferId = -1
                     };
+
+                    // In pipe mode, create a Pipe and register it as an external buffer
+                    if (_usePipeMode)
+                    {
+                        var pipe = new Pipe(PipeBufferSize);
+                        var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+                        if (extBufId >= 0)
+                        {
+                            _rioClients[clientIndex].SendPipe = pipe;
+                            _rioClients[clientIndex].ExternalBufferId = extBufId;
+                        }
+                        else
+                        {
+                            pipe.Dispose();
+                            Console.WriteLine($"[RIO] Warning: Failed to register external buffer for client {clientIndex}");
+                        }
+                    }
 
                     // Start timing on first connection
                     if (!_benchmarkStarted)
@@ -350,15 +402,45 @@ public class Program
 
         ref var client = ref _rioClients[index];
 
-        // Copy from recv buffer to send buffer for echo
-        // Both buffers are in the RIO registered memory pool
-        unsafe
+        // In pipe mode, use zero-copy send from Pipe's circular buffer
+        if (_usePipeMode && client.SendPipe != null && client.ExternalBufferId >= 0)
         {
-            Buffer.MemoryCopy((void*)client.RecvBuffer, (void*)client.SendBuffer, BufferSize, result);
-        }
+            // Write received data to the pipe's write side
+            var writeSpan = client.SendPipe.Writer.AvailableToWrite();
+            if (writeSpan.Length >= result)
+            {
+                unsafe
+                {
+                    new Span<byte>((void*)client.RecvBuffer, result).CopyTo(writeSpan);
+                }
+                client.SendPipe.Writer.Advance((uint)result);
 
-        // Queue send using registered buffer
-        ring.PrepareSendRegistered(client.ConnId, result, OpSend | (uint)index);
+                // Get the read position and send directly from pipe memory (zero-copy!)
+                var readSpan = client.SendPipe.Reader.AvailableToRead();
+                var offset = client.SendPipe.Reader.GetReadOffset();
+
+                // Queue send using external buffer (zero-copy from Pipe memory)
+                ring.PrepareSendExternal(client.ConnId, client.ExternalBufferId, offset, readSpan.Length, OpSend | (uint)index);
+            }
+            else
+            {
+                // Pipe is full - shouldn't happen in echo server, but handle gracefully
+                Console.WriteLine($"[RIO] Warning: Pipe full for client {index}");
+                CloseRIOClient(ring, index, benchmarkMode);
+            }
+        }
+        else
+        {
+            // Standard mode: Copy from recv buffer to send buffer for echo
+            // Both buffers are in the RIO registered memory pool
+            unsafe
+            {
+                Buffer.MemoryCopy((void*)client.RecvBuffer, (void*)client.SendBuffer, BufferSize, result);
+            }
+
+            // Queue send using registered buffer
+            ring.PrepareSendRegistered(client.ConnId, result, OpSend | (uint)index);
+        }
     }
 
     private static void HandleRIOSend(WindowsRIOGroup ring, int index, int result, bool benchmarkMode)
@@ -373,6 +455,12 @@ public class Program
         _totalMessages++;
 
         ref var client = ref _rioClients[index];
+
+        // In pipe mode, advance the pipe reader to consume the sent data
+        if (_usePipeMode && client.SendPipe != null)
+        {
+            client.SendPipe.Reader.Advance((uint)result);
+        }
 
         // Queue next receive using registered buffer
         ring.PrepareRecvRegistered(client.ConnId, BufferSize, OpRecv | (uint)index);
@@ -393,6 +481,16 @@ public class Program
 
         if (!benchmarkMode)
             Console.WriteLine($"[RIO] Client {index} disconnected");
+
+        // Clean up Pipe and external buffer if in pipe mode
+        if (client.SendPipe != null)
+        {
+            if (client.ExternalBufferId >= 0)
+            {
+                ring.UnregisterExternalBuffer(client.ExternalBufferId);
+            }
+            client.SendPipe.Dispose();
+        }
 
         // Unregister from RIO before closing socket
         ring.UnregisterSocket(client.ConnId);
@@ -454,6 +552,9 @@ public class Program
         _benchmarkStarted = false;
         _finalStatsPrinted = false;
         _peakConnections = 0;
+        _pollCallCount = 0;
+        _pollTotalTicks = 0;
+        _pollTotalCompletions = 0;
         _benchmarkStopwatch.Reset();
 
         var handles = new GCHandle[1024];
@@ -465,7 +566,14 @@ public class Program
 
         while (_running)
         {
+            // Time the Poll syscall
+            var pollStart = Stopwatch.GetTimestamp();
             var count = pollGroup.Poll(handles);
+            var pollEnd = Stopwatch.GetTimestamp();
+
+            _pollCallCount++;
+            _pollTotalTicks += pollEnd - pollStart;
+            _pollTotalCompletions += count;
 
             for (var i = 0; i < count; i++)
             {
@@ -762,6 +870,30 @@ public class Program
 
         Console.WriteLine($"Peak connections: {_peakConnections}");
 
+        // Syscall timing stats
+        Console.WriteLine();
+        Console.WriteLine($"=== I/O Syscall Statistics ({(rioRing != null ? "WaitCompletions" : "Poll")}) ===");
+        Console.WriteLine($"Total calls: {_pollCallCount:N0}");
+        Console.WriteLine($"Total completions: {_pollTotalCompletions:N0}");
+        if (_pollCallCount > 0)
+        {
+            var avgCompletionsPerCall = (double)_pollTotalCompletions / _pollCallCount;
+            var totalTimeMs = _pollTotalTicks * 1000.0 / Stopwatch.Frequency;
+            var avgTimePerCallUs = totalTimeMs * 1000.0 / _pollCallCount;
+            var callsPerSec = elapsed > 0 ? _pollCallCount / elapsed : 0;
+
+            Console.WriteLine($"Avg completions/call: {avgCompletionsPerCall:N2}");
+            Console.WriteLine($"Total time in syscalls: {totalTimeMs:N2} ms");
+            Console.WriteLine($"Avg time/call: {avgTimePerCallUs:N2} µs");
+            Console.WriteLine($"Calls/sec: {callsPerSec:N0}");
+
+            if (elapsed > 0)
+            {
+                var syscallOverheadPct = (totalTimeMs / 1000.0) / elapsed * 100.0;
+                Console.WriteLine($"Syscall overhead: {syscallOverheadPct:N1}% of total time");
+            }
+        }
+
         if (rioRing != null)
         {
             Console.WriteLine();
@@ -775,6 +907,14 @@ public class Program
             Console.WriteLine($"Committed bytes: {rioRing.CommittedBytes / 1024.0 / 1024.0:N2} MB (actual physical memory)");
             Console.WriteLine($"Committed slabs: {rioRing.CommittedSlabs} (256 connections each)");
             Console.WriteLine($"Committed connections: {rioRing.CommittedConnections}");
+
+            if (_usePipeMode)
+            {
+                Console.WriteLine();
+                Console.WriteLine("=== Pipe Mode (Zero-Copy External Buffers) ===");
+                Console.WriteLine($"External buffers registered: {rioRing.ExternalBufferCount}");
+                Console.WriteLine($"Pipe buffer size: {PipeBufferSize / 1024} KB per connection");
+            }
         }
     }
 

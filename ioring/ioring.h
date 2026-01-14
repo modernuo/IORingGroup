@@ -400,6 +400,76 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
 // Get the number of owned listeners
 IORING_API uint32_t ioring_rio_get_listener_count(ioring_t* ring);
 
+// =============================================================================
+// RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
+// =============================================================================
+
+/*
+ * External buffers allow zero-copy I/O from user-owned memory (e.g., ModernUO's
+ * Pipe circular buffer). This avoids copying data between the application's
+ * buffers and RIO's internal buffers.
+ *
+ * Usage pattern:
+ *   // Create a Pipe (double-mapped circular buffer)
+ *   Pipe sendPipe = new Pipe(256 * 1024);
+ *
+ *   // Register its memory with RIO (full virtual range = 2x physical for double-mapping)
+ *   int bufId = ioring_rio_register_external_buffer(ring, pipe.GetBufferPointer(),
+ *                                                   pipe.GetVirtualSize());
+ *
+ *   // Write data to pipe using normal Pipe.Writer
+ *   var span = sendPipe.Writer.AvailableToWrite();
+ *   // ... write packet data ...
+ *   sendPipe.Writer.Advance(bytesWritten);
+ *
+ *   // Send directly from pipe memory (zero-copy!)
+ *   var toSend = sendPipe.Reader.AvailableToRead();
+ *   int offset = sendPipe.Reader.GetReadOffset();
+ *   ioring_prep_send_external(sqe, conn_id, bufId, offset, toSend.Length, user_data);
+ *
+ *   // After send completes, advance the pipe
+ *   sendPipe.Reader.Advance(bytesSent);
+ *
+ *   // Cleanup
+ *   ioring_rio_unregister_external_buffer(ring, bufId);
+ */
+
+// Register external buffer (e.g., VirtualAlloc'd Pipe memory) with RIO
+// - ring: the RIO ring
+// - buffer: pointer to buffer memory (e.g., Pipe.GetBufferPointer())
+// - length: size in bytes (for double-mapped buffers, use 2x physical size)
+// Returns: buffer ID on success (>= 0), -1 on failure
+// NOTE: The buffer must remain valid until ioring_rio_unregister_external_buffer() is called
+IORING_API int ioring_rio_register_external_buffer(
+    ioring_t* ring,
+    void* buffer,
+    uint32_t length
+);
+
+// Unregister an external buffer
+// - ring: the RIO ring
+// - buffer_id: ID returned by ioring_rio_register_external_buffer()
+IORING_API void ioring_rio_unregister_external_buffer(ioring_t* ring, int buffer_id);
+
+// Prepare send from external registered buffer
+// - sqe: SQE to fill
+// - conn_id: connection ID from ioring_rio_register()
+// - buffer_id: external buffer ID from ioring_rio_register_external_buffer()
+// - offset: offset within the registered buffer to start sending from
+// - len: number of bytes to send
+// - user_data: user data returned with completion
+IORING_API void ioring_prep_send_external(
+    ioring_sqe_t* sqe,
+    int conn_id,
+    int buffer_id,
+    uint32_t offset,
+    uint32_t len,
+    uint64_t user_data
+);
+
+// Get the number of registered external buffers
+IORING_API uint32_t ioring_rio_get_external_buffer_count(ioring_t* ring);
+
 #ifdef __cplusplus
 }
 #endif
