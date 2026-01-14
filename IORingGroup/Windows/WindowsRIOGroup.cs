@@ -142,6 +142,29 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// </summary>
     public int SendBufferSize => _sendBufferSize;
 
+    /// <summary>
+    /// Gets the currently committed buffer bytes (actual physical memory).
+    /// Memory is committed on-demand as connections are registered.
+    /// </summary>
+    public long CommittedBytes => (long)Win_x64.ioring_rio_get_committed_bytes(_ring);
+
+    /// <summary>
+    /// Gets the total reserved buffer bytes (virtual address space only).
+    /// This is the maximum capacity, but physical memory is only used as needed.
+    /// </summary>
+    public long ReservedBytes => (long)Win_x64.ioring_rio_get_reserved_bytes(_ring);
+
+    /// <summary>
+    /// Gets the number of committed buffer slabs.
+    /// Each slab covers 256 connections.
+    /// </summary>
+    public int CommittedSlabs => (int)Win_x64.ioring_rio_get_committed_slabs(_ring);
+
+    /// <summary>
+    /// Gets the number of connection slots with committed buffers.
+    /// </summary>
+    public int CommittedConnections => (int)Win_x64.ioring_rio_get_committed_connections(_ring);
+
     /// <inheritdoc/>
     public int SubmissionQueueSpace => (int)Win_x64.ioring_sq_space_left(_ring);
 
@@ -235,6 +258,37 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public static nint GetAcceptEx(nint listenSocket = 0)
     {
         return Win_x64.ioring_get_acceptex(listenSocket);
+    }
+
+    /// <summary>
+    /// Creates a listener socket owned by the ring with WSA_FLAG_REGISTERED_IO.
+    /// </summary>
+    /// <param name="bindAddress">IP address to bind to (e.g., "0.0.0.0" or "127.0.0.1")</param>
+    /// <param name="port">Port number to listen on</param>
+    /// <param name="backlog">Listen queue size (e.g., 128 or SOMAXCONN)</param>
+    /// <returns>Listener socket handle on success, -1 on failure</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Important:</b> For RIO mode, use this method instead of creating a .NET Socket
+    /// for the listener. The listener must have WSA_FLAG_REGISTERED_IO for AcceptEx
+    /// sockets to work with RIO operations.
+    /// </para>
+    /// <para>
+    /// Close the listener with <see cref="CloseListener"/> when done.
+    /// </para>
+    /// </remarks>
+    public nint CreateListener(string bindAddress, ushort port, int backlog)
+    {
+        return Win_x64.ioring_rio_create_listener(_ring, bindAddress, port, backlog);
+    }
+
+    /// <summary>
+    /// Closes a listener socket created by <see cref="CreateListener"/>.
+    /// </summary>
+    /// <param name="listener">The listener socket handle</param>
+    public void CloseListener(nint listener)
+    {
+        Win_x64.ioring_rio_close_listener(_ring, listener);
     }
 
     /// <summary>
