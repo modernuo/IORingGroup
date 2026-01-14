@@ -220,6 +220,42 @@ public sealed class WindowsIORingGroup : IIORingGroup
             Win_x64.closesocket(socket);
     }
 
+    // =============================================================================
+    // Registered Buffer Operations (Zero-Copy I/O) - Not supported in legacy mode
+    // =============================================================================
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// WindowsIORingGroup uses legacy (non-RIO) mode which does not support registered buffers.
+    /// Use WindowsRIOGroup for zero-copy buffer operations.
+    /// </remarks>
+    public int RegisterBuffer(IORingBuffer buffer)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations require RIO mode. Use WindowsRIOGroup instead.");
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterBuffer(int bufferId)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations require RIO mode. Use WindowsRIOGroup instead.");
+    }
+
+    /// <inheritdoc/>
+    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations require RIO mode. Use WindowsRIOGroup instead.");
+    }
+
+    /// <inheritdoc/>
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations require RIO mode. Use WindowsRIOGroup instead.");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

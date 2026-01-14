@@ -456,6 +456,106 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             _arch.close((int)socket);
     }
 
+    // =============================================================================
+    // Registered Buffer Operations (Zero-Copy I/O)
+    // =============================================================================
+
+    // External buffer tracking (similar to Windows RIO)
+    private const int MaxExternalBuffers = 16;
+    private readonly nint[] _externalBufferPtrs = new nint[MaxExternalBuffers];
+    private readonly int[] _externalBufferLengths = new int[MaxExternalBuffers];
+    private int _externalBufferCount;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// On Linux, buffer registration tracks the buffer locally for use with
+    /// PrepareSendBuffer/PrepareRecvBuffer. Unlike Windows RIO, Linux io_uring
+    /// doesn't require kernel-level buffer registration for socket I/O - the
+    /// buffer pointer is used directly with SEND/RECV operations.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int RegisterBuffer(IORingBuffer buffer)
+    {
+        if (buffer == null)
+            throw new ArgumentNullException(nameof(buffer));
+
+        if (_externalBufferCount >= MaxExternalBuffers)
+            throw new InvalidOperationException("Maximum external buffer count reached");
+
+        // Find free slot
+        for (var i = 0; i < MaxExternalBuffers; i++)
+        {
+            if (_externalBufferPtrs[i] == 0)
+            {
+                _externalBufferPtrs[i] = buffer.Pointer;
+                _externalBufferLengths[i] = buffer.VirtualSize;
+                _externalBufferCount++;
+                return i;
+            }
+        }
+
+        throw new InvalidOperationException("No free buffer slots available");
+    }
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void UnregisterBuffer(int bufferId)
+    {
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            throw new ArgumentOutOfRangeException(nameof(bufferId));
+
+        if (_externalBufferPtrs[bufferId] != 0)
+        {
+            _externalBufferPtrs[bufferId] = 0;
+            _externalBufferLengths[bufferId] = 0;
+            _externalBufferCount--;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// On Linux, this uses a regular SEND operation with the buffer pointer
+    /// calculated from the registered buffer. The connId is used as the fd.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            throw new ArgumentOutOfRangeException(nameof(bufferId));
+
+        var bufPtr = _externalBufferPtrs[bufferId];
+        if (bufPtr == 0)
+            throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+
+        if (offset + length > _externalBufferLengths[bufferId])
+            throw new ArgumentOutOfRangeException(nameof(offset), "Offset + length exceeds buffer size");
+
+        // Use regular SEND with calculated buffer address
+        PrepareSend(connId, bufPtr + offset, length, MsgFlags.None, userData);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// On Linux, this uses a regular RECV operation with the buffer pointer
+    /// calculated from the registered buffer. The connId is used as the fd.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            throw new ArgumentOutOfRangeException(nameof(bufferId));
+
+        var bufPtr = _externalBufferPtrs[bufferId];
+        if (bufPtr == 0)
+            throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+
+        if (offset + length > _externalBufferLengths[bufferId])
+            throw new ArgumentOutOfRangeException(nameof(offset), "Offset + length exceeds buffer size");
+
+        // Use regular RECV with calculated buffer address
+        PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
+    }
+
     private static uint ParseIPv4(string address)
     {
         if (address == "0.0.0.0") return 0; // INADDR_ANY

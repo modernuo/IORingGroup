@@ -39,6 +39,12 @@ public partial class Pipe : IDisposable
             return new Span<byte>((void*)(_pipe._buffer + write), (int)sz);
         }
 
+        /// <summary>
+        /// Gets the current write offset from the buffer base.
+        /// Used for zero-copy receives with registered buffers.
+        /// </summary>
+        public int GetWriteOffset() => (int)_pipe._writeIdx;
+
         public void Advance(uint count)
         {
             var read = _pipe._readIdx;

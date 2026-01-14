@@ -376,13 +376,11 @@ public class Program
 
                 if (useRegisteredBuffers && rioRing != null)
                 {
-                    // Use RIO registered buffers
-                    var connId = rioRing.RegisterSocket(clientSocket, out var recvBuf, out var sendBuf);
+                    // Register socket with RIO for async completion queue
+                    var connId = rioRing.RegisterSocket(clientSocket);
                     if (connId >= 0)
                     {
                         client.ConnId = connId;
-                        client.RecvBuffer = recvBuf;
-                        client.SendBuffer = sendBuf;
 
                         // In pipe mode, create a Pipe and register it as an external buffer
                         if (_usePipeMode)
@@ -407,16 +405,14 @@ public class Program
                     }
                 }
 
-                if (!useRegisteredBuffers || client.ConnId < 0)
+                // Always use pinned buffers for recv/send (per-connection RIO buffers removed)
                 {
-                    // Use pinned buffers
                     var recvBuffer = new byte[BufferSize];
                     var sendBuffer = new byte[BufferSize];
                     client.RecvHandle = GCHandle.Alloc(recvBuffer, GCHandleType.Pinned);
                     client.SendHandle = GCHandle.Alloc(sendBuffer, GCHandleType.Pinned);
                     client.RecvBuffer = client.RecvHandle.AddrOfPinnedObject();
                     client.SendBuffer = client.SendHandle.AddrOfPinnedObject();
-                    client.ConnId = -1;
                 }
 
                 // Start timing on first connection
@@ -438,14 +434,7 @@ public class Program
                     Console.WriteLine($"Client {clientIndex} connected (socket={result})");
 
                 // Post initial receive
-                if (client.ConnId >= 0 && rioRing != null)
-                {
-                    rioRing.PrepareRecvRegistered(client.ConnId, BufferSize, OpRecv | (uint)clientIndex);
-                }
-                else
-                {
-                    ring.PrepareRecv(client.Socket, client.RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)clientIndex);
-                }
+                ring.PrepareRecv(client.Socket, client.RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)clientIndex);
             }
             else
             {
@@ -501,15 +490,6 @@ public class Program
                 CloseClient(ring, rioRing, index, useRegisteredBuffers);
             }
         }
-        else if (client.ConnId >= 0 && rioRing != null)
-        {
-            // RIO registered buffer mode: copy recv->send buffer
-            unsafe
-            {
-                Buffer.MemoryCopy((void*)client.RecvBuffer, (void*)client.SendBuffer, BufferSize, result);
-            }
-            rioRing.PrepareSendRegistered(client.ConnId, result, OpSend | (uint)index);
-        }
         else
         {
             // Standard mode: copy recv->send buffer
@@ -541,14 +521,7 @@ public class Program
         }
 
         // Queue next receive
-        if (client.ConnId >= 0 && rioRing != null)
-        {
-            rioRing.PrepareRecvRegistered(client.ConnId, BufferSize, OpRecv | (uint)index);
-        }
-        else
-        {
-            ring.PrepareRecv(client.Socket, client.RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)index);
-        }
+        ring.PrepareRecv(client.Socket, client.RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)index);
     }
 
     private static void CloseClient(IIORingGroup ring, WindowsRIOGroup? rioRing, int index, bool useRegisteredBuffers)
@@ -970,13 +943,6 @@ public class Program
             Console.WriteLine("=== RIO Ring Info ===");
             Console.WriteLine($"Active connections: {rioRing.ActiveConnections}");
             Console.WriteLine($"Max connections: {rioRing.MaxConnections}");
-
-            Console.WriteLine();
-            Console.WriteLine("=== Lazy Commit Stats ===");
-            Console.WriteLine($"Reserved bytes: {rioRing.ReservedBytes / 1024.0 / 1024.0:N2} MB (virtual address space)");
-            Console.WriteLine($"Committed bytes: {rioRing.CommittedBytes / 1024.0 / 1024.0:N2} MB (actual physical memory)");
-            Console.WriteLine($"Committed slabs: {rioRing.CommittedSlabs} (256 connections each)");
-            Console.WriteLine($"Committed connections: {rioRing.CommittedConnections}");
 
             if (_usePipeMode)
             {
