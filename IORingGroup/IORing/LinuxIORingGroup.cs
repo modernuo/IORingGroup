@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -369,6 +370,121 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void AdvanceCompletionQueue(int count)
     {
         Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
+    }
+
+    // =============================================================================
+    // Listener and Socket Management
+    // =============================================================================
+
+    /// <inheritdoc/>
+    public unsafe nint CreateListener(string bindAddress, ushort port, int backlog)
+    {
+        // Create non-blocking TCP socket
+        var fd = _arch.socket(
+            _arch.AF_INET,
+            _arch.SOCK_STREAM | _arch.SOCK_NONBLOCK,
+            _arch.IPPROTO_TCP
+        );
+
+        if (fd < 0) return -1;
+
+        // Disable SO_REUSEADDR (exclusive address use)
+        int optval = 0;
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_REUSEADDR, (nint)(&optval), sizeof(int));
+
+        // Disable TCP_NODELAY (Nagle off)
+        optval = 1;
+        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
+
+        // Disable SO_LINGER
+        var linger = new LingerOption { OnOff = 0, Seconds = 0 };
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+
+        // Parse and bind address
+        var addr = new sockaddr_in
+        {
+            sin_family = (ushort)_arch.AF_INET,
+            sin_port = BinaryPrimitives.ReverseEndianness(port),
+            sin_addr = ParseIPv4(bindAddress)
+        };
+
+        if (_arch.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
+        {
+            _arch.close(fd);
+            return -1;
+        }
+
+        if (_arch.listen(fd, backlog) < 0)
+        {
+            _arch.close(fd);
+            return -1;
+        }
+
+        return fd;
+    }
+
+    /// <inheritdoc/>
+    public void CloseListener(nint listener)
+    {
+        if (listener >= 0)
+            _arch.close((int)listener);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ConfigureSocket(nint socket)
+    {
+        var fd = (int)socket;
+
+        // Set non-blocking
+        var flags = _arch.fcntl(fd, _arch.F_GETFL, 0);
+        if (flags >= 0)
+            _arch.fcntl(fd, _arch.F_SETFL, flags | _arch.O_NONBLOCK);
+
+        // TCP_NODELAY (disable Nagle)
+        int optval = 1;
+        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
+
+        // Disable SO_LINGER
+        var linger = new LingerOption { OnOff = 0, Seconds = 0 };
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+    }
+
+    /// <inheritdoc/>
+    public void CloseSocket(nint socket)
+    {
+        if (socket >= 0)
+            _arch.close((int)socket);
+    }
+
+    private static uint ParseIPv4(string address)
+    {
+        if (address == "0.0.0.0") return 0; // INADDR_ANY
+
+        var parts = address.Split('.');
+        if (parts.Length != 4) return 0;
+
+        return (uint)(
+            byte.Parse(parts[0]) |
+            (byte.Parse(parts[1]) << 8) |
+            (byte.Parse(parts[2]) << 16) |
+            (byte.Parse(parts[3]) << 24)
+        );
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct sockaddr_in
+    {
+        public ushort sin_family;
+        public ushort sin_port;
+        public uint sin_addr;
+        public ulong sin_zero;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LingerOption
+    {
+        public int OnOff;
+        public int Seconds;
     }
 
     public void Dispose()

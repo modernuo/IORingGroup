@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025, ModernUO
+#
+# Docker Compose for IORingGroup Linux benchmarks
+#
+# Usage:
+#   # Run io_uring benchmark (60s):
+#   docker compose --profile iouring up --build
+#
+#   # Run epoll benchmark (60s):
+#   docker compose --profile epoll up --build
+#
+#   # Run tests:
+#   docker compose run test
+#
+#   # Custom duration (e.g., 30s):
+#   DURATION=30 docker compose --profile iouring up --build
+#
+#   # Run both benchmarks sequentially:
+#   ./scripts/benchmark.sh
+
+services:
+  # io_uring server (Linux native)
+  server-iouring:
+    build:
+      context: .
+      target: server
+    profiles: ["iouring"]
+    environment:
+      - BACKEND=--iouring
+      - BENCHMARK_ARGS=-b -q
+      - DURATION=${DURATION:-60}
+    ports:
+      - "5000:5000"
+    # io_uring requires elevated privileges
+    privileged: true
+    networks:
+      - benchmark
+
+  # epoll/PollGroup server (cross-platform)
+  server-epoll:
+    build:
+      context: .
+      target: server
+    profiles: ["epoll"]
+    environment:
+      - BACKEND=--epoll
+      - BENCHMARK_ARGS=-b -q
+      - DURATION=${DURATION:-60}
+    ports:
+      - "5000:5000"
+    networks:
+      - benchmark
+
+  # Benchmark client for io_uring
+  client-iouring:
+    build:
+      context: .
+      target: client
+    profiles: ["iouring"]
+    environment:
+      - SERVER_HOST=server-iouring
+      - SERVER_PORT=5000
+      - CONNECTIONS=${CONNECTIONS:-100}
+      - MESSAGES=${MESSAGES:-100000}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-1000}
+    depends_on:
+      - server-iouring
+    networks:
+      - benchmark
+    # Wait for server to be ready
+    restart: on-failure
+
+  # Benchmark client for epoll
+  client-epoll:
+    build:
+      context: .
+      target: client
+    profiles: ["epoll"]
+    environment:
+      - SERVER_HOST=server-epoll
+      - SERVER_PORT=5000
+      - CONNECTIONS=${CONNECTIONS:-100}
+      - MESSAGES=${MESSAGES:-100000}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-1000}
+    depends_on:
+      - server-epoll
+    networks:
+      - benchmark
+    restart: on-failure
+
+  # Test runner
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    privileged: true
+
+networks:
+  benchmark:
+    driver: bridge

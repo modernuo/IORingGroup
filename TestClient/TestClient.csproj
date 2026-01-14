@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>Preview</LangVersion>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- RuntimeIdentifier set via command line for cross-platform builds -->
   </PropertyGroup>
 
   <ItemGroup>

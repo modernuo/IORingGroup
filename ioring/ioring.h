@@ -129,7 +129,6 @@ IORING_API void ioring_cq_advance(ioring_t* ring, uint32_t count);
 
 // Error handling
 IORING_API int ioring_get_last_error(void);
-IORING_API const char* ioring_strerror(int error);
 
 // =============================================================================
 // HIGH-PERFORMANCE RIO API (true async with registered buffers)
@@ -142,7 +141,7 @@ IORING_API const char* ioring_strerror(int error);
  * - True async operations (don't block waiting for data)
  *
  * Usage pattern:
- * 1. Create ring with ioring_create_rio() specifying max connections and buffer sizes
+ * 1. Create ring with ioring_create_rio_ex() specifying max connections and buffer sizes
  * 2. Accept connections normally (listener doesn't need RIO)
  * 3. Register each connected socket with ioring_rio_register() to get buffer pointers
  * 4. Post recv/send ops with ioring_prep_recv_registered/ioring_prep_send_registered
@@ -152,19 +151,6 @@ IORING_API const char* ioring_strerror(int error);
  */
 
 // Create ring with RIO buffer pool pre-allocated
-// - entries: SQ/CQ size (power of 2 recommended)
-// - max_connections: maximum concurrent registered sockets
-// - recv_buffer_size: size of receive buffer per connection
-// - send_buffer_size: size of send buffer per connection
-// Returns NULL on failure (check ioring_get_last_error())
-IORING_API ioring_t* ioring_create_rio(
-    uint32_t entries,
-    uint32_t max_connections,
-    uint32_t recv_buffer_size,
-    uint32_t send_buffer_size
-);
-
-// Extended version with configurable outstanding operations
 // - outstanding_per_socket: max outstanding ops per direction (recv/send) per socket
 //   Default is 2 (enough for request-response patterns like echo)
 //   Higher values (4-8) for pipelined protocols
@@ -194,10 +180,6 @@ IORING_API int ioring_rio_register(
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
 
-// Get buffer sizes for this ring
-IORING_API uint32_t ioring_rio_get_recv_buffer_size(ioring_t* ring);
-IORING_API uint32_t ioring_rio_get_send_buffer_size(ioring_t* ring);
-
 // Prepare receive on registered connection
 // Data will be placed in the recv_buf returned from ioring_rio_register()
 IORING_API void ioring_prep_recv_registered(
@@ -219,9 +201,6 @@ IORING_API void ioring_prep_send_registered(
 // Check if ring was created with RIO support
 IORING_API int ioring_is_rio(ioring_t* ring);
 
-// Get maximum connections for RIO ring
-IORING_API uint32_t ioring_rio_get_max_connections(ioring_t* ring);
-
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
 
@@ -234,95 +213,6 @@ IORING_API size_t ioring_rio_get_reserved_bytes(ioring_t* ring);
 IORING_API uint32_t ioring_rio_get_committed_slabs(ioring_t* ring);
 // Get number of connection slots with committed buffers
 IORING_API uint32_t ioring_rio_get_committed_connections(ioring_t* ring);
-
-// Diagnostic: Get connection state for debugging
-// Returns packed value: (active << 0) | (rq_valid << 1) | (socket_valid << 2)
-// Value 7 = fully valid (active + rq_valid + socket_valid)
-// Negative value indicates error
-IORING_API int ioring_rio_get_conn_state(ioring_t* ring, int conn_id);
-
-// Diagnostic: Check if RIOReceive parameters are valid (does NOT actually post)
-// Returns: 1 if all parameters valid, negative error code if invalid
-IORING_API int ioring_rio_check_recv_params(ioring_t* ring, int conn_id);
-
-// Diagnostic: Get number of completions waiting in user-space CQ
-IORING_API int ioring_rio_peek_cq_count(ioring_t* ring);
-
-// Diagnostic: Get RIO recv stats (packed: recv_calls | recv_success << 16)
-IORING_API uint32_t ioring_rio_get_recv_stats(void);
-
-// Diagnostic: Get last RIOReceive error
-IORING_API int ioring_rio_get_last_recv_error(void);
-
-// Diagnostic: Get dequeue stats (packed: dequeue_calls | dequeue_total << 16)
-IORING_API uint32_t ioring_rio_get_dequeue_stats(void);
-
-// Diagnostic: Reset all counters
-IORING_API void ioring_rio_reset_stats(void);
-
-// Diagnostic: Get build version (to verify correct DLL is loaded)
-IORING_API int ioring_get_build_version(void);
-
-// Diagnostic: Get the CQ handle being used
-IORING_API uint64_t ioring_rio_get_cq_handle(ioring_t* ring);
-
-// Diagnostic: Get the RQ handle that was created (for AcceptEx sockets)
-IORING_API uint64_t ioring_rio_get_rq_created(void);
-
-// Diagnostic: Get the RQ handle used in RIOReceive
-IORING_API uint64_t ioring_rio_get_rq_used(void);
-
-// Diagnostic: Get the buffer ID used in RIOReceive
-IORING_API uint64_t ioring_rio_get_buf_id_used(void);
-
-// Diagnostic: Get the buffer offset used in RIOReceive
-IORING_API uint32_t ioring_rio_get_buf_offset_used(void);
-
-// Diagnostic: Verify buffer registration is valid for the ring
-IORING_API int ioring_rio_check_buffer_registration(ioring_t* ring);
-
-// Diagnostic: Get the connection slot that was created (during AcceptEx)
-IORING_API int ioring_rio_get_conn_slot_created(void);
-
-// Diagnostic: Get the connection ID used in RIOReceive
-IORING_API int ioring_rio_get_conn_id_used(void);
-
-// Diagnostic: Get the CQ used when creating the RQ (to compare with polling CQ)
-IORING_API uint64_t ioring_rio_get_cq_at_rq_create(void);
-
-// Diagnostic: Check if socket has data available using WSAPoll
-// Returns: 1 if readable, 0 if not, -error on error
-IORING_API int ioring_rio_check_socket_readable(ioring_t* ring, int conn_id);
-
-// Diagnostic: Get the raw socket handle stored for a connection
-IORING_API uint64_t ioring_rio_get_conn_socket(ioring_t* ring, int conn_id);
-
-// Diagnostic: Verify socket is valid using getsockopt (SO_TYPE)
-// Returns: socket type (SOCK_STREAM=1, SOCK_DGRAM=2) if valid, -error if invalid
-IORING_API int ioring_rio_verify_socket_valid(ioring_t* ring, int conn_id);
-
-// Diagnostic: Check how much data is pending on the socket using FIONREAD
-// Returns: bytes available, or -error on failure
-IORING_API int ioring_rio_get_socket_pending_bytes(ioring_t* ring, int conn_id);
-
-// Diagnostic: Get the buffer ID registered with the ring (to compare with bufIdUsed)
-IORING_API uint64_t ioring_rio_get_buffer_id(ioring_t* ring);
-
-// Diagnostic: Get SO_UPDATE_ACCEPT_CONTEXT result (0=success, >0=WSA error)
-IORING_API int ioring_rio_get_update_accept_ctx_result(void);
-
-// Diagnostic: Get the listener socket used in SO_UPDATE_ACCEPT_CONTEXT
-IORING_API uint64_t ioring_rio_get_listen_socket_used(void);
-
-// Diagnostic: Get the accept socket used in SO_UPDATE_ACCEPT_CONTEXT
-IORING_API uint64_t ioring_rio_get_accept_socket_at_update(void);
-
-// Diagnostic: Get RIONotify call count
-IORING_API int ioring_rio_get_notify_calls(void);
-
-// Diagnostic: Check if any data was written to the receive buffer
-// Returns: first 4 bytes of buffer as int (e.g., "Hell" = 0x6C6C6548)
-IORING_API int ioring_rio_peek_recv_buffer(ioring_t* ring, int conn_id);
 
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
@@ -353,10 +243,6 @@ IORING_API int ioring_rio_peek_recv_buffer(ioring_t* ring, int conn_id);
 // Create a socket suitable for AcceptEx that has WSA_FLAG_REGISTERED_IO
 // Returns INVALID_SOCKET on failure
 IORING_API SOCKET ioring_rio_create_accept_socket(void);
-
-// Connect a socket to the specified address (for testing RIO on client sockets)
-// Returns 0 on success, -1 on failure (call ioring_get_last_error for details)
-IORING_API int ioring_connect_socket(SOCKET sock, const char* ip_address, uint16_t port);
 
 // Get AcceptEx function pointer (convenience helper)
 // Returns NULL on failure
@@ -397,8 +283,17 @@ IORING_API SOCKET ioring_rio_create_listener(
 // This properly cleans up any pending AcceptEx operations
 IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
 
-// Get the number of owned listeners
-IORING_API uint32_t ioring_rio_get_listener_count(ioring_t* ring);
+// Configure an accepted socket with optimal settings (TCP_NODELAY, non-blocking, etc.)
+// Call this on sockets from accept completions if not using PrepareAccept
+IORING_API void ioring_rio_configure_socket(SOCKET socket);
+
+// Create a listener socket with optimal settings (non-RIO mode)
+// Uses standard socket (not WSA_FLAG_REGISTERED_IO) for non-RIO use cases
+IORING_API SOCKET ioring_create_listener(
+    const char* bind_addr,
+    uint16_t port,
+    int backlog
+);
 
 // =============================================================================
 // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
