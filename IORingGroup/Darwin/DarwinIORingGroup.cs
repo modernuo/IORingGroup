@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -372,6 +373,135 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         _cqHead += count;
     }
 
+    // =============================================================================
+    // Listener and Socket Management
+    // =============================================================================
+
+    /// <inheritdoc/>
+    public unsafe nint CreateListener(string bindAddress, ushort port, int backlog)
+    {
+        // Create TCP socket
+        var fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd < 0) return -1;
+
+        // Set non-blocking
+        var flags = Darwin.fcntl(fd, F_GETFL, 0);
+        if (flags >= 0)
+            Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        // Disable SO_REUSEADDR (exclusive address use)
+        int optval = 0;
+        Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (nint)(&optval), sizeof(int));
+
+        // TCP_NODELAY (disable Nagle)
+        optval = 1;
+        Darwin.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (nint)(&optval), sizeof(int));
+
+        // Disable SO_LINGER
+        var linger = new linger { l_onoff = 0, l_linger = 0 };
+        Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
+
+        // Parse and bind address
+        var addr = new sockaddr_in
+        {
+            sin_len = (byte)sizeof(sockaddr_in),
+            sin_family = AF_INET,
+            sin_port = BinaryPrimitives.ReverseEndianness(port),
+            sin_addr = ParseIPv4(bindAddress)
+        };
+
+        if (Darwin.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
+        {
+            Darwin.close(fd);
+            return -1;
+        }
+
+        if (Darwin.listen(fd, backlog) < 0)
+        {
+            Darwin.close(fd);
+            return -1;
+        }
+
+        return fd;
+    }
+
+    /// <inheritdoc/>
+    public void CloseListener(nint listener)
+    {
+        if (listener >= 0)
+            Darwin.close((int)listener);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ConfigureSocket(nint socket)
+    {
+        var fd = (int)socket;
+
+        // Set non-blocking
+        var flags = Darwin.fcntl(fd, F_GETFL, 0);
+        if (flags >= 0)
+            Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        // TCP_NODELAY (disable Nagle)
+        int optval = 1;
+        Darwin.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (nint)(&optval), sizeof(int));
+
+        // Disable SO_LINGER
+        var linger = new linger { l_onoff = 0, l_linger = 0 };
+        Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
+    }
+
+    /// <inheritdoc/>
+    public void CloseSocket(nint socket)
+    {
+        if (socket >= 0)
+            Darwin.close((int)socket);
+    }
+
+    private static uint ParseIPv4(string address)
+    {
+        if (address == "0.0.0.0") return 0; // INADDR_ANY
+
+        var parts = address.Split('.');
+        if (parts.Length != 4) return 0;
+
+        return (uint)(
+            byte.Parse(parts[0]) |
+            (byte.Parse(parts[1]) << 8) |
+            (byte.Parse(parts[2]) << 16) |
+            (byte.Parse(parts[3]) << 24)
+        );
+    }
+
+    // Socket constants for macOS/BSD
+    private const int AF_INET = 2;
+    private const int SOCK_STREAM = 1;
+    private const int IPPROTO_TCP = 6;
+    private const int SOL_SOCKET = 0xFFFF;
+    private const int SO_REUSEADDR = 0x0004;
+    private const int SO_LINGER = 0x0080;
+    private const int TCP_NODELAY = 0x01;
+    private const int F_GETFL = 3;
+    private const int F_SETFL = 4;
+    private const int O_NONBLOCK = 0x0004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct sockaddr_in
+    {
+        public byte sin_len;
+        public byte sin_family;
+        public ushort sin_port;
+        public uint sin_addr;
+        public ulong sin_zero;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct linger
+    {
+        public int l_onoff;
+        public int l_linger;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -412,6 +542,21 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
         [LibraryImport("libSystem.dylib", SetLastError = true)]
         public static partial int shutdown(int sockfd, int how);
+
+        [LibraryImport("libSystem.dylib", SetLastError = true)]
+        public static partial int socket(int domain, int type, int protocol);
+
+        [LibraryImport("libSystem.dylib", SetLastError = true)]
+        public static partial int bind(int sockfd, nint addr, int addrlen);
+
+        [LibraryImport("libSystem.dylib", SetLastError = true)]
+        public static partial int listen(int sockfd, int backlog);
+
+        [LibraryImport("libSystem.dylib", SetLastError = true)]
+        public static partial int setsockopt(int sockfd, int level, int optname, nint optval, int optlen);
+
+        [LibraryImport("libSystem.dylib", SetLastError = true)]
+        public static partial int fcntl(int fd, int cmd, int arg);
     }
 
     [StructLayout(LayoutKind.Sequential)]

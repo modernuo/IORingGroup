@@ -291,6 +291,31 @@ public sealed class WindowsRIOGroup : IIORingGroup
         Win_x64.ioring_rio_close_listener(_ring, listener);
     }
 
+    /// <summary>
+    /// Configures an accepted socket with optimal settings.
+    /// </summary>
+    /// <param name="socket">The accepted socket handle</param>
+    /// <remarks>
+    /// On Windows RIO, sockets created via AcceptEx are already configured by the library.
+    /// This method is provided for API consistency but may be a no-op if the socket
+    /// was created via PrepareAccept.
+    /// </remarks>
+    public void ConfigureSocket(nint socket)
+    {
+        // AcceptEx sockets from PrepareAccept are already configured by ioring.dll
+        // For manually created sockets, call setsockopt for TCP_NODELAY etc.
+        Win_x64.ioring_rio_configure_socket(socket);
+    }
+
+    /// <summary>
+    /// Closes a socket.
+    /// </summary>
+    /// <param name="socket">The socket handle to close</param>
+    public void CloseSocket(nint socket)
+    {
+        Win_x64.closesocket(socket);
+    }
+
     // =============================================================================
     // External Buffer Support (for zero-copy from user-owned memory like Pipe)
     // =============================================================================

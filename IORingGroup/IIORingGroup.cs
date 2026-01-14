@@ -15,6 +15,12 @@ public interface IIORingGroup : IDisposable
     int SubmissionQueueSpace { get; }
 
     /// <summary>
+    /// Gets the number of currently active connections (platform-specific tracking).
+    /// Returns -1 if not supported by the implementation.
+    /// </summary>
+    int ActiveConnections => -1;
+
+    /// <summary>
     /// Gets the number of pending completions in the completion queue.
     /// </summary>
     int CompletionQueueCount { get; }
@@ -128,4 +134,50 @@ public interface IIORingGroup : IDisposable
     /// </summary>
     /// <param name="count">Number of completions to mark as consumed.</param>
     void AdvanceCompletionQueue(int count);
+
+    // =============================================================================
+    // Listener and Socket Management
+    // =============================================================================
+
+    /// <summary>
+    /// Creates a listening socket bound to the specified address and port.
+    /// </summary>
+    /// <param name="bindAddress">IP address to bind to (e.g., "0.0.0.0" for all interfaces).</param>
+    /// <param name="port">Port number to listen on.</param>
+    /// <param name="backlog">Maximum pending connections queue length.</param>
+    /// <returns>Listener socket handle on success, -1 on failure.</returns>
+    /// <remarks>
+    /// The socket is created with platform-optimal flags:
+    /// - Non-blocking mode
+    /// - TCP_NODELAY (Nagle disabled)
+    /// - SO_REUSEADDR disabled (exclusive address use)
+    /// - SO_LINGER disabled
+    /// On Windows RIO, the socket includes WSA_FLAG_REGISTERED_IO for AcceptEx compatibility.
+    /// </remarks>
+    nint CreateListener(string bindAddress, ushort port, int backlog);
+
+    /// <summary>
+    /// Closes a listener socket created by <see cref="CreateListener"/>.
+    /// </summary>
+    /// <param name="listener">The listener socket handle.</param>
+    void CloseListener(nint listener);
+
+    /// <summary>
+    /// Configures an accepted socket with optimal settings.
+    /// </summary>
+    /// <param name="socket">The accepted socket handle.</param>
+    /// <remarks>
+    /// Sets:
+    /// - Non-blocking mode
+    /// - TCP_NODELAY (Nagle disabled)
+    /// - SO_LINGER disabled
+    /// Call this on sockets returned from accept completions.
+    /// </remarks>
+    void ConfigureSocket(nint socket);
+
+    /// <summary>
+    /// Closes a socket.
+    /// </summary>
+    /// <param name="socket">The socket handle to close.</param>
+    void CloseSocket(nint socket);
 }

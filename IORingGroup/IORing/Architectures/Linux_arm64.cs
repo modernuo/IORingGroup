@@ -14,14 +14,29 @@ public sealed partial class Linux_arm64 : ILinuxArch
 
     private Linux_arm64() { }
 
-    // ILinuxArch property implementations
+    // ILinuxArch property implementations - mmap
     int ILinuxArch.PROT_READ => PROT_READ;
     int ILinuxArch.PROT_WRITE => PROT_WRITE;
     int ILinuxArch.MAP_SHARED => MAP_SHARED;
     int ILinuxArch.MAP_POPULATE => MAP_POPULATE;
+
+    // ILinuxArch property implementations - io_uring offsets
     ulong ILinuxArch.IORING_OFF_SQ_RING => IORING_OFF_SQ_RING;
     ulong ILinuxArch.IORING_OFF_CQ_RING => IORING_OFF_CQ_RING;
     ulong ILinuxArch.IORING_OFF_SQES => IORING_OFF_SQES;
+
+    // ILinuxArch property implementations - socket constants
+    int ILinuxArch.AF_INET => AF_INET;
+    int ILinuxArch.SOCK_STREAM => SOCK_STREAM;
+    int ILinuxArch.SOCK_NONBLOCK => SOCK_NONBLOCK;
+    int ILinuxArch.IPPROTO_TCP => IPPROTO_TCP;
+    int ILinuxArch.SOL_SOCKET => SOL_SOCKET;
+    int ILinuxArch.SO_REUSEADDR => SO_REUSEADDR;
+    int ILinuxArch.SO_LINGER => SO_LINGER;
+    int ILinuxArch.TCP_NODELAY => TCP_NODELAY;
+    int ILinuxArch.F_SETFL => F_SETFL;
+    int ILinuxArch.F_GETFL => F_GETFL;
+    int ILinuxArch.O_NONBLOCK => O_NONBLOCK;
 
     // Syscall numbers for aarch64
     private const int SYS_io_uring_setup = 425;
@@ -45,6 +60,20 @@ public sealed partial class Linux_arm64 : ILinuxArch
     public const ulong IORING_OFF_CQ_RING = 0x8000000;
     public const ulong IORING_OFF_SQES = 0x10000000;
 
+    // Socket constants (same as x64 on Linux)
+    public const int AF_INET = 2;
+    public const int SOCK_STREAM = 1;
+    public const int SOCK_NONBLOCK = 0x800;
+    public const int IPPROTO_TCP = 6;
+    public const int SOL_SOCKET = 1;
+    public const int SO_REUSEADDR = 2;
+    public const int SO_LINGER = 13;
+    public const int TCP_NODELAY = 1;
+    public const int F_SETFL = 4;
+    public const int F_GETFL = 3;
+    public const int O_NONBLOCK = 0x800;
+
+    // libc bindings - memory
     [LibraryImport("libc", SetLastError = true)]
     private static partial nint mmap_native(nint addr, nuint length, int prot, int flags, int fd, long offset);
 
@@ -53,6 +82,22 @@ public sealed partial class Linux_arm64 : ILinuxArch
 
     [LibraryImport("libc", SetLastError = true)]
     private static partial int close_native(int fd);
+
+    // libc bindings - sockets
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int socket_native(int domain, int type, int protocol);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int bind_native(int sockfd, nint addr, int addrlen);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int listen_native(int sockfd, int backlog);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int setsockopt_native(int sockfd, int level, int optname, nint optval, int optlen);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int fcntl_native(int fd, int cmd, int arg);
 
     /// <summary>
     /// io_uring_setup syscall wrapper.
@@ -90,8 +135,14 @@ public sealed partial class Linux_arm64 : ILinuxArch
     int ILinuxArch.munmap(nint addr, nuint length)
         => munmap_native(addr, length);
 
-    int ILinuxArch.close(int fd)
-        => close_native(fd);
+    int ILinuxArch.close(int fd) => close_native(fd);
+
+    int ILinuxArch.socket(int domain, int type, int protocol) => socket_native(domain, type, protocol);
+    int ILinuxArch.bind(int sockfd, nint addr, int addrlen) => bind_native(sockfd, addr, addrlen);
+    int ILinuxArch.listen(int sockfd, int backlog) => listen_native(sockfd, backlog);
+    int ILinuxArch.setsockopt(int sockfd, int level, int optname, nint optval, int optlen)
+        => setsockopt_native(sockfd, level, optname, optval, optlen);
+    int ILinuxArch.fcntl(int fd, int cmd, int arg) => fcntl_native(fd, cmd, arg);
 
     // Raw syscall implementation
     [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]

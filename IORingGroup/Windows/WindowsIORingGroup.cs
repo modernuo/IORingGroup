@@ -189,6 +189,37 @@ public sealed class WindowsIORingGroup : IIORingGroup
         Win_x64.ioring_cq_advance(_ring, (uint)count);
     }
 
+    // =============================================================================
+    // Listener and Socket Management
+    // =============================================================================
+
+    /// <inheritdoc/>
+    public nint CreateListener(string bindAddress, ushort port, int backlog)
+    {
+        // For non-RIO mode, use standard socket creation via ioring.dll
+        return Win_x64.ioring_create_listener(bindAddress, port, backlog);
+    }
+
+    /// <inheritdoc/>
+    public void CloseListener(nint listener)
+    {
+        if (listener != -1 && listener != 0)
+            Win_x64.closesocket(listener);
+    }
+
+    /// <inheritdoc/>
+    public void ConfigureSocket(nint socket)
+    {
+        Win_x64.ioring_rio_configure_socket(socket);
+    }
+
+    /// <inheritdoc/>
+    public void CloseSocket(nint socket)
+    {
+        if (socket != -1 && socket != 0)
+            Win_x64.closesocket(socket);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
