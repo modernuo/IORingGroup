@@ -24,7 +24,7 @@ public class Program
 {
     private const int Port = 5000;
     private const int BufferSize = 4096;
-    private const int MaxClients = 16384;
+    private const int MaxClients = 8192;
     private const int ListenBacklog = 4096;
 
     private static volatile bool _running = true;
@@ -138,6 +138,7 @@ public class Program
     private static long _lastReportedMessages;
     private static readonly Stopwatch _benchmarkStopwatch = new();
     private static bool _benchmarkStarted;
+    private static bool _finalStatsPrinted;
     private static int _peakConnections;
 
     // Memory stats (captured at start)
@@ -184,9 +185,9 @@ public class Program
                 _lastReportedMessages = 0;
                 _pendingAcceptCount = 0;
                 _benchmarkStarted = false;
+                _finalStatsPrinted = false;
                 _peakConnections = 0;
                 _benchmarkStopwatch.Reset();
-                CaptureStartMemoryStats();
 
                 // Pre-post multiple accepts
                 for (var i = 0; i < PendingAccepts; i++)
@@ -225,7 +226,11 @@ public class Program
                 }
 
                 _benchmarkStopwatch.Stop();
-                PrintFinalStats("RIO", ring);
+                if (!_finalStatsPrinted)
+                {
+                    _finalStatsPrinted = true;
+                    PrintFinalStats("RIO", ring);
+                }
             }
             finally
             {
@@ -283,13 +288,14 @@ public class Program
                         Active = true
                     };
 
-                    // Start benchmark on first connection
-                    if (benchmarkMode && !_benchmarkStarted)
+                    // Start timing on first connection
+                    if (!_benchmarkStarted)
                     {
                         _benchmarkStarted = true;
                         CaptureStartMemoryStats();
                         _benchmarkStopwatch.Start();
-                        Console.WriteLine("[RIO] First client connected - benchmark started!");
+                        if (benchmarkMode)
+                            Console.WriteLine("[RIO] First client connected - benchmark started!");
                     }
 
                     // Track peak connections
@@ -395,10 +401,11 @@ public class Program
         client = default;
 
         // Stop benchmark when all clients disconnect (after benchmark started)
-        if (benchmarkMode && _benchmarkStarted && ring.ActiveConnections == 0)
+        if (benchmarkMode && _benchmarkStarted && ring.ActiveConnections == 0 && !_finalStatsPrinted)
         {
             _benchmarkStopwatch.Stop();
             Console.WriteLine("[RIO] All clients disconnected - benchmark stopped!");
+            _finalStatsPrinted = true;
             PrintFinalStats("RIO", ring);
             _running = false;  // Exit the server loop
         }
@@ -438,17 +445,18 @@ public class Program
         pollGroup.Add(listener, listenerState.Handle);
 
         Console.WriteLine($"PollGroup server listening on port {Port}");
-        Console.WriteLine($"Backend: wepoll (Windows) / epoll (Linux) / kqueue (macOS)");
+        Console.WriteLine("Backend: wepoll (Windows) / epoll (Linux) / kqueue (macOS)");
 
         // Reset stats
         _totalMessages = 0;
         _totalBytes = 0;
         _lastReportedMessages = 0;
         _benchmarkStarted = false;
+        _finalStatsPrinted = false;
         _peakConnections = 0;
         _benchmarkStopwatch.Reset();
 
-        var handles = new GCHandle[256];
+        var handles = new GCHandle[1024];
         var lastStatsMs = 0L;
 
         var pendingSendCount = 0;
@@ -463,57 +471,57 @@ public class Program
             {
                 var state = (PollClientState)handles[i].Target!;
 
-                if (state.Socket == listener)
-                {
-                    // Accept new connections
-                    while (true)
-                    {
-                        try
-                        {
-                            var client = listener.Accept();
-                            client.Blocking = false;
-                            client.NoDelay = true;
-                            client.LingerState = new LingerOption(true, 0);
-
-                            var clientIndex = FindFreePollSlot();
-                            if (clientIndex >= 0)
-                            {
-                                var clientState = new PollClientState { Socket = client };
-                                clientState.Handle = GCHandle.Alloc(clientState, GCHandleType.Normal);
-                                _pollClients[clientIndex] = clientState;
-                                pollGroup.Add(client, clientState.Handle);
-
-                                // Start benchmark on first connection
-                                if (benchmarkMode && !_benchmarkStarted)
-                                {
-                                    _benchmarkStarted = true;
-                                    CaptureStartMemoryStats();
-                                    _benchmarkStopwatch.Start();
-                                    Console.WriteLine("[PollGroup] First client connected - benchmark started!");
-                                }
-
-                                // Track peak connections
-                                var activeCount = CountActivePollClients();
-                                if (activeCount > _peakConnections)
-                                    _peakConnections = activeCount;
-
-                                if (!benchmarkMode)
-                                    Console.WriteLine($"[PollGroup] Client {clientIndex} connected");
-                            }
-                            else
-                            {
-                                client.Close();
-                            }
-                        }
-                        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
-                        {
-                            break;
-                        }
-                    }
-                }
-                else
+                if (state.Socket != listener)
                 {
                     HandlePollClient(pollGroup, state, ref pendingSendCount, benchmarkMode);
+                    continue;
+                }
+
+                // Accept new connections
+                while (true)
+                {
+                    try
+                    {
+                        var client = listener.Accept();
+                        client.Blocking = false;
+                        client.NoDelay = true;
+                        client.LingerState = new LingerOption(true, 0);
+
+                        var clientIndex = FindFreePollSlot();
+                        if (clientIndex >= 0)
+                        {
+                            var clientState = new PollClientState { Socket = client };
+                            clientState.Handle = GCHandle.Alloc(clientState, GCHandleType.Normal);
+                            _pollClients[clientIndex] = clientState;
+                            pollGroup.Add(client, clientState.Handle);
+
+                            // Start timing on first connection
+                            if (!_benchmarkStarted)
+                            {
+                                _benchmarkStarted = true;
+                                CaptureStartMemoryStats();
+                                _benchmarkStopwatch.Start();
+                                if (benchmarkMode)
+                                    Console.WriteLine("[PollGroup] First client connected - benchmark started!");
+                            }
+
+                            // Track peak connections
+                            var activeCount = CountActivePollClients();
+                            if (activeCount > _peakConnections)
+                                _peakConnections = activeCount;
+
+                            if (!benchmarkMode)
+                                Console.WriteLine($"[PollGroup] Client {clientIndex} connected");
+                        }
+                        else
+                        {
+                            client.Close();
+                        }
+                    }
+                    catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -548,7 +556,11 @@ public class Program
         }
 
         _benchmarkStopwatch.Stop();
-        PrintFinalStats("PollGroup", null);
+        if (!_finalStatsPrinted)
+        {
+            _finalStatsPrinted = true;
+            PrintFinalStats("PollGroup", null);
+        }
 
         // Cleanup
         listenerState.Handle.Free();
@@ -644,10 +656,11 @@ public class Program
                 _pollClients[i] = null;
 
                 // Stop benchmark when all clients disconnect (after benchmark started)
-                if (benchmarkMode && _benchmarkStarted && CountActivePollClients() == 0)
+                if (benchmarkMode && _benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted)
                 {
                     _benchmarkStopwatch.Stop();
                     Console.WriteLine("[PollGroup] All clients disconnected - benchmark stopped!");
+                    _finalStatsPrinted = true;
                     PrintFinalStats("PollGroup", null);
                     _running = false;  // Exit the server loop
                 }
