@@ -8,21 +8,26 @@ namespace System.Network.Windows;
 
 /// <summary>
 /// High-performance Windows RIO (Registered I/O) implementation.
-/// Uses pre-registered buffers for zero-copy I/O and true async operations.
+/// Uses externally registered buffers for zero-copy I/O and true async operations.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Usage pattern:
-/// 1. Create with max connections and buffer sizes
-/// 2. Accept connections using PrepareAccept on listener (AcceptEx is handled internally)
-/// 3. Register each accepted socket with RegisterSocket() to get buffer pointers
-/// 4. Use PrepareRecvRegistered/PrepareSendRegistered with connection IDs
-/// 5. Call UnregisterSocket() before closing sockets
+/// 1. Create with max connections
+/// 2. Register external buffers (e.g., IORingBufferPool buffers)
+/// 3. Accept connections using PrepareAccept on listener (AcceptEx is handled internally)
+/// 4. Register each accepted socket with RegisterSocket()
+/// 5. Use PrepareSendBuffer/PrepareRecvBuffer with connection IDs and buffer IDs
+/// 6. Call UnregisterSocket() before closing sockets
 /// </para>
 /// <para>
 /// <b>Important:</b> PrepareAccept automatically uses AcceptEx internally to create
 /// RIO-compatible sockets. The accepted socket handle returned in the completion
 /// can be directly registered with RegisterSocket().
+/// </para>
+/// <para>
+/// <b>Note:</b> Buffers are now managed externally via IORingBufferPool. The recv_buffer_size
+/// and send_buffer_size constructor parameters are retained for API compatibility but unused.
 /// </para>
 /// </remarks>
 public sealed class WindowsRIOGroup : IIORingGroup
@@ -138,32 +143,9 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public int RecvBufferSize => _recvBufferSize;
 
     /// <summary>
-    /// Gets the send buffer size per connection.
+    /// Gets the send buffer size per connection (unused - buffers managed externally).
     /// </summary>
     public int SendBufferSize => _sendBufferSize;
-
-    /// <summary>
-    /// Gets the currently committed buffer bytes (actual physical memory).
-    /// Memory is committed on-demand as connections are registered.
-    /// </summary>
-    public long CommittedBytes => (long)Win_x64.ioring_rio_get_committed_bytes(_ring);
-
-    /// <summary>
-    /// Gets the total reserved buffer bytes (virtual address space only).
-    /// This is the maximum capacity, but physical memory is only used as needed.
-    /// </summary>
-    public long ReservedBytes => (long)Win_x64.ioring_rio_get_reserved_bytes(_ring);
-
-    /// <summary>
-    /// Gets the number of committed buffer slabs.
-    /// Each slab covers 256 connections.
-    /// </summary>
-    public int CommittedSlabs => (int)Win_x64.ioring_rio_get_committed_slabs(_ring);
-
-    /// <summary>
-    /// Gets the number of connection slots with committed buffers.
-    /// </summary>
-    public int CommittedConnections => (int)Win_x64.ioring_rio_get_committed_connections(_ring);
 
     /// <inheritdoc/>
     public int SubmissionQueueSpace => (int)Win_x64.ioring_sq_space_left(_ring);
@@ -190,18 +172,14 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// Registers a connected socket for RIO operations.
     /// </summary>
     /// <param name="socket">The connected socket handle</param>
-    /// <param name="recvBuffer">Output: pointer to the pre-allocated receive buffer</param>
-    /// <param name="sendBuffer">Output: pointer to the pre-allocated send buffer</param>
     /// <returns>Connection ID (>= 0) on success, -1 on failure</returns>
     /// <remarks>
-    /// The returned buffer pointers are valid until UnregisterSocket is called.
-    /// Write data to sendBuffer before calling PrepareSendRegistered.
-    /// Read data from recvBuffer after a recv completion.
+    /// After registration, use PrepareSendBuffer/PrepareRecvBuffer with external buffer IDs.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int RegisterSocket(nint socket, out nint recvBuffer, out nint sendBuffer)
+    public int RegisterSocket(nint socket)
     {
-        return Win_x64.ioring_rio_register(_ring, socket, out recvBuffer, out sendBuffer);
+        return Win_x64.ioring_rio_register(_ring, socket);
     }
 
     /// <summary>
@@ -397,31 +375,61 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public int ExternalBufferCount => (int)Win_x64.ioring_rio_get_external_buffer_count(_ring);
 
     /// <summary>
-    /// Prepares a receive operation on a registered connection.
-    /// Data will be placed in the recvBuffer returned from RegisterSocket.
+    /// Prepares a receive operation from an external registered buffer.
     /// </summary>
-    /// <param name="connId">Connection ID from RegisterSocket</param>
-    /// <param name="maxLen">Maximum bytes to receive (up to RecvBufferSize)</param>
+    /// <param name="connId">Connection ID from <see cref="RegisterSocket"/></param>
+    /// <param name="bufferId">External buffer ID from <see cref="RegisterExternalBuffer"/></param>
+    /// <param name="offset">Offset within the registered buffer to receive into</param>
+    /// <param name="len">Maximum number of bytes to receive</param>
     /// <param name="userData">User data returned with completion</param>
+    /// <remarks>
+    /// This allows zero-copy receives directly into user-owned memory like Pipe.
+    /// After the completion, read the received data at the specified offset.
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecvRegistered(int connId, int maxLen, ulong userData)
+    public void PrepareRecvExternal(int connId, int bufferId, int offset, int len, ulong userData)
     {
         var sqe = GetSqe();
-        Win_x64.ioring_prep_recv_registered(sqe, connId, (uint)maxLen, userData);
+        Win_x64.ioring_prep_recv_external(sqe, connId, bufferId, (uint)offset, (uint)len, userData);
     }
 
-    /// <summary>
-    /// Prepares a send operation on a registered connection.
-    /// Data must already be written to the sendBuffer from RegisterSocket.
-    /// </summary>
-    /// <param name="connId">Connection ID from RegisterSocket</param>
-    /// <param name="len">Number of bytes to send (already in sendBuffer)</param>
-    /// <param name="userData">User data returned with completion</param>
+    // =============================================================================
+    // IIORingGroup Registered Buffer Operations
+    // =============================================================================
+
+    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSendRegistered(int connId, int len, ulong userData)
+    public int RegisterBuffer(IORingBuffer buffer)
+    {
+        if (buffer == null)
+        {
+            throw new ArgumentNullException(nameof(buffer));
+        }
+
+        return Win_x64.ioring_rio_register_external_buffer(_ring, buffer.Pointer, (uint)buffer.VirtualSize);
+    }
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void UnregisterBuffer(int bufferId)
+    {
+        Win_x64.ioring_rio_unregister_external_buffer(_ring, bufferId);
+    }
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
         var sqe = GetSqe();
-        Win_x64.ioring_prep_send_registered(sqe, connId, (uint)len, userData);
+        Win_x64.ioring_prep_send_external(sqe, connId, bufferId, (uint)offset, (uint)length, userData);
+    }
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        var sqe = GetSqe();
+        Win_x64.ioring_prep_recv_external(sqe, connId, bufferId, (uint)offset, (uint)length, userData);
     }
 
     // =============================================================================

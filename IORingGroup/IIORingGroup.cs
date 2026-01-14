@@ -180,4 +180,54 @@ public interface IIORingGroup : IDisposable
     /// </summary>
     /// <param name="socket">The socket handle to close.</param>
     void CloseSocket(nint socket);
+
+    // =============================================================================
+    // Registered Buffer Operations (Zero-Copy I/O)
+    // =============================================================================
+
+    /// <summary>
+    /// Registers a buffer for zero-copy I/O operations.
+    /// </summary>
+    /// <param name="buffer">The buffer to register.</param>
+    /// <returns>Buffer ID for use with buffer-based I/O operations.</returns>
+    /// <remarks>
+    /// On Windows RIO, this calls RIORegisterBuffer.
+    /// On Linux io_uring, this registers with io_uring_register_buffers.
+    /// The buffer's entire virtual size (2x physical for double-mapped) is registered.
+    /// </remarks>
+    int RegisterBuffer(IORingBuffer buffer);
+
+    /// <summary>
+    /// Unregisters a previously registered buffer.
+    /// </summary>
+    /// <param name="bufferId">The buffer ID returned from <see cref="RegisterBuffer"/>.</param>
+    void UnregisterBuffer(int bufferId);
+
+    /// <summary>
+    /// Queues a send operation using a registered buffer (zero-copy).
+    /// </summary>
+    /// <param name="connId">Connection ID (from socket registration if applicable).</param>
+    /// <param name="bufferId">Registered buffer ID.</param>
+    /// <param name="offset">Offset within the buffer.</param>
+    /// <param name="length">Number of bytes to send.</param>
+    /// <param name="userData">User data returned with the completion.</param>
+    /// <remarks>
+    /// This enables true zero-copy sends directly from a registered buffer.
+    /// The offset can extend into the double-mapped region (0 to 2x physical size).
+    /// </remarks>
+    void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData);
+
+    /// <summary>
+    /// Queues a receive operation using a registered buffer (zero-copy).
+    /// </summary>
+    /// <param name="connId">Connection ID (from socket registration if applicable).</param>
+    /// <param name="bufferId">Registered buffer ID.</param>
+    /// <param name="offset">Offset within the buffer.</param>
+    /// <param name="length">Maximum bytes to receive.</param>
+    /// <param name="userData">User data returned with the completion.</param>
+    /// <remarks>
+    /// This enables true zero-copy receives directly into a registered buffer.
+    /// The offset can extend into the double-mapped region (0 to 2x physical size).
+    /// </remarks>
+    void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData);
 }

@@ -458,6 +458,41 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             Darwin.close((int)socket);
     }
 
+    // =============================================================================
+    // Registered Buffer Operations (Zero-Copy I/O) - Not supported on macOS/kqueue
+    // =============================================================================
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// macOS kqueue does not support registered buffers.
+    /// </remarks>
+    public int RegisterBuffer(IORingBuffer buffer)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations are not supported on macOS/kqueue.");
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterBuffer(int bufferId)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations are not supported on macOS/kqueue.");
+    }
+
+    /// <inheritdoc/>
+    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations are not supported on macOS/kqueue.");
+    }
+
+    /// <inheritdoc/>
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        throw new NotSupportedException(
+            "Registered buffer operations are not supported on macOS/kqueue.");
+    }
+
     private static uint ParseIPv4(string address)
     {
         if (address == "0.0.0.0") return 0; // INADDR_ANY

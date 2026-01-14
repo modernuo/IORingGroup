@@ -131,30 +131,35 @@ IORING_API void ioring_cq_advance(ioring_t* ring, uint32_t count);
 IORING_API int ioring_get_last_error(void);
 
 // =============================================================================
-// HIGH-PERFORMANCE RIO API (true async with registered buffers)
+// HIGH-PERFORMANCE RIO API (true async with external buffers)
 // =============================================================================
 
 /*
  * RIO (Registered I/O) provides high-performance async socket I/O with:
- * - Pre-registered buffer pools (zero-copy between user/kernel)
+ * - Externally registered buffers (zero-copy between user/kernel)
  * - Batched submissions and completions (fewer syscalls)
  * - True async operations (don't block waiting for data)
  *
  * Usage pattern:
- * 1. Create ring with ioring_create_rio_ex() specifying max connections and buffer sizes
- * 2. Accept connections normally (listener doesn't need RIO)
- * 3. Register each connected socket with ioring_rio_register() to get buffer pointers
- * 4. Post recv/send ops with ioring_prep_recv_registered/ioring_prep_send_registered
+ * 1. Create ring with ioring_create_rio_ex() specifying max connections
+ * 2. Register external buffers with ioring_rio_register_external_buffer()
+ * 3. Register each connected socket with ioring_rio_register()
+ * 4. Post recv/send ops with ioring_prep_recv_external/ioring_prep_send_external
  * 5. Submit with ioring_submit(), wait/peek completions as usual
  * 6. Unregister socket before closing with ioring_rio_unregister()
  * 7. Destroy ring with ioring_destroy()
+ *
+ * NOTE: Buffers are now managed externally (e.g., via IORingBufferPool in C#).
+ * The recv_buffer_size and send_buffer_size parameters are retained for
+ * API compatibility but are unused.
  */
 
-// Create ring with RIO buffer pool pre-allocated
+// Create ring with RIO support
 // - outstanding_per_socket: max outstanding ops per direction (recv/send) per socket
 //   Default is 2 (enough for request-response patterns like echo)
 //   Higher values (4-8) for pipelined protocols
 //   CQ is auto-sized to max_connections * outstanding_per_socket * 2
+// NOTE: recv_buffer_size and send_buffer_size are unused (buffers managed externally)
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
     uint32_t max_connections,
@@ -165,54 +170,21 @@ IORING_API ioring_t* ioring_create_rio_ex(
 
 // Register a connected socket for RIO operations
 // - socket: the connected socket (not the listener!)
-// - recv_buf: output - pointer to pre-allocated receive buffer
-// - send_buf: output - pointer to pre-allocated send buffer
 // Returns: connection ID (>= 0) on success, -1 on error
-// The returned buffers are valid until ioring_rio_unregister() is called
 IORING_API int ioring_rio_register(
     ioring_t* ring,
-    SOCKET socket,
-    void** recv_buf,
-    void** send_buf
+    SOCKET socket
 );
 
 // Unregister a connection (call BEFORE closing the socket)
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
 
-// Prepare receive on registered connection
-// Data will be placed in the recv_buf returned from ioring_rio_register()
-IORING_API void ioring_prep_recv_registered(
-    ioring_sqe_t* sqe,
-    int conn_id,        // Connection ID from ioring_rio_register()
-    uint32_t max_len,   // Maximum bytes to receive (up to recv_buffer_size)
-    uint64_t user_data  // User data returned with completion
-);
-
-// Prepare send on registered connection
-// Data must already be written to send_buf from ioring_rio_register()
-IORING_API void ioring_prep_send_registered(
-    ioring_sqe_t* sqe,
-    int conn_id,        // Connection ID from ioring_rio_register()
-    uint32_t len,       // Bytes to send (already in send_buf)
-    uint64_t user_data  // User data returned with completion
-);
-
 // Check if ring was created with RIO support
 IORING_API int ioring_is_rio(ioring_t* ring);
 
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
-
-// Lazy commit buffer stats (memory is committed on-demand as connections are registered)
-// Get currently committed buffer bytes (actual physical memory used)
-IORING_API size_t ioring_rio_get_committed_bytes(ioring_t* ring);
-// Get total reserved buffer bytes (virtual address space, not physical memory)
-IORING_API size_t ioring_rio_get_reserved_bytes(ioring_t* ring);
-// Get number of committed buffer slabs
-IORING_API uint32_t ioring_rio_get_committed_slabs(ioring_t* ring);
-// Get number of connection slots with committed buffers
-IORING_API uint32_t ioring_rio_get_committed_connections(ioring_t* ring);
 
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
@@ -354,6 +326,23 @@ IORING_API void ioring_rio_unregister_external_buffer(ioring_t* ring, int buffer
 // - len: number of bytes to send
 // - user_data: user data returned with completion
 IORING_API void ioring_prep_send_external(
+    ioring_sqe_t* sqe,
+    int conn_id,
+    int buffer_id,
+    uint32_t offset,
+    uint32_t len,
+    uint64_t user_data
+);
+
+// Prepare a recv into an external buffer (e.g., VirtualAlloc'd Pipe memory)
+// Parameters:
+// - sqe: submission queue entry
+// - conn_id: connection ID from ioring_rio_register
+// - buffer_id: external buffer ID from ioring_rio_register_external_buffer
+// - offset: byte offset within the external buffer
+// - len: maximum number of bytes to receive
+// - user_data: user data returned with completion
+IORING_API void ioring_prep_recv_external(
     ioring_sqe_t* sqe,
     int conn_id,
     int buffer_id,

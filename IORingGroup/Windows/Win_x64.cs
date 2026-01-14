@@ -119,12 +119,12 @@ public static partial class Win_x64
     // =============================================================================
 
     /// <summary>
-    /// Create a ring with RIO buffer pool and configurable outstanding operations.
+    /// Create a ring with RIO support and configurable outstanding operations.
     /// </summary>
     /// <param name="entries">SQ/CQ size (power of 2 recommended)</param>
     /// <param name="maxConnections">Maximum concurrent registered sockets</param>
-    /// <param name="recvBufferSize">Size of receive buffer per connection</param>
-    /// <param name="sendBufferSize">Size of send buffer per connection</param>
+    /// <param name="recvBufferSize">Unused - buffers now managed externally</param>
+    /// <param name="sendBufferSize">Unused - buffers now managed externally</param>
     /// <param name="outstandingPerSocket">Max outstanding ops per direction per socket (default 2, max 16)</param>
     /// <returns>Ring handle, or IntPtr.Zero on failure</returns>
     [LibraryImport(LibraryName, SetLastError = true)]
@@ -135,11 +135,9 @@ public static partial class Win_x64
     /// </summary>
     /// <param name="ring">Ring handle from ioring_create_rio</param>
     /// <param name="socket">Connected socket handle</param>
-    /// <param name="recvBuf">Output: pointer to pre-allocated receive buffer</param>
-    /// <param name="sendBuf">Output: pointer to pre-allocated send buffer</param>
     /// <returns>Connection ID (>= 0) on success, -1 on error</returns>
     [LibraryImport(LibraryName, SetLastError = true)]
-    public static partial int ioring_rio_register(nint ring, nint socket, out nint recvBuf, out nint sendBuf);
+    public static partial int ioring_rio_register(nint ring, nint socket);
 
     /// <summary>
     /// Unregister a connection (call BEFORE closing the socket).
@@ -158,43 +156,6 @@ public static partial class Win_x64
     /// </summary>
     [LibraryImport(LibraryName)]
     public static partial uint ioring_rio_get_active_connections(nint ring);
-
-    /// <summary>
-    /// Get currently committed buffer bytes (actual physical memory).
-    /// Lazy commit: memory is committed on-demand as connections are registered.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial nuint ioring_rio_get_committed_bytes(nint ring);
-
-    /// <summary>
-    /// Get total reserved buffer bytes (virtual address space, not physical memory).
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial nuint ioring_rio_get_reserved_bytes(nint ring);
-
-    /// <summary>
-    /// Get number of committed buffer slabs.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial uint ioring_rio_get_committed_slabs(nint ring);
-
-    /// <summary>
-    /// Get number of connection slots with committed buffers.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial uint ioring_rio_get_committed_connections(nint ring);
-
-    /// <summary>
-    /// Prepare receive on registered connection.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial void ioring_prep_recv_registered(nint sqe, int connId, uint maxLen, ulong userData);
-
-    /// <summary>
-    /// Prepare send on registered connection.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial void ioring_prep_send_registered(nint sqe, int connId, uint len, ulong userData);
 
     // =============================================================================
     // RIO AcceptEx Support (for server-side RIO)
@@ -308,6 +269,18 @@ public static partial class Win_x64
     /// <param name="userData">User data returned with completion</param>
     [LibraryImport(LibraryName)]
     public static partial void ioring_prep_send_external(nint sqe, int connId, int bufferId, uint offset, uint len, ulong userData);
+
+    /// <summary>
+    /// Prepare a receive into an external buffer for zero-copy I/O.
+    /// </summary>
+    /// <param name="sqe">Submission queue entry pointer</param>
+    /// <param name="connId">Connection ID from ioring_rio_register</param>
+    /// <param name="bufferId">External buffer ID from ioring_rio_register_external_buffer</param>
+    /// <param name="offset">Offset within the registered buffer to receive into</param>
+    /// <param name="len">Maximum number of bytes to receive</param>
+    /// <param name="userData">User data returned with completion</param>
+    [LibraryImport(LibraryName)]
+    public static partial void ioring_prep_recv_external(nint sqe, int connId, int bufferId, uint offset, uint len, ulong userData);
 
     /// <summary>
     /// Get the number of registered external buffers.
