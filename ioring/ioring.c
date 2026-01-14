@@ -60,33 +60,6 @@ static uint32_t windows_to_linux_poll(SHORT win_mask) {
 }
 
 // =============================================================================
-// Buffer Pool (LIFO Slab Allocator)
-// =============================================================================
-
-#define DEFAULT_SLAB_SIZE 4096
-#define MAX_OUTSTANDING_RECV 4
-#define MAX_OUTSTANDING_SEND 4
-
-typedef struct buffer_pool {
-    char* base;                     // VirtualAlloc'd region
-    RIO_BUFFERID buffer_id;         // Registered with RIO
-    uint32_t slab_size;             // Size of each slab (default 4096)
-    uint32_t slab_count;            // Total number of slabs
-
-    // LIFO stack for O(1) allocation
-    uint32_t* free_stack;           // Array of free slab indices
-    uint32_t stack_top;             // Current top of stack (0 = empty)
-
-    SRWLOCK lock;                   // For thread safety (lightweight)
-} buffer_pool_t;
-
-// Forward declarations for pool functions
-static buffer_pool_t* pool_create(uint32_t slab_size, uint32_t slab_count);
-static void pool_destroy(buffer_pool_t* pool);
-static int32_t pool_alloc(buffer_pool_t* pool);
-static void pool_free(buffer_pool_t* pool, int32_t offset);
-
-// =============================================================================
 // Connection State for RIO Mode
 // =============================================================================
 
@@ -98,18 +71,6 @@ typedef struct rio_connection {
     RIO_BUFFERID buffer_id;         // Which slab this connection's buffers are in
     uint32_t recv_offset;           // Offset within the slab for recv buffer
     uint32_t send_offset;           // Offset within the slab for send buffer
-
-    // NEW: Multi-slot slab allocation mode
-    uint32_t recv_slab_offsets[MAX_OUTSTANDING_RECV];  // Offsets into pool
-    uint8_t recv_slot_mask;         // Bit set = slot has pending RIOReceive
-
-    uint32_t send_slab_offsets[MAX_OUTSTANDING_SEND];  // Offsets into pool
-    uint8_t send_slot_mask;         // Bit set = slot has pending RIOSend
-
-    // Application state
-    uint32_t recv_bytes_available;  // Bytes available in current recv buffer
-    uint32_t recv_consumed;         // Bytes already consumed by app
-    int current_recv_slot;          // Slot with data ready for app (-1 if none)
 
     BOOL active;                    // Connection is fully registered and active
     BOOL reserved;                  // Slot is reserved (prevents AcceptEx collision)
@@ -167,7 +128,6 @@ struct ioring {
     // RIO mode data
     BOOL rio_mode;                      // True if created with ioring_create_rio
     RIO_CQ rio_cq;                      // RIO completion queue
-    buffer_pool_t* pool;                // Slab allocator for recv/send buffers (new API)
     uint32_t rio_max_connections;       // Max concurrent connections
     uint32_t rio_active_connections;    // Current active connections
     uint32_t rio_outstanding_per_socket;// Max outstanding ops per direction per socket
@@ -274,93 +234,6 @@ static BOOL init_rio(void) {
 }
 
 // =============================================================================
-// Buffer Pool Implementation (LIFO Slab Allocator)
-// =============================================================================
-
-static buffer_pool_t* pool_create(uint32_t slab_size, uint32_t slab_count) {
-    buffer_pool_t* pool = (buffer_pool_t*)calloc(1, sizeof(buffer_pool_t));
-    if (!pool) return NULL;
-
-    pool->slab_size = slab_size;
-    pool->slab_count = slab_count;
-
-    // Allocate the buffer memory (page-aligned for optimal DMA)
-    size_t total_size = (size_t)slab_size * slab_count;
-    pool->base = (char*)VirtualAlloc(NULL, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!pool->base) {
-        free(pool);
-        return NULL;
-    }
-
-    // Register with RIO
-    pool->buffer_id = rio.RIORegisterBuffer(pool->base, (DWORD)total_size);
-    if (pool->buffer_id == RIO_INVALID_BUFFERID) {
-        VirtualFree(pool->base, 0, MEM_RELEASE);
-        free(pool);
-        return NULL;
-    }
-
-    // Allocate free stack
-    pool->free_stack = (uint32_t*)malloc(slab_count * sizeof(uint32_t));
-    if (!pool->free_stack) {
-        rio.RIODeregisterBuffer(pool->buffer_id);
-        VirtualFree(pool->base, 0, MEM_RELEASE);
-        free(pool);
-        return NULL;
-    }
-
-    // Initialize free stack with all indices (LIFO: push in reverse order)
-    for (uint32_t i = 0; i < slab_count; i++) {
-        pool->free_stack[i] = i;
-    }
-    pool->stack_top = slab_count;  // All slabs are free
-
-    InitializeSRWLock(&pool->lock);
-    return pool;
-}
-
-static void pool_destroy(buffer_pool_t* pool) {
-    if (!pool) return;
-
-    if (pool->buffer_id != RIO_INVALID_BUFFERID) {
-        rio.RIODeregisterBuffer(pool->buffer_id);
-    }
-    if (pool->base) {
-        VirtualFree(pool->base, 0, MEM_RELEASE);
-    }
-    if (pool->free_stack) {
-        free(pool->free_stack);
-    }
-    free(pool);
-}
-
-// O(1) allocation - returns offset into pool, or -1 if empty
-static int32_t pool_alloc(buffer_pool_t* pool) {
-    AcquireSRWLockExclusive(&pool->lock);
-
-    if (pool->stack_top == 0) {
-        ReleaseSRWLockExclusive(&pool->lock);
-        return -1;  // Pool exhausted (backpressure)
-    }
-
-    uint32_t index = pool->free_stack[--pool->stack_top];
-    ReleaseSRWLockExclusive(&pool->lock);
-
-    return (int32_t)(index * pool->slab_size);
-}
-
-// O(1) free - returns slab to pool
-static void pool_free(buffer_pool_t* pool, int32_t offset) {
-    if (offset < 0) return;
-
-    uint32_t index = (uint32_t)offset / pool->slab_size;
-
-    AcquireSRWLockExclusive(&pool->lock);
-    pool->free_stack[pool->stack_top++] = index;
-    ReleaseSRWLockExclusive(&pool->lock);
-}
-
-// =============================================================================
 // Legacy API Implementation (synchronous fallback)
 // =============================================================================
 
@@ -459,27 +332,12 @@ IORING_API void ioring_destroy(ioring_t* ring) {
             CloseHandle(ring->accept_iocp);
         }
 
-        // Cleanup RIO connections (close sockets, free slabs)
+        // Cleanup RIO connections (close sockets)
         if (ring->rio_connections) {
             for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
                 rio_connection_t* conn = &ring->rio_connections[i];
-                if (conn->active || conn->reserved) {
-                    // Free any allocated recv slabs
-                    for (int j = 0; j < MAX_OUTSTANDING_RECV; j++) {
-                        if (conn->recv_slot_mask & (1 << j)) {
-                            pool_free(ring->pool, (int32_t)conn->recv_slab_offsets[j]);
-                        }
-                    }
-                    // Free any allocated send slabs
-                    for (int j = 0; j < MAX_OUTSTANDING_SEND; j++) {
-                        if (conn->send_slot_mask & (1 << j)) {
-                            pool_free(ring->pool, (int32_t)conn->send_slab_offsets[j]);
-                        }
-                    }
-                    // Close socket if we own it
-                    if (conn->socket != INVALID_SOCKET) {
-                        closesocket(conn->socket);
-                    }
+                if ((conn->active || conn->reserved) && conn->socket != INVALID_SOCKET) {
+                    closesocket(conn->socket);
                 }
             }
             free(ring->rio_connections);
@@ -488,11 +346,6 @@ IORING_API void ioring_destroy(ioring_t* ring) {
         // Close RIO completion queue
         if (ring->rio_cq != RIO_INVALID_CQ) {
             rio.RIOCloseCompletionQueue(ring->rio_cq);
-        }
-
-        // Destroy buffer pool (deregisters and frees memory)
-        if (ring->pool) {
-            pool_destroy(ring->pool);
         }
 
         // Cleanup all registered buffer slabs
@@ -1167,15 +1020,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
         ring->rio_connections[i].active = FALSE;
         ring->rio_connections[i].reserved = FALSE;
     }
-
-    // ==========================================================================
-    // Buffer Pool (LIFO Slab Allocator) - DISABLED
-    // ==========================================================================
-    // The pool is for the multi-slot API which is not currently used.
-    // The legacy fixed-buffer mode (PrepareRecvRegistered/PrepareSendRegistered)
-    // uses rio_buffer with lazy commit instead.
-    // TODO: Re-enable with lazy commit if multi-slot API is needed.
-    ring->pool = NULL;
 
     // ==========================================================================
     // Lazy-Commit Buffer (reserves full address space, commits slabs on demand)
