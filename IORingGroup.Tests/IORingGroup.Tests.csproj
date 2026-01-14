@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\IORingGroup\IORingGroup.csproj" />
+    <ProjectReference Include="..\TestServer\TestServer.csproj" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\IORingGroup\runtimes\win-x64\native\ioring.dll')">

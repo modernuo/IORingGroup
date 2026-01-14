@@ -291,6 +291,86 @@ public sealed class WindowsRIOGroup : IIORingGroup
         Win_x64.ioring_rio_close_listener(_ring, listener);
     }
 
+    // =============================================================================
+    // External Buffer Support (for zero-copy from user-owned memory like Pipe)
+    // =============================================================================
+
+    /// <summary>
+    /// Registers an external buffer (e.g., VirtualAlloc'd Pipe memory) with RIO.
+    /// </summary>
+    /// <param name="buffer">Pointer to buffer memory</param>
+    /// <param name="length">Size in bytes (for double-mapped buffers, use 2x physical size)</param>
+    /// <returns>Buffer ID on success (>= 0), -1 on failure</returns>
+    /// <remarks>
+    /// <para>
+    /// External buffers allow zero-copy I/O from user-owned memory. This is useful
+    /// for circular buffers like ModernUO's Pipe where you want to send directly
+    /// from the application's buffer without copying to RIO's internal buffers.
+    /// </para>
+    /// <para>
+    /// The buffer must remain valid until <see cref="UnregisterExternalBuffer"/> is called.
+    /// </para>
+    /// <para>
+    /// Example usage with Pipe:
+    /// <code>
+    /// var pipe = new Pipe(256 * 1024);
+    /// int bufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+    ///
+    /// // Write data to pipe
+    /// var span = pipe.Writer.AvailableToWrite();
+    /// // ... write packet data ...
+    /// pipe.Writer.Advance(bytesWritten);
+    ///
+    /// // Send directly from pipe memory (zero-copy!)
+    /// var toSend = pipe.Reader.AvailableToRead();
+    /// int offset = pipe.Reader.GetReadOffset();
+    /// ring.PrepareSendExternal(connId, bufId, offset, toSend.Length, userData);
+    /// </code>
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int RegisterExternalBuffer(nint buffer, uint length)
+    {
+        return Win_x64.ioring_rio_register_external_buffer(_ring, buffer, length);
+    }
+
+    /// <summary>
+    /// Unregisters an external buffer.
+    /// </summary>
+    /// <param name="bufferId">Buffer ID returned by <see cref="RegisterExternalBuffer"/></param>
+    /// <remarks>
+    /// The caller is responsible for freeing the buffer memory after unregistering.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void UnregisterExternalBuffer(int bufferId)
+    {
+        Win_x64.ioring_rio_unregister_external_buffer(_ring, bufferId);
+    }
+
+    /// <summary>
+    /// Prepares a send operation from an external registered buffer.
+    /// </summary>
+    /// <param name="connId">Connection ID from <see cref="RegisterSocket"/></param>
+    /// <param name="bufferId">External buffer ID from <see cref="RegisterExternalBuffer"/></param>
+    /// <param name="offset">Offset within the registered buffer to start sending from</param>
+    /// <param name="len">Number of bytes to send</param>
+    /// <param name="userData">User data returned with completion</param>
+    /// <remarks>
+    /// This allows zero-copy sends directly from user-owned memory like Pipe.
+    /// The data must already be written at the specified offset in the external buffer.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PrepareSendExternal(int connId, int bufferId, int offset, int len, ulong userData)
+    {
+        var sqe = GetSqe();
+        Win_x64.ioring_prep_send_external(sqe, connId, bufferId, (uint)offset, (uint)len, userData);
+    }
+
+    /// <summary>
+    /// Gets the number of registered external buffers.
+    /// </summary>
+    public int ExternalBufferCount => (int)Win_x64.ioring_rio_get_external_buffer_count(_ring);
+
     /// <summary>
     /// Prepares a receive operation on a registered connection.
     /// Data will be placed in the recvBuffer returned from RegisterSocket.

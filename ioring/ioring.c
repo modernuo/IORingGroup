@@ -241,6 +241,13 @@ struct ioring {
     }* pending_ops;
     uint32_t pending_count;
     uint32_t pending_capacity;
+
+    // External buffer support (for zero-copy from user-owned memory like Pipe)
+    #define RIO_MAX_EXTERNAL_BUFFERS 16
+    RIO_BUFFERID external_buffer_ids[16];   // Registered buffer IDs
+    void* external_buffer_ptrs[16];          // Pointers for tracking
+    uint32_t external_buffer_lengths[16];    // Lengths for validation
+    uint32_t external_buffer_count;          // Number of registered external buffers
 };
 
 // Static initialization
@@ -516,6 +523,13 @@ IORING_API void ioring_destroy(ioring_t* ring) {
             for (uint32_t i = 0; i < ring->rio_committed_slabs; i++) {
                 if (ring->rio_slab_ids[i] != RIO_INVALID_BUFFERID) {
                     rio.RIODeregisterBuffer(ring->rio_slab_ids[i]);
+                }
+            }
+
+            // Cleanup external buffers (user is responsible for freeing memory)
+            for (uint32_t i = 0; i < 16; i++) {
+                if (ring->external_buffer_ids[i] != RIO_INVALID_BUFFERID) {
+                    rio.RIODeregisterBuffer(ring->external_buffer_ids[i]);
                 }
             }
         }
@@ -794,8 +808,31 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
             }
         }
         else if (sqe->opcode == IORING_OP_SEND) {
-            buf.Offset = conn->send_offset;
-            buf.Length = sqe->len;
+            // Check if this is an external buffer send (flag 0x01)
+            if (sqe->flags & 0x01) {
+                // External buffer send - use buffer_id from sqe
+                int ext_buf_id = (int)sqe->buf_index;
+                if (ext_buf_id < 0 || ext_buf_id >= 16 ||
+                    ring->external_buffer_ids[ext_buf_id] == RIO_INVALID_BUFFERID) {
+                    complete_op(ring, sqe->user_data, -EINVAL, 0);
+                    return 1;
+                }
+
+                // Validate offset + length doesn't exceed buffer
+                uint32_t offset = (uint32_t)sqe->addr;  // Offset stored in addr
+                if (offset + sqe->len > ring->external_buffer_lengths[ext_buf_id]) {
+                    complete_op(ring, sqe->user_data, -EINVAL, 0);
+                    return 1;
+                }
+
+                buf.BufferId = ring->external_buffer_ids[ext_buf_id];
+                buf.Offset = offset;
+                buf.Length = sqe->len;
+            } else {
+                // Regular per-connection buffer send
+                buf.Offset = conn->send_offset;
+                buf.Length = sqe->len;
+            }
 
             while (!success && retries < max_retries) {
                 success = rio.RIOSend(conn->rq, &buf, 1, 0, (PVOID)sqe->user_data);
@@ -1223,6 +1260,14 @@ IORING_API ioring_t* ioring_create_rio_ex(
     ring->rio_buffer_committed = 0;
     for (uint32_t i = 0; i < RIO_MAX_SLABS; i++) {
         ring->rio_slab_ids[i] = RIO_INVALID_BUFFERID;
+    }
+
+    // Initialize external buffer tracking
+    ring->external_buffer_count = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        ring->external_buffer_ids[i] = RIO_INVALID_BUFFERID;
+        ring->external_buffer_ptrs[i] = NULL;
+        ring->external_buffer_lengths[i] = 0;
     }
 
     // RESERVE full address space (no physical memory yet - this is free)
@@ -2230,4 +2275,90 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener) {
 IORING_API uint32_t ioring_rio_get_listener_count(ioring_t* ring) {
     if (!ring) return 0;
     return ring->owned_listener_count;
+}
+
+// =============================================================================
+// RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
+// =============================================================================
+
+IORING_API int ioring_rio_register_external_buffer(
+    ioring_t* ring,
+    void* buffer,
+    uint32_t length
+) {
+    if (!ring || !ring->rio_mode) {
+        last_error = EINVAL;
+        return -1;
+    }
+
+    if (!buffer || length == 0) {
+        last_error = EINVAL;
+        return -1;
+    }
+
+    // Find a free slot
+    int slot = -1;
+    for (uint32_t i = 0; i < 16; i++) {
+        if (ring->external_buffer_ids[i] == RIO_INVALID_BUFFERID) {
+            slot = (int)i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        last_error = WSAENOBUFS;  // No free slots
+        return -1;
+    }
+
+    // Register buffer with RIO
+    RIO_BUFFERID buf_id = rio.RIORegisterBuffer(buffer, length);
+    if (buf_id == RIO_INVALID_BUFFERID) {
+        last_error = WSAGetLastError();
+        return -1;
+    }
+
+    // Store the registration
+    ring->external_buffer_ids[slot] = buf_id;
+    ring->external_buffer_ptrs[slot] = buffer;
+    ring->external_buffer_lengths[slot] = length;
+    ring->external_buffer_count++;
+
+    return slot;
+}
+
+IORING_API void ioring_rio_unregister_external_buffer(ioring_t* ring, int buffer_id) {
+    if (!ring || !ring->rio_mode) return;
+    if (buffer_id < 0 || buffer_id >= 16) return;
+
+    if (ring->external_buffer_ids[buffer_id] != RIO_INVALID_BUFFERID) {
+        rio.RIODeregisterBuffer(ring->external_buffer_ids[buffer_id]);
+        ring->external_buffer_ids[buffer_id] = RIO_INVALID_BUFFERID;
+        ring->external_buffer_ptrs[buffer_id] = NULL;
+        ring->external_buffer_lengths[buffer_id] = 0;
+        if (ring->external_buffer_count > 0) {
+            ring->external_buffer_count--;
+        }
+    }
+}
+
+IORING_API void ioring_prep_send_external(
+    ioring_sqe_t* sqe,
+    int conn_id,
+    int buffer_id,
+    uint32_t offset,
+    uint32_t len,
+    uint64_t user_data
+) {
+    sqe->opcode = IORING_OP_SEND;
+    sqe->fd = conn_id;
+    sqe->flags = 0x81;  // 0x80 = registered buffer, 0x01 = external buffer flag
+    sqe->addr = (uint64_t)offset;  // Store offset in addr field
+    sqe->len = len;
+    sqe->buf_index = (uint16_t)buffer_id;  // Store buffer_id in buf_index
+    sqe->user_data = user_data;
+}
+
+IORING_API uint32_t ioring_rio_get_external_buffer_count(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return 0;
+    return ring->external_buffer_count;
 }

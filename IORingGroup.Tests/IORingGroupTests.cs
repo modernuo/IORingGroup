@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Network;
+using TestServer;
 
 namespace IORingGroup.Tests;
 
@@ -1069,6 +1070,427 @@ public class WindowsRIOGroupTests
             ring.AdvanceCompletionQueue(count);
 
             ring.UnregisterSocket(connId);
+            System.Network.Windows.Win_x64.closesocket(clientSocket);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "Required functions not available - rebuild ioring.dll");
+        }
+    }
+
+    // =============================================================================
+    // External Buffer Tests
+    // =============================================================================
+
+    [SkippableFact]
+    public void RegisterExternalBuffer_WithValidBuffer_ReturnsPositiveId()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var pipe = new Pipe(64 * 1024);
+
+            var bufferId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+
+            if (bufferId < 0)
+            {
+                var error = System.Network.Windows.Win_x64.ioring_get_last_error();
+                Skip.If(true, $"RegisterExternalBuffer failed with error {error} - rebuild ioring.dll");
+            }
+
+            Assert.True(bufferId >= 0, $"RegisterExternalBuffer returned {bufferId}");
+            Assert.Equal(1, ring.ExternalBufferCount);
+
+            ring.UnregisterExternalBuffer(bufferId);
+            Assert.Equal(0, ring.ExternalBufferCount);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "External buffer functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void RegisterExternalBuffer_MultipleBuffers_TracksCount()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var pipe1 = new Pipe(64 * 1024);
+            using var pipe2 = new Pipe(64 * 1024);
+            using var pipe3 = new Pipe(64 * 1024);
+
+            var id1 = ring.RegisterExternalBuffer(pipe1.GetBufferPointer(), pipe1.GetVirtualSize());
+            Skip.If(id1 < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
+
+            var id2 = ring.RegisterExternalBuffer(pipe2.GetBufferPointer(), pipe2.GetVirtualSize());
+            var id3 = ring.RegisterExternalBuffer(pipe3.GetBufferPointer(), pipe3.GetVirtualSize());
+
+            Assert.Equal(3, ring.ExternalBufferCount);
+
+            // IDs should be unique
+            Assert.NotEqual(id1, id2);
+            Assert.NotEqual(id2, id3);
+            Assert.NotEqual(id1, id3);
+
+            ring.UnregisterExternalBuffer(id2);
+            Assert.Equal(2, ring.ExternalBufferCount);
+
+            ring.UnregisterExternalBuffer(id1);
+            ring.UnregisterExternalBuffer(id3);
+            Assert.Equal(0, ring.ExternalBufferCount);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "External buffer functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void UnregisterExternalBuffer_InvalidId_DoesNotThrow()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+
+            // Should not throw for invalid IDs
+            ring.UnregisterExternalBuffer(-1);
+            ring.UnregisterExternalBuffer(100);
+            ring.UnregisterExternalBuffer(0);
+
+            Assert.Equal(0, ring.ExternalBufferCount);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "External buffer functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void ExternalBufferCount_InitiallyZero()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            Assert.Equal(0, ring.ExternalBufferCount);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "External buffer functions not available - rebuild ioring.dll");
+        }
+    }
+
+    // =============================================================================
+    // Pipe + RIO Integration Tests (Zero-Copy Sends)
+    // =============================================================================
+
+    [SkippableFact]
+    public void PrepareSendExternal_WithPipe_SendsData()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+
+            // Create a Pipe for zero-copy sends
+            using var pipe = new Pipe(64 * 1024);
+
+            // Register pipe memory with RIO
+            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
+
+            // Create connected socket pair
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
+
+            // Create RIO client socket
+            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+
+            var connectResult = System.Network.Windows.Win_x64.ioring_connect_socket(
+                clientSocket, "127.0.0.1", (ushort)endpoint.Port);
+
+            if (connectResult != 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, $"Connect failed with error {err}");
+            }
+
+            using var serverSide = listener.Accept();
+
+            // Register client socket with RIO
+            var connId = ring.RegisterSocket(clientSocket, out var recvBuf, out var sendBuf);
+            if (connId < 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, $"RegisterSocket failed with error {err}");
+            }
+
+            // Write test data to the pipe
+            var testData = "Hello from Pipe zero-copy!"u8.ToArray();
+            var writeSpan = pipe.Writer.AvailableToWrite();
+            testData.CopyTo(writeSpan);
+            pipe.Writer.Advance((uint)testData.Length);
+
+            // Get the read offset for the send
+            var readOffset = pipe.Reader.GetReadOffset();
+            var readLength = pipe.Reader.AvailableToRead().Length;
+
+            // Send using external buffer (zero-copy from Pipe memory!)
+            const ulong sendUserData = 42;
+            ring.PrepareSendExternal(connId, extBufId, readOffset, readLength, sendUserData);
+            ring.Submit();
+
+            // Wait for send completion
+            Span<Completion> completions = stackalloc Completion[16];
+            var count = ring.WaitCompletions(completions, 1, 2000);
+
+            Assert.True(count > 0, "No send completion received");
+            Assert.Equal(sendUserData, completions[0].UserData);
+            Assert.Equal(testData.Length, completions[0].Result);
+
+            ring.AdvanceCompletionQueue(count);
+
+            // Advance pipe reader (data was sent)
+            pipe.Reader.Advance((uint)testData.Length);
+
+            // Receive on server side to verify data
+            var recvBuffer = new byte[testData.Length];
+            var received = serverSide.Receive(recvBuffer);
+
+            Assert.Equal(testData.Length, received);
+            Assert.Equal(testData, recvBuffer);
+
+            // Cleanup
+            ring.UnregisterSocket(connId);
+            ring.UnregisterExternalBuffer(extBufId);
+            System.Network.Windows.Win_x64.closesocket(clientSocket);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "Required functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void PrepareSendExternal_MultipleChunks_Works()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var pipe = new Pipe(64 * 1024);
+
+            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
+
+            // Create connected socket pair
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
+
+            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+
+            var connectResult = System.Network.Windows.Win_x64.ioring_connect_socket(
+                clientSocket, "127.0.0.1", (ushort)endpoint.Port);
+
+            if (connectResult != 0)
+            {
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, "Connect failed");
+            }
+
+            using var serverSide = listener.Accept();
+            serverSide.ReceiveTimeout = 2000;
+
+            var connId = ring.RegisterSocket(clientSocket, out _, out _);
+            if (connId < 0)
+            {
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, "RegisterSocket failed");
+            }
+
+            // Send multiple chunks through the pipe
+            Span<Completion> completions = stackalloc Completion[16];
+            for (int i = 0; i < 5; i++)
+            {
+                var chunkData = new byte[100];
+                Array.Fill(chunkData, (byte)(i + 0x41)); // 'A', 'B', 'C', etc.
+
+                var writeSpan = pipe.Writer.AvailableToWrite();
+                chunkData.CopyTo(writeSpan);
+                pipe.Writer.Advance(100);
+
+                var readOffset = pipe.Reader.GetReadOffset();
+                ring.PrepareSendExternal(connId, extBufId, readOffset, 100, (ulong)i);
+                ring.Submit();
+
+                var count = ring.WaitCompletions(completions, 1, 2000);
+                Assert.True(count > 0, $"No completion for chunk {i}");
+                Assert.Equal(100, completions[0].Result);
+                ring.AdvanceCompletionQueue(count);
+
+                pipe.Reader.Advance(100);
+
+                // Verify on server
+                var recvBuffer = new byte[100];
+                var received = serverSide.Receive(recvBuffer);
+                Assert.Equal(100, received);
+                Assert.True(recvBuffer.All(b => b == (byte)(i + 0x41)));
+            }
+
+            ring.UnregisterSocket(connId);
+            ring.UnregisterExternalBuffer(extBufId);
+            System.Network.Windows.Win_x64.closesocket(clientSocket);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "Required functions not available - rebuild ioring.dll");
+        }
+    }
+
+    [SkippableFact]
+    public void PrepareSendExternal_WithWrappedPipe_SendsCorrectData()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+
+            // Use a small pipe to force wrap-around
+            var pageSize = (uint)Environment.SystemPageSize;
+            using var pipe = new Pipe(pageSize);
+
+            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
+
+            // Create connected socket pair
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
+
+            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+
+            var connectResult = System.Network.Windows.Win_x64.ioring_connect_socket(
+                clientSocket, "127.0.0.1", (ushort)endpoint.Port);
+
+            if (connectResult != 0)
+            {
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, "Connect failed");
+            }
+
+            using var serverSide = listener.Accept();
+            serverSide.ReceiveTimeout = 2000;
+
+            var connId = ring.RegisterSocket(clientSocket, out _, out _);
+            if (connId < 0)
+            {
+                System.Network.Windows.Win_x64.closesocket(clientSocket);
+                Skip.If(true, "RegisterSocket failed");
+            }
+
+            // Fill most of the buffer to force wrap-around on next write
+            var fillSize = (int)(pageSize - 200);
+            var fillData = new byte[fillSize];
+            new Random(42).NextBytes(fillData);
+
+            var writeSpan = pipe.Writer.AvailableToWrite();
+            fillData.CopyTo(writeSpan);
+            pipe.Writer.Advance((uint)fillSize);
+
+            // Send and consume
+            ring.PrepareSendExternal(connId, extBufId, pipe.Reader.GetReadOffset(), fillSize, 1);
+            ring.Submit();
+
+            Span<Completion> completions = stackalloc Completion[16];
+            var count = ring.WaitCompletions(completions, 1, 2000);
+            Assert.True(count > 0);
+            ring.AdvanceCompletionQueue(count);
+            pipe.Reader.Advance((uint)fillSize);
+
+            var recvBuffer = new byte[fillSize];
+            var totalReceived = 0;
+            while (totalReceived < fillSize)
+            {
+                var received = serverSide.Receive(recvBuffer, totalReceived, fillSize - totalReceived, SocketFlags.None);
+                if (received == 0) break;
+                totalReceived += received;
+            }
+            Assert.Equal(fillSize, totalReceived);
+            Assert.Equal(fillData, recvBuffer);
+
+            // Now write data that wraps around the ring buffer
+            var wrapData = "Wrapped data test!"u8.ToArray();
+            writeSpan = pipe.Writer.AvailableToWrite();
+            wrapData.CopyTo(writeSpan);
+            pipe.Writer.Advance((uint)wrapData.Length);
+
+            // The double-mapping magic allows us to read contiguously even across the wrap
+            var readOffset = pipe.Reader.GetReadOffset();
+            ring.PrepareSendExternal(connId, extBufId, readOffset, wrapData.Length, 2);
+            ring.Submit();
+
+            count = ring.WaitCompletions(completions, 1, 2000);
+            Assert.True(count > 0, "No completion for wrapped send");
+            Assert.Equal(wrapData.Length, completions[0].Result);
+            ring.AdvanceCompletionQueue(count);
+            pipe.Reader.Advance((uint)wrapData.Length);
+
+            var wrapRecv = new byte[wrapData.Length];
+            var wrapReceived = serverSide.Receive(wrapRecv);
+            Assert.Equal(wrapData.Length, wrapReceived);
+            Assert.Equal(wrapData, wrapRecv);
+
+            ring.UnregisterSocket(connId);
+            ring.UnregisterExternalBuffer(extBufId);
             System.Network.Windows.Win_x64.closesocket(clientSocket);
         }
         catch (InvalidOperationException ex)
