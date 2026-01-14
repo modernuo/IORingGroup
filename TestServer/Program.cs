@@ -12,8 +12,9 @@ namespace TestServer;
 
 public enum ServerBackend
 {
-    RIO,        // True RIO with registered buffers
-    PollGroup   // wepoll-based polling
+    RIO,        // Windows: True RIO with registered buffers
+    PollGroup,  // Cross-platform: wepoll (Windows) / epoll (Linux) / kqueue (macOS)
+    IoUring     // Linux: Native io_uring
 }
 
 /// <summary>
@@ -31,18 +32,27 @@ public class Program
     private static volatile bool _running = true;
     private static bool _quietMode;
     private static bool _usePipeMode;  // Use Pipe with external buffer for zero-copy sends
+    private static int _benchmarkDuration; // 0 = run until clients disconnect
 
     public static void Main(string[] args)
     {
-        var backend = ServerBackend.RIO;
+        // Default backend: RIO on Windows, io_uring on Linux, PollGroup elsewhere
+        var backend = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? ServerBackend.RIO
+            : RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+                ? ServerBackend.IoUring
+                : ServerBackend.PollGroup;
+
         var benchmarkMode = false;
+        var benchmarkDuration = 0; // 0 = run until all clients disconnect
         nint cpuAffinity = 0;
 
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i];
             if (arg.Equals("--pollgroup", StringComparison.OrdinalIgnoreCase) ||
-                arg.Equals("-p", StringComparison.OrdinalIgnoreCase))
+                arg.Equals("-p", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--epoll", StringComparison.OrdinalIgnoreCase))
             {
                 backend = ServerBackend.PollGroup;
             }
@@ -51,10 +61,20 @@ public class Program
             {
                 backend = ServerBackend.RIO;
             }
+            else if (arg.Equals("--iouring", StringComparison.OrdinalIgnoreCase) ||
+                     arg.Equals("-u", StringComparison.OrdinalIgnoreCase))
+            {
+                backend = ServerBackend.IoUring;
+            }
             else if (arg.Equals("--benchmark", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-b", StringComparison.OrdinalIgnoreCase))
             {
                 benchmarkMode = true;
+            }
+            else if ((arg.Equals("--duration", StringComparison.OrdinalIgnoreCase) ||
+                      arg.Equals("-d", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Length)
+            {
+                benchmarkDuration = int.Parse(args[++i]);
             }
             else if (arg.Equals("--quiet", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-q", StringComparison.OrdinalIgnoreCase))
@@ -77,6 +97,8 @@ public class Program
             }
         }
 
+        _benchmarkDuration = benchmarkDuration;
+
         // Set CPU affinity if specified
         if (cpuAffinity != 0)
         {
@@ -91,11 +113,16 @@ public class Program
             }
         }
 
-        Console.WriteLine("RIO vs PollGroup Benchmark Server (Single-threaded)");
+        Console.WriteLine("IORingGroup Benchmark Server (Single-threaded)");
+        Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
         Console.WriteLine($"Backend: {backend}");
-        Console.WriteLine($"Benchmark mode: {benchmarkMode}, Quiet: {_quietMode}, Pipe mode: {_usePipeMode}");
+        Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--quiet|-q] [--pipe] [--affinity|-a <mask>]");
+        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p|--epoll] [--iouring|-u] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--pipe] [--affinity|-a <mask>]");
+        Console.WriteLine("  --rio: Windows Registered I/O (Windows only)");
+        Console.WriteLine("  --pollgroup/--epoll: wepoll (Windows) / epoll (Linux) / kqueue (macOS)");
+        Console.WriteLine("  --iouring: Linux io_uring (Linux only)");
+        Console.WriteLine("  --duration: Run for N seconds then exit (for timed benchmarks)");
         Console.WriteLine("  --pipe: Use Pipe circular buffer with external buffer registration for zero-copy sends (RIO only)");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
@@ -105,13 +132,22 @@ public class Program
             _running = false;
         };
 
-        if (backend == ServerBackend.RIO)
+        switch (backend)
         {
-            RunRIOServer(benchmarkMode);
-        }
-        else
-        {
-            RunPollGroupServer(benchmarkMode);
+            case ServerBackend.RIO when RuntimeInformation.IsOSPlatform(OSPlatform.Windows):
+                RunRIOServer(benchmarkMode);
+                break;
+            case ServerBackend.IoUring when RuntimeInformation.IsOSPlatform(OSPlatform.Linux):
+                RunIoUringServer(benchmarkMode);
+                break;
+            case ServerBackend.RIO:
+            case ServerBackend.IoUring:
+                Console.WriteLine($"Warning: {backend} not supported on this platform, falling back to PollGroup");
+                RunPollGroupServer(benchmarkMode);
+                break;
+            default:
+                RunPollGroupServer(benchmarkMode);
+                break;
         }
     }
 
@@ -222,6 +258,13 @@ public class Program
 
                 while (_running)
                 {
+                    // Check duration limit
+                    if (_benchmarkDuration > 0 && _benchmarkStarted && _benchmarkStopwatch.Elapsed.TotalSeconds >= _benchmarkDuration)
+                    {
+                        Console.WriteLine($"[RIO] Benchmark duration ({_benchmarkDuration}s) reached - stopping...");
+                        break;
+                    }
+
                     ring.Submit();
 
                     // Time the PeekCompletions syscall (non-blocking, like PollGroup)
@@ -498,8 +541,8 @@ public class Program
 
         client = default;
 
-        // Stop benchmark when all clients disconnect (after benchmark started)
-        if (benchmarkMode && _benchmarkStarted && ring.ActiveConnections == 0 && !_finalStatsPrinted)
+        // Stop benchmark when all clients disconnect (only if not using duration mode)
+        if (benchmarkMode && _benchmarkStarted && ring.ActiveConnections == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
         {
             _benchmarkStopwatch.Stop();
             Console.WriteLine("[RIO] All clients disconnected - benchmark stopped!");
@@ -566,6 +609,13 @@ public class Program
 
         while (_running)
         {
+            // Check duration limit
+            if (_benchmarkDuration > 0 && _benchmarkStarted && _benchmarkStopwatch.Elapsed.TotalSeconds >= _benchmarkDuration)
+            {
+                Console.WriteLine($"[PollGroup] Benchmark duration ({_benchmarkDuration}s) reached - stopping...");
+                break;
+            }
+
             // Time the Poll syscall
             var pollStart = Stopwatch.GetTimestamp();
             var count = pollGroup.Poll(handles);
@@ -763,8 +813,8 @@ public class Program
                 state.Socket.Close();
                 _pollClients[i] = null;
 
-                // Stop benchmark when all clients disconnect (after benchmark started)
-                if (benchmarkMode && _benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted)
+                // Stop benchmark when all clients disconnect (only if not using duration mode)
+                if (benchmarkMode && _benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
                 {
                     _benchmarkStopwatch.Stop();
                     Console.WriteLine("[PollGroup] All clients disconnected - benchmark stopped!");
@@ -920,6 +970,340 @@ public class Program
 
     #endregion
 
+    #region io_uring Server (Linux)
+
+    // Client state for io_uring
+    private struct IoUringClientState
+    {
+        public nint Socket;
+        public nint RecvBuffer;   // Pinned buffer for recv
+        public nint SendBuffer;   // Pinned buffer for send
+        public bool Active;
+        public GCHandle RecvHandle;
+        public GCHandle SendHandle;
+    }
+
+    private static readonly IoUringClientState[] _ioUringClients = new IoUringClientState[MaxClients];
+
+    private static void RunIoUringServer(bool benchmarkMode)
+    {
+        try
+        {
+            using var ring = IORingGroup.Create(queueSize: 16384);
+
+            Console.WriteLine($"io_uring ring created");
+
+            // Create and bind listener socket using .NET Socket
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            listener.Blocking = false;
+            listener.Bind(new IPEndPoint(IPAddress.Any, Port));
+            listener.NoDelay = true;
+            listener.Listen(ListenBacklog);
+
+            var listenerFd = listener.Handle;
+            Console.WriteLine($"io_uring server listening on port {Port}");
+
+            // Reset stats
+            _totalMessages = 0;
+            _totalBytes = 0;
+            _lastReportedMessages = 0;
+            _pendingAcceptCount = 0;
+            _benchmarkStarted = false;
+            _finalStatsPrinted = false;
+            _peakConnections = 0;
+            _pollCallCount = 0;
+            _pollTotalTicks = 0;
+            _pollTotalCompletions = 0;
+            _benchmarkStopwatch.Reset();
+
+            // Pre-post accepts
+            for (var i = 0; i < PendingAccepts; i++)
+            {
+                ring.PrepareAccept(listenerFd, 0, 0, OpAccept);
+                _pendingAcceptCount++;
+            }
+
+            Span<Completion> completions = stackalloc Completion[1024];
+            var lastStatsMs = 0L;
+
+            Console.WriteLine("Waiting for first client connection to start benchmark...");
+
+            while (_running)
+            {
+                // Check duration limit
+                if (_benchmarkDuration > 0 && _benchmarkStarted && _benchmarkStopwatch.Elapsed.TotalSeconds >= _benchmarkDuration)
+                {
+                    Console.WriteLine($"[io_uring] Benchmark duration ({_benchmarkDuration}s) reached - stopping...");
+                    break;
+                }
+
+                ring.Submit();
+
+                // Time the PeekCompletions syscall
+                var pollStart = Stopwatch.GetTimestamp();
+                var count = ring.PeekCompletions(completions);
+                var pollEnd = Stopwatch.GetTimestamp();
+
+                _pollCallCount++;
+                _pollTotalTicks += pollEnd - pollStart;
+                _pollTotalCompletions += count;
+
+                for (var i = 0; i < count; i++)
+                {
+                    ProcessIoUringCompletion(ring, listenerFd, ref completions[i], benchmarkMode);
+                }
+
+                ring.AdvanceCompletionQueue(count);
+
+                // Print stats every second in benchmark mode
+                if (benchmarkMode)
+                {
+                    var elapsedMs = _benchmarkStopwatch.ElapsedMilliseconds;
+                    if (elapsedMs - lastStatsMs >= 1000)
+                    {
+                        PrintStats("io_uring");
+                        lastStatsMs = elapsedMs;
+                    }
+                }
+
+                // Yield when no work
+                if (count == 0)
+                {
+                    Thread.Sleep(1);
+                }
+            }
+
+            _benchmarkStopwatch.Stop();
+            if (!_finalStatsPrinted)
+            {
+                _finalStatsPrinted = true;
+                PrintFinalStats("io_uring", null);
+            }
+
+            // Cleanup clients
+            for (var i = 0; i < MaxClients; i++)
+            {
+                if (_ioUringClients[i].Active)
+                {
+                    CloseIoUringClient(ring, i, benchmarkMode);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"io_uring server error: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+        }
+    }
+
+    private static void ProcessIoUringCompletion(IIORingGroup ring, nint listenerFd, ref Completion cqe, bool benchmarkMode)
+    {
+        var op = cqe.UserData & OpMask;
+        var index = (int)(cqe.UserData & IndexMask);
+
+        switch (op)
+        {
+            case OpAccept:
+                HandleIoUringAccept(ring, listenerFd, cqe.Result, benchmarkMode);
+                break;
+            case OpRecv:
+                HandleIoUringRecv(ring, index, cqe.Result, benchmarkMode);
+                break;
+            case OpSend:
+                HandleIoUringSend(ring, index, cqe.Result, benchmarkMode);
+                break;
+        }
+    }
+
+    private static void HandleIoUringAccept(IIORingGroup ring, nint listenerFd, int result, bool benchmarkMode)
+    {
+        _pendingAcceptCount--;
+
+        if (result >= 0)
+        {
+            var clientSocket = (nint)result;
+            var clientIndex = FindFreeIoUringSlot();
+
+            if (clientIndex >= 0)
+            {
+                // Allocate pinned buffers for this client
+                var recvBuffer = new byte[BufferSize];
+                var sendBuffer = new byte[BufferSize];
+                var recvHandle = GCHandle.Alloc(recvBuffer, GCHandleType.Pinned);
+                var sendHandle = GCHandle.Alloc(sendBuffer, GCHandleType.Pinned);
+
+                _ioUringClients[clientIndex] = new IoUringClientState
+                {
+                    Socket = clientSocket,
+                    RecvBuffer = recvHandle.AddrOfPinnedObject(),
+                    SendBuffer = sendHandle.AddrOfPinnedObject(),
+                    RecvHandle = recvHandle,
+                    SendHandle = sendHandle,
+                    Active = true
+                };
+
+                // Set socket non-blocking and TCP_NODELAY
+                // Note: On Linux we'd use fcntl and setsockopt, but .NET Socket wraps this
+                try
+                {
+                    // Wrap in Socket temporarily to set options
+                    using var tempSocket = new Socket(new SafeSocketHandle(clientSocket, ownsHandle: false));
+                    tempSocket.Blocking = false;
+                    tempSocket.NoDelay = true;
+                }
+                catch
+                {
+                    // Best effort
+                }
+
+                // Start timing on first connection
+                if (!_benchmarkStarted)
+                {
+                    _benchmarkStarted = true;
+                    CaptureStartMemoryStats();
+                    _benchmarkStopwatch.Start();
+                    if (benchmarkMode)
+                        Console.WriteLine("[io_uring] First client connected - benchmark started!");
+                }
+
+                // Track peak connections
+                var activeCount = CountActiveIoUringClients();
+                if (activeCount > _peakConnections)
+                    _peakConnections = activeCount;
+
+                if (!benchmarkMode)
+                    Console.WriteLine($"[io_uring] Client {clientIndex} connected (fd={result})");
+
+                // Post initial receive
+                ring.PrepareRecv(clientSocket, _ioUringClients[clientIndex].RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)clientIndex);
+            }
+            else
+            {
+                Console.WriteLine($"[io_uring] No free slot for client, closing fd {result}");
+                CloseSocket(clientSocket);
+            }
+        }
+        else
+        {
+            // Accept error
+            if (result != -11 && result != -4) // EAGAIN, EINTR
+                Console.WriteLine($"[io_uring] Accept error: {result}");
+        }
+
+        // Replenish accepts
+        while (_pendingAcceptCount < PendingAccepts)
+        {
+            ring.PrepareAccept(listenerFd, 0, 0, OpAccept);
+            _pendingAcceptCount++;
+        }
+    }
+
+    private static void HandleIoUringRecv(IIORingGroup ring, int index, int result, bool benchmarkMode)
+    {
+        if (result <= 0)
+        {
+            CloseIoUringClient(ring, index, benchmarkMode);
+            return;
+        }
+
+        _totalBytes += result;
+
+        ref var client = ref _ioUringClients[index];
+
+        // Copy data from recv buffer to send buffer for echo
+        unsafe
+        {
+            Buffer.MemoryCopy((void*)client.RecvBuffer, (void*)client.SendBuffer, BufferSize, result);
+        }
+
+        // Queue send
+        ring.PrepareSend(client.Socket, client.SendBuffer, result, MsgFlags.None, OpSend | (uint)index);
+    }
+
+    private static void HandleIoUringSend(IIORingGroup ring, int index, int result, bool benchmarkMode)
+    {
+        if (result <= 0)
+        {
+            CloseIoUringClient(ring, index, benchmarkMode);
+            return;
+        }
+
+        _totalBytes += result;
+        _totalMessages++;
+
+        ref var client = ref _ioUringClients[index];
+
+        // Queue next receive
+        ring.PrepareRecv(client.Socket, client.RecvBuffer, BufferSize, MsgFlags.None, OpRecv | (uint)index);
+    }
+
+    private static int FindFreeIoUringSlot()
+    {
+        for (var i = 0; i < MaxClients; i++)
+            if (!_ioUringClients[i].Active)
+                return i;
+        return -1;
+    }
+
+    private static int CountActiveIoUringClients()
+    {
+        var count = 0;
+        for (var i = 0; i < MaxClients; i++)
+            if (_ioUringClients[i].Active)
+                count++;
+        return count;
+    }
+
+    private static void CloseIoUringClient(IIORingGroup ring, int index, bool benchmarkMode)
+    {
+        ref var client = ref _ioUringClients[index];
+        if (!client.Active) return;
+
+        if (!benchmarkMode)
+            Console.WriteLine($"[io_uring] Client {index} disconnected");
+
+        // Free pinned buffers
+        if (client.RecvHandle.IsAllocated)
+            client.RecvHandle.Free();
+        if (client.SendHandle.IsAllocated)
+            client.SendHandle.Free();
+
+        CloseSocket(client.Socket);
+        client = default;
+
+        // Stop benchmark when all clients disconnect (after benchmark started)
+        if (benchmarkMode && _benchmarkStarted && CountActiveIoUringClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
+        {
+            _benchmarkStopwatch.Stop();
+            Console.WriteLine("[io_uring] All clients disconnected - benchmark stopped!");
+            _finalStatsPrinted = true;
+            PrintFinalStats("io_uring", null);
+            _running = false;
+        }
+    }
+
+    private static void CloseSocket(nint socket)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            closesocket(socket);
+        }
+        else
+        {
+            close((int)socket);
+        }
+    }
+
+    #endregion
+
+    #region Platform Interop
+
     [DllImport("ws2_32.dll")]
     private static extern int closesocket(nint socket);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int close(int fd);
+
+    #endregion
 }
