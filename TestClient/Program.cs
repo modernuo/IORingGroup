@@ -18,6 +18,8 @@ public class Program
         var port = DefaultPort;
         var benchmarkCount = 0;
         var benchmarkConnections = 1;
+        var maxConcurrent = 1000; // Default max concurrent connections
+        nint cpuAffinity = 0;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -37,11 +39,37 @@ public class Program
             {
                 benchmarkConnections = int.Parse(args[++i]);
             }
+            else if ((args[i] == "--concurrent" || args[i] == "-C") && i + 1 < args.Length)
+            {
+                maxConcurrent = int.Parse(args[++i]);
+            }
+            else if ((args[i] == "--affinity" || args[i] == "-a") && i + 1 < args.Length)
+            {
+                var affinityStr = args[++i];
+                if (affinityStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    cpuAffinity = (nint)Convert.ToInt64(affinityStr[2..], 16);
+                else
+                    cpuAffinity = (nint)long.Parse(affinityStr);
+            }
+        }
+
+        // Set CPU affinity if specified
+        if (cpuAffinity != 0)
+        {
+            try
+            {
+                Process.GetCurrentProcess().ProcessorAffinity = cpuAffinity;
+                Console.WriteLine($"CPU affinity set to: 0x{cpuAffinity:X}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to set CPU affinity: {ex.Message}");
+            }
         }
 
         if (benchmarkCount > 0)
         {
-            await RunBenchmark(host, port, benchmarkCount, benchmarkConnections);
+            await RunBenchmark(host, port, benchmarkCount, benchmarkConnections, maxConcurrent);
             return;
         }
 
@@ -152,18 +180,17 @@ public class Program
         }
     }
 
-    private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount)
+    private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount, int maxConcurrent)
     {
         Console.WriteLine("IORingGroup Benchmark Client");
         Console.WriteLine($"Host: {host}:{port}");
         Console.WriteLine($"Connections: {connectionCount}");
         Console.WriteLine($"Messages per connection: {messagesPerConnection:N0}");
+        Console.WriteLine($"Max concurrent: {maxConcurrent}");
         Console.WriteLine();
 
         // Use semaphore to limit concurrent connection attempts
-        // This prevents overwhelming the server's listen backlog
-        const int maxConcurrentConnections = 500;
-        using var semaphore = new SemaphoreSlim(maxConcurrentConnections);
+        using var semaphore = new SemaphoreSlim(maxConcurrent);
 
         var tasks = new Task<BenchmarkResult>[connectionCount];
         var sw = Stopwatch.StartNew();

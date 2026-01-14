@@ -4,7 +4,6 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Network;
 using System.Network.Windows;
@@ -29,14 +28,17 @@ public class Program
     private const int ListenBacklog = 4096;
 
     private static volatile bool _running = true;
+    private static bool _quietMode;
 
     public static void Main(string[] args)
     {
         var backend = ServerBackend.RIO;
         var benchmarkMode = false;
+        nint cpuAffinity = 0;
 
-        foreach (var arg in args)
+        for (var i = 0; i < args.Length; i++)
         {
+            var arg = args[i];
             if (arg.Equals("--pollgroup", StringComparison.OrdinalIgnoreCase) ||
                 arg.Equals("-p", StringComparison.OrdinalIgnoreCase))
             {
@@ -52,13 +54,42 @@ public class Program
             {
                 benchmarkMode = true;
             }
+            else if (arg.Equals("--quiet", StringComparison.OrdinalIgnoreCase) ||
+                     arg.Equals("-q", StringComparison.OrdinalIgnoreCase))
+            {
+                _quietMode = true;
+            }
+            else if ((arg.Equals("--affinity", StringComparison.OrdinalIgnoreCase) ||
+                      arg.Equals("-a", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Length)
+            {
+                // CPU affinity mask (e.g., 0x1 for CPU 0, 0x2 for CPU 1, 0xF for CPUs 0-3)
+                var affinityStr = args[++i];
+                if (affinityStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    cpuAffinity = (nint)Convert.ToInt64(affinityStr[2..], 16);
+                else
+                    cpuAffinity = (nint)long.Parse(affinityStr);
+            }
+        }
+
+        // Set CPU affinity if specified
+        if (cpuAffinity != 0)
+        {
+            try
+            {
+                Process.GetCurrentProcess().ProcessorAffinity = cpuAffinity;
+                Console.WriteLine($"CPU affinity set to: 0x{cpuAffinity:X}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to set CPU affinity: {ex.Message}");
+            }
         }
 
         Console.WriteLine("RIO vs PollGroup Benchmark Server (Single-threaded)");
         Console.WriteLine($"Backend: {backend}");
-        Console.WriteLine($"Benchmark mode: {benchmarkMode}");
+        Console.WriteLine($"Benchmark mode: {benchmarkMode}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b]");
+        Console.WriteLine("Usage: TestServer [--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--quiet|-q] [--affinity|-a <mask>]");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
         Console.CancelKeyPress += (_, e) =>
@@ -86,8 +117,8 @@ public class Program
     private const ulong OpMask = 0xF000_0000_0000_0000UL;
     private const ulong IndexMask = 0x0FFF_FFFF_FFFF_FFFFUL;
 
-    // Number of accepts to keep queued
-    private const int PendingAccepts = 128;
+    // Number of accepts to keep queued (must not exceed accept pool size in ioring.dll, currently 64)
+    private const int PendingAccepts = 64;
 
     // Client state for RIO
     private struct RIOClientState
@@ -106,6 +137,14 @@ public class Program
     private static long _totalBytes;
     private static long _lastReportedMessages;
     private static readonly Stopwatch _benchmarkStopwatch = new();
+    private static bool _benchmarkStarted;
+    private static int _peakConnections;
+
+    // Memory stats (captured at start)
+    private static long _startAllocatedBytes;
+    private static int _startGen0;
+    private static int _startGen1;
+    private static int _startGen2;
 
     // Track pending accepts
     private static int _pendingAcceptCount;
@@ -124,57 +163,74 @@ public class Program
 
             Console.WriteLine($"RIO ring created: MaxConnections={ring.MaxConnections}, RecvBuf={ring.RecvBufferSize}, SendBuf={ring.SendBufferSize}");
 
-            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-
-            listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            listener.Blocking = false;
-            listener.Bind(new IPEndPoint(IPAddress.Any, Port));
-            listener.NoDelay = true;
-            listener.Listen(ListenBacklog);
-
-            Console.WriteLine($"RIO server listening on port {Port}");
-            Console.WriteLine($"Backend: {ring.Backend} (IsRIO: {ring.IsRIO})");
-
-            _pendingAcceptCount = 0;
-
-            // Pre-post multiple accepts
-            for (var i = 0; i < PendingAccepts; i++)
+            // IMPORTANT: Use library-owned listener with WSA_FLAG_REGISTERED_IO
+            // A .NET Socket listener won't work - the listener MUST have WSA_FLAG_REGISTERED_IO
+            // for AcceptEx sockets to work with RIO operations.
+            var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
+            if (listener == -1)
             {
-                ring.PrepareAccept(listener.Handle, 0, 0, OpAccept);
-                _pendingAcceptCount++;
+                var error = Win_x64.ioring_get_last_error();
+                throw new InvalidOperationException($"Failed to create listener: error {error}");
             }
 
-            Span<Completion> completions = stackalloc Completion[256];
-            var lastStatsMs = 0L;
-
-            _benchmarkStopwatch.Start();
-
-            while (_running)
+            try
             {
-                ring.Submit();
-                var count = ring.WaitCompletions(completions, 1, 1);
+                Console.WriteLine($"RIO server listening on port {Port}");
+                Console.WriteLine($"Backend: {ring.Backend} (IsRIO: {ring.IsRIO})");
 
-                for (var i = 0; i < count; i++)
+                // Reset stats
+                _totalMessages = 0;
+                _totalBytes = 0;
+                _lastReportedMessages = 0;
+                _pendingAcceptCount = 0;
+                _benchmarkStarted = false;
+                _peakConnections = 0;
+                _benchmarkStopwatch.Reset();
+                CaptureStartMemoryStats();
+
+                // Pre-post multiple accepts
+                for (var i = 0; i < PendingAccepts; i++)
                 {
-                    ProcessRIOCompletion(ring, listener.Handle, ref completions[i], benchmarkMode);
+                    ring.PrepareAccept(listener, 0, 0, OpAccept);
+                    _pendingAcceptCount++;
                 }
 
-                ring.AdvanceCompletionQueue(count);
+                Span<Completion> completions = stackalloc Completion[1024];
+                var lastStatsMs = 0L;
 
-                // Print stats every second in benchmark mode
-                if (benchmarkMode)
+                Console.WriteLine("Waiting for first client connection to start benchmark...");
+
+                while (_running)
                 {
-                    var elapsedMs = _benchmarkStopwatch.ElapsedMilliseconds;
-                    if (elapsedMs - lastStatsMs >= 1000)
+                    ring.Submit();
+                    var count = ring.WaitCompletions(completions, 1, 1);
+
+                    for (var i = 0; i < count; i++)
                     {
-                        PrintStats("RIO");
-                        lastStatsMs = elapsedMs;
+                        ProcessRIOCompletion(ring, listener, ref completions[i], benchmarkMode);
+                    }
+
+                    ring.AdvanceCompletionQueue(count);
+
+                    // Print stats every second in benchmark mode
+                    if (benchmarkMode)
+                    {
+                        var elapsedMs = _benchmarkStopwatch.ElapsedMilliseconds;
+                        if (elapsedMs - lastStatsMs >= 1000)
+                        {
+                            PrintStats("RIO");
+                            lastStatsMs = elapsedMs;
+                        }
                     }
                 }
-            }
 
-            _benchmarkStopwatch.Stop();
-            PrintFinalStats("RIO", ring);
+                _benchmarkStopwatch.Stop();
+                PrintFinalStats("RIO", ring);
+            }
+            finally
+            {
+                ring.CloseListener(listener);
+            }
         }
         catch (Exception ex)
         {
@@ -226,6 +282,20 @@ public class Program
                         SendBuffer = sendBuf,
                         Active = true
                     };
+
+                    // Start benchmark on first connection
+                    if (benchmarkMode && !_benchmarkStarted)
+                    {
+                        _benchmarkStarted = true;
+                        CaptureStartMemoryStats();
+                        _benchmarkStopwatch.Start();
+                        Console.WriteLine("[RIO] First client connected - benchmark started!");
+                    }
+
+                    // Track peak connections
+                    var activeCount = ring.ActiveConnections;
+                    if (activeCount > _peakConnections)
+                        _peakConnections = activeCount;
 
                     if (!benchmarkMode)
                         Console.WriteLine($"[RIO] Client {clientIndex} connected (socket={result}, connId={connId})");
@@ -323,6 +393,15 @@ public class Program
         closesocket(client.Socket);
 
         client = default;
+
+        // Stop benchmark when all clients disconnect (after benchmark started)
+        if (benchmarkMode && _benchmarkStarted && ring.ActiveConnections == 0)
+        {
+            _benchmarkStopwatch.Stop();
+            Console.WriteLine("[RIO] All clients disconnected - benchmark stopped!");
+            PrintFinalStats("RIO", ring);
+            _running = false;  // Exit the server loop
+        }
     }
 
     #endregion
@@ -361,12 +440,20 @@ public class Program
         Console.WriteLine($"PollGroup server listening on port {Port}");
         Console.WriteLine($"Backend: wepoll (Windows) / epoll (Linux) / kqueue (macOS)");
 
+        // Reset stats
+        _totalMessages = 0;
+        _totalBytes = 0;
+        _lastReportedMessages = 0;
+        _benchmarkStarted = false;
+        _peakConnections = 0;
+        _benchmarkStopwatch.Reset();
+
         var handles = new GCHandle[256];
         var lastStatsMs = 0L;
 
         var pendingSendCount = 0;
 
-        _benchmarkStopwatch.Start();
+        Console.WriteLine("Waiting for first client connection to start benchmark...");
 
         while (_running)
         {
@@ -395,6 +482,20 @@ public class Program
                                 clientState.Handle = GCHandle.Alloc(clientState, GCHandleType.Normal);
                                 _pollClients[clientIndex] = clientState;
                                 pollGroup.Add(client, clientState.Handle);
+
+                                // Start benchmark on first connection
+                                if (benchmarkMode && !_benchmarkStarted)
+                                {
+                                    _benchmarkStarted = true;
+                                    CaptureStartMemoryStats();
+                                    _benchmarkStopwatch.Start();
+                                    Console.WriteLine("[PollGroup] First client connected - benchmark started!");
+                                }
+
+                                // Track peak connections
+                                var activeCount = CountActivePollClients();
+                                if (activeCount > _peakConnections)
+                                    _peakConnections = activeCount;
 
                                 if (!benchmarkMode)
                                     Console.WriteLine($"[PollGroup] Client {clientIndex} connected");
@@ -541,6 +642,15 @@ public class Program
                 state.Handle.Free();
                 state.Socket.Close();
                 _pollClients[i] = null;
+
+                // Stop benchmark when all clients disconnect (after benchmark started)
+                if (benchmarkMode && _benchmarkStarted && CountActivePollClients() == 0)
+                {
+                    _benchmarkStopwatch.Stop();
+                    Console.WriteLine("[PollGroup] All clients disconnected - benchmark stopped!");
+                    PrintFinalStats("PollGroup", null);
+                    _running = false;  // Exit the server loop
+                }
                 break;
             }
         }
@@ -554,12 +664,36 @@ public class Program
         return -1;
     }
 
+    private static int CountActivePollClients()
+    {
+        var count = 0;
+        for (var i = 0; i < MaxClients; i++)
+            if (_pollClients[i] != null)
+                count++;
+        return count;
+    }
+
     #endregion
 
     #region Stats
 
+    private static void CaptureStartMemoryStats()
+    {
+        // Force a collection to get a clean baseline
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        _startAllocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+        _startGen0 = GC.CollectionCount(0);
+        _startGen1 = GC.CollectionCount(1);
+        _startGen2 = GC.CollectionCount(2);
+    }
+
     private static void PrintStats(string backend)
     {
+        if (_quietMode) return;
+
         var messages = Interlocked.Read(ref _totalMessages);
 
         if (messages == _lastReportedMessages)
@@ -573,7 +707,12 @@ public class Program
         var msgPerSec = elapsed > 0 ? messages / elapsed : 0;
         var mbPerSec = elapsed > 0 ? (bytes / 1024.0 / 1024.0) / elapsed : 0;
 
-        Console.WriteLine($"[{backend}] Messages: {messages:N0} | Rate: {msgPerSec:N0} msg/s | Throughput: {mbPerSec:N2} MB/s");
+        // Include GC stats
+        var gen0 = GC.CollectionCount(0) - _startGen0;
+        var gen1 = GC.CollectionCount(1) - _startGen1;
+        var gen2 = GC.CollectionCount(2) - _startGen2;
+
+        Console.WriteLine($"[{backend}] Msgs: {messages:N0} | {msgPerSec:N0} msg/s | {mbPerSec:N2} MB/s | GC: {gen0}/{gen1}/{gen2}");
     }
 
     private static void PrintFinalStats(string backend, WindowsRIOGroup? rioRing)
@@ -581,6 +720,12 @@ public class Program
         var elapsed = _benchmarkStopwatch.Elapsed.TotalSeconds;
         var messages = Interlocked.Read(ref _totalMessages);
         var bytes = Interlocked.Read(ref _totalBytes);
+
+        // Memory stats
+        var allocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - _startAllocatedBytes;
+        var gen0 = GC.CollectionCount(0) - _startGen0;
+        var gen1 = GC.CollectionCount(1) - _startGen1;
+        var gen2 = GC.CollectionCount(2) - _startGen2;
 
         Console.WriteLine();
         Console.WriteLine($"=== {backend} Final Statistics ===");
@@ -593,12 +738,30 @@ public class Program
             Console.WriteLine($"Average throughput: {(bytes / 1024.0 / 1024.0) / elapsed:N2} MB/s");
         }
 
+        Console.WriteLine();
+        Console.WriteLine("=== Memory Statistics ===");
+        Console.WriteLine($"Total allocated: {allocatedBytes / 1024.0 / 1024.0:N2} MB");
+        Console.WriteLine($"GC collections: Gen0={gen0}, Gen1={gen1}, Gen2={gen2}");
+        if (messages > 0)
+        {
+            Console.WriteLine($"Bytes allocated per message: {(double)allocatedBytes / messages:N2}");
+        }
+
+        Console.WriteLine($"Peak connections: {_peakConnections}");
+
         if (rioRing != null)
         {
             Console.WriteLine();
             Console.WriteLine("=== RIO Ring Info ===");
             Console.WriteLine($"Active connections: {rioRing.ActiveConnections}");
             Console.WriteLine($"Max connections: {rioRing.MaxConnections}");
+
+            Console.WriteLine();
+            Console.WriteLine("=== Lazy Commit Stats ===");
+            Console.WriteLine($"Reserved bytes: {rioRing.ReservedBytes / 1024.0 / 1024.0:N2} MB (virtual address space)");
+            Console.WriteLine($"Committed bytes: {rioRing.CommittedBytes / 1024.0 / 1024.0:N2} MB (actual physical memory)");
+            Console.WriteLine($"Committed slabs: {rioRing.CommittedSlabs} (256 connections each)");
+            Console.WriteLine($"Committed connections: {rioRing.CommittedConnections}");
         }
     }
 

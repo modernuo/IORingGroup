@@ -117,9 +117,10 @@ typedef struct rio_connection {
     SOCKET socket;
     RIO_RQ rq;                      // Request queue for this socket
 
-    // Legacy fixed-offset mode (for backwards compatibility)
-    uint32_t recv_offset;           // Fixed offset for recv buffer
-    uint32_t send_offset;           // Fixed offset for send buffer
+    // Buffer location (lazy commit mode)
+    RIO_BUFFERID buffer_id;         // Which slab this connection's buffers are in
+    uint32_t recv_offset;           // Offset within the slab for recv buffer
+    uint32_t send_offset;           // Offset within the slab for send buffer
 
     // NEW: Multi-slot slab allocation mode
     uint32_t recv_slab_offsets[MAX_OUTSTANDING_RECV];  // Offsets into pool
@@ -160,8 +161,13 @@ typedef struct acceptex_context {
 #define RIO_DEFAULT_OUTSTANDING_PER_SOCKET 2  // 1 recv + 1 send typical for echo
 #define RIO_MAX_OUTSTANDING_PER_SOCKET 16     // Upper limit per direction
 
+// Lazy commit slab configuration
+#define RIO_MAX_SLABS 64                      // Max number of buffer slabs (64 * 256 = 16K connections)
+#define RIO_CONNECTIONS_PER_SLAB 256          // Connections per slab (2MB per slab at 8KB/conn)
+
 // Forward declarations
 static void dequeue_rio_completions(ioring_t* ring);
+static BOOL ensure_rio_capacity(ioring_t* ring, uint32_t needed_connections);
 
 // Internal ring structure
 struct ioring {
@@ -193,11 +199,22 @@ struct ioring {
     HANDLE rio_event;                   // Event for completion notification
     HANDLE rio_iocp;                    // IOCP for RIO completions (if using IOCP mode)
 
-    // Legacy fixed-buffer mode (for backwards compatibility with existing API)
-    char* rio_buffer;                   // Contiguous buffer for all connections
-    RIO_BUFFERID rio_buf_id;            // Registered buffer ID
+    // Lazy-commit buffer mode (reserves full address space, commits on demand)
+    char* rio_buffer;                   // VirtualAlloc'd with MEM_RESERVE (full capacity)
+    size_t rio_buffer_reserved;         // Total reserved size
+    size_t rio_buffer_committed;        // Currently committed size
     uint32_t rio_recv_buf_size;         // Receive buffer size per connection
     uint32_t rio_send_buf_size;         // Send buffer size per connection
+    uint32_t rio_per_conn_size;         // recv + send size per connection
+
+    // Slab management (each slab is committed and registered separately)
+    RIO_BUFFERID rio_slab_ids[RIO_MAX_SLABS]; // Buffer ID per committed slab
+    uint32_t rio_slab_size;             // Size of each slab in bytes
+    uint32_t rio_committed_slabs;       // Number of slabs committed and registered
+    uint32_t rio_committed_connections; // Number of connection slots committed
+
+    // Legacy single-buffer ID (for backwards compat, points to first slab)
+    RIO_BUFFERID rio_buf_id;            // = rio_slab_ids[0]
 
     // Owned listener sockets (library creates these)
     SOCKET* owned_listeners;            // Array of listener sockets we created
@@ -494,10 +511,15 @@ IORING_API void ioring_destroy(ioring_t* ring) {
             pool_destroy(ring->pool);
         }
 
-        // Cleanup legacy buffer
-        if (ring->rio_buf_id != RIO_INVALID_BUFFERID && rio.RIODeregisterBuffer) {
-            rio.RIODeregisterBuffer(ring->rio_buf_id);
+        // Cleanup all registered buffer slabs
+        if (rio.RIODeregisterBuffer) {
+            for (uint32_t i = 0; i < ring->rio_committed_slabs; i++) {
+                if (ring->rio_slab_ids[i] != RIO_INVALID_BUFFERID) {
+                    rio.RIODeregisterBuffer(ring->rio_slab_ids[i]);
+                }
+            }
         }
+        // Release the entire reserved region (includes all committed pages)
         if (ring->rio_buffer) {
             VirtualFree(ring->rio_buffer, 0, MEM_RELEASE);
         }
@@ -734,7 +756,7 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
         }
 
         RIO_BUF buf;
-        buf.BufferId = ring->rio_buf_id;
+        buf.BufferId = conn->buffer_id;  // Use per-connection buffer ID (lazy commit)
 
         BOOL success = FALSE;
         int retries = 0;
@@ -843,6 +865,88 @@ static void process_pending_polls(ioring_t* ring) {
             i++;
         }
     }
+}
+
+// =============================================================================
+// Lazy Commit: Ensure we have enough committed buffer capacity
+// =============================================================================
+static BOOL ensure_rio_capacity(ioring_t* ring, uint32_t needed_connections) {
+    if (!ring || !ring->rio_mode) return FALSE;
+
+    // Already have enough capacity
+    if (needed_connections <= ring->rio_committed_connections) {
+        return TRUE;
+    }
+
+    // Check if we've hit the max
+    if (needed_connections > ring->rio_max_connections) {
+        last_error = WSAENOBUFS;
+        return FALSE;
+    }
+
+    // Calculate how many slabs we need
+    uint32_t conns_per_slab = RIO_CONNECTIONS_PER_SLAB;
+    if (conns_per_slab > ring->rio_max_connections) conns_per_slab = ring->rio_max_connections;
+
+    uint32_t slabs_needed = (needed_connections + conns_per_slab - 1) / conns_per_slab;
+    if (slabs_needed > RIO_MAX_SLABS) {
+        last_error = WSAENOBUFS;
+        return FALSE;
+    }
+
+    // Commit and register new slabs as needed
+    while (ring->rio_committed_slabs < slabs_needed) {
+        uint32_t slab_index = ring->rio_committed_slabs;
+        size_t slab_offset = (size_t)slab_index * ring->rio_slab_size;
+
+        // Check we're still within reserved range
+        if (slab_offset + ring->rio_slab_size > ring->rio_buffer_reserved) {
+            last_error = WSAENOBUFS;
+            return FALSE;
+        }
+
+        // Commit this slab's memory
+        void* committed = VirtualAlloc(
+            ring->rio_buffer + slab_offset,
+            ring->rio_slab_size,
+            MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (!committed) {
+            last_error = GetLastError();
+            return FALSE;
+        }
+
+        // Register with RIO
+        ring->rio_slab_ids[slab_index] = rio.RIORegisterBuffer(
+            ring->rio_buffer + slab_offset,
+            ring->rio_slab_size
+        );
+        if (ring->rio_slab_ids[slab_index] == RIO_INVALID_BUFFERID) {
+            last_error = WSAGetLastError();
+            // Decommit the memory we just committed
+            VirtualFree(ring->rio_buffer + slab_offset, ring->rio_slab_size, MEM_DECOMMIT);
+            return FALSE;
+        }
+
+        ring->rio_committed_slabs++;
+        ring->rio_buffer_committed += ring->rio_slab_size;
+        ring->rio_committed_connections = ring->rio_committed_slabs * conns_per_slab;
+        if (ring->rio_committed_connections > ring->rio_max_connections) {
+            ring->rio_committed_connections = ring->rio_max_connections;
+        }
+
+        // Update buffer_id for connections in this new slab
+        uint32_t first_conn = slab_index * conns_per_slab;
+        uint32_t last_conn = first_conn + conns_per_slab;
+        if (last_conn > ring->rio_max_connections) last_conn = ring->rio_max_connections;
+
+        for (uint32_t i = first_conn; i < last_conn; i++) {
+            ring->rio_connections[i].buffer_id = ring->rio_slab_ids[slab_index];
+        }
+    }
+
+    return TRUE;
 }
 
 // Dequeue RIO completions (and AcceptEx completions)
@@ -1087,50 +1191,74 @@ IORING_API ioring_t* ioring_create_rio_ex(
     }
 
     // ==========================================================================
-    // Create Buffer Pool (LIFO Slab Allocator)
+    // Buffer Pool (LIFO Slab Allocator) - DISABLED
     // ==========================================================================
-    // Calculate number of slabs needed:
-    // - Each connection can have up to outstanding_per_socket recv + outstanding_per_socket send
-    // - Total slabs = max_connections * outstanding_per_socket * 2
-    // - Add 20% headroom for flexibility
-    uint32_t slab_size = recv_buffer_size > send_buffer_size ? recv_buffer_size : send_buffer_size;
-    if (slab_size < DEFAULT_SLAB_SIZE) slab_size = DEFAULT_SLAB_SIZE;
-    // Round up to page size for optimal DMA
-    slab_size = (slab_size + 4095) & ~4095;
-
-    uint32_t total_slabs = max_connections * outstanding_per_socket * 2;
-    total_slabs = (total_slabs * 120) / 100;  // 20% headroom
-    if (total_slabs < 256) total_slabs = 256;  // Minimum pool size
-
-    ring->pool = pool_create(slab_size, total_slabs);
-    if (!ring->pool) {
-        goto fail;
-    }
+    // The pool is for the multi-slot API which is not currently used.
+    // The legacy fixed-buffer mode (PrepareRecvRegistered/PrepareSendRegistered)
+    // uses rio_buffer with lazy commit instead.
+    // TODO: Re-enable with lazy commit if multi-slot API is needed.
+    ring->pool = NULL;
 
     // ==========================================================================
-    // Legacy Fixed-Offset Buffer (for backwards compatibility)
+    // Lazy-Commit Buffer (reserves full address space, commits slabs on demand)
     // ==========================================================================
     ring->rio_recv_buf_size = recv_buffer_size;
     ring->rio_send_buf_size = send_buffer_size;
     uint32_t per_connection_size = recv_buffer_size + send_buffer_size;
-    size_t legacy_buffer_size = (size_t)max_connections * per_connection_size;
+    ring->rio_per_conn_size = per_connection_size;
 
-    ring->rio_buffer = (char*)VirtualAlloc(NULL, legacy_buffer_size,
-                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    // Calculate slab sizing
+    // Each slab covers RIO_CONNECTIONS_PER_SLAB connections
+    uint32_t conns_per_slab = RIO_CONNECTIONS_PER_SLAB;
+    if (conns_per_slab > max_connections) conns_per_slab = max_connections;
+    ring->rio_slab_size = conns_per_slab * per_connection_size;
+
+    // Total size to reserve (full capacity)
+    size_t total_buffer_size = (size_t)max_connections * per_connection_size;
+    ring->rio_buffer_reserved = total_buffer_size;
+
+    // Initialize slab tracking
+    ring->rio_committed_slabs = 0;
+    ring->rio_committed_connections = 0;
+    ring->rio_buffer_committed = 0;
+    for (uint32_t i = 0; i < RIO_MAX_SLABS; i++) {
+        ring->rio_slab_ids[i] = RIO_INVALID_BUFFERID;
+    }
+
+    // RESERVE full address space (no physical memory yet - this is free)
+    ring->rio_buffer = (char*)VirtualAlloc(NULL, total_buffer_size,
+                                           MEM_RESERVE, PAGE_READWRITE);
     if (!ring->rio_buffer) {
         goto fail;
     }
 
-    ring->rio_buf_id = rio.RIORegisterBuffer(ring->rio_buffer, (DWORD)legacy_buffer_size);
-    if (ring->rio_buf_id == RIO_INVALID_BUFFERID) {
+    // COMMIT first slab only (this allocates physical memory)
+    void* committed = VirtualAlloc(ring->rio_buffer, ring->rio_slab_size,
+                                   MEM_COMMIT, PAGE_READWRITE);
+    if (!committed) {
         goto fail;
     }
+    ring->rio_buffer_committed = ring->rio_slab_size;
+    ring->rio_committed_connections = conns_per_slab;
 
-    // Initialize per-connection offsets
+    // Register first slab with RIO
+    ring->rio_slab_ids[0] = rio.RIORegisterBuffer(ring->rio_buffer, ring->rio_slab_size);
+    if (ring->rio_slab_ids[0] == RIO_INVALID_BUFFERID) {
+        goto fail;
+    }
+    ring->rio_committed_slabs = 1;
+    ring->rio_buf_id = ring->rio_slab_ids[0];  // Legacy compatibility
+
+    // Initialize per-connection buffer info (only for first slab initially)
     for (uint32_t i = 0; i < max_connections; i++) {
-        uint32_t base_offset = i * per_connection_size;
-        ring->rio_connections[i].recv_offset = base_offset;
-        ring->rio_connections[i].send_offset = base_offset + recv_buffer_size;
+        uint32_t slab_index = i / conns_per_slab;
+        uint32_t index_in_slab = i % conns_per_slab;
+        uint32_t offset_in_slab = index_in_slab * per_connection_size;
+
+        ring->rio_connections[i].buffer_id = (slab_index < ring->rio_committed_slabs)
+            ? ring->rio_slab_ids[slab_index] : RIO_INVALID_BUFFERID;
+        ring->rio_connections[i].recv_offset = offset_in_slab;
+        ring->rio_connections[i].send_offset = offset_in_slab + recv_buffer_size;
     }
 
     // Create IOCP for RIO completions (optional, can use polling)
@@ -1221,16 +1349,22 @@ IORING_API int ioring_rio_register(
         return -1;
     }
 
+    // Helper to calculate buffer pointers from slab-based offsets
+    uint32_t conns_per_slab = RIO_CONNECTIONS_PER_SLAB;
+    if (conns_per_slab > ring->rio_max_connections) conns_per_slab = ring->rio_max_connections;
+
     // Check if this socket is already registered (e.g., from AcceptEx)
     for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
         if (ring->rio_connections[i].active && ring->rio_connections[i].socket == socket) {
             // Socket already registered - just return buffer pointers
             rio_connection_t* conn = &ring->rio_connections[i];
+            uint32_t slab_index = i / conns_per_slab;
+            size_t slab_base = (size_t)slab_index * ring->rio_slab_size;
             if (recv_buf) {
-                *recv_buf = ring->rio_buffer + conn->recv_offset;
+                *recv_buf = ring->rio_buffer + slab_base + conn->recv_offset;
             }
             if (send_buf) {
-                *send_buf = ring->rio_buffer + conn->send_offset;
+                *send_buf = ring->rio_buffer + slab_base + conn->send_offset;
             }
             return (int)i;
         }
@@ -1247,6 +1381,12 @@ IORING_API int ioring_rio_register(
 
     if (slot < 0) {
         last_error = WSAENOBUFS;
+        return -1;
+    }
+
+    // Ensure we have capacity for this slot (lazy commit)
+    if (!ensure_rio_capacity(ring, (uint32_t)slot + 1)) {
+        // last_error set by ensure_rio_capacity
         return -1;
     }
 
@@ -1287,12 +1427,14 @@ IORING_API int ioring_rio_register(
     conn->active = TRUE;
     ring->rio_active_connections++;
 
-    // Return buffer pointers
+    // Return buffer pointers (using slab-based offsets)
+    uint32_t slab_index = (uint32_t)slot / conns_per_slab;
+    size_t slab_base = (size_t)slab_index * ring->rio_slab_size;
     if (recv_buf) {
-        *recv_buf = ring->rio_buffer + conn->recv_offset;
+        *recv_buf = ring->rio_buffer + slab_base + conn->recv_offset;
     }
     if (send_buf) {
-        *send_buf = ring->rio_buffer + conn->send_offset;
+        *send_buf = ring->rio_buffer + slab_base + conn->send_offset;
     }
 
     return slot;
@@ -1331,6 +1473,23 @@ IORING_API uint32_t ioring_rio_get_max_connections(ioring_t* ring) {
 
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring) {
     return ring && ring->rio_mode ? ring->rio_active_connections : 0;
+}
+
+// Lazy commit stats
+IORING_API size_t ioring_rio_get_committed_bytes(ioring_t* ring) {
+    return ring && ring->rio_mode ? ring->rio_buffer_committed : 0;
+}
+
+IORING_API size_t ioring_rio_get_reserved_bytes(ioring_t* ring) {
+    return ring && ring->rio_mode ? ring->rio_buffer_reserved : 0;
+}
+
+IORING_API uint32_t ioring_rio_get_committed_slabs(ioring_t* ring) {
+    return ring && ring->rio_mode ? ring->rio_committed_slabs : 0;
+}
+
+IORING_API uint32_t ioring_rio_get_committed_connections(ioring_t* ring) {
+    return ring && ring->rio_mode ? ring->rio_committed_connections : 0;
 }
 
 // Diagnostic: Get connection state for debugging
@@ -1562,8 +1721,14 @@ IORING_API int ioring_rio_peek_recv_buffer(ioring_t* ring, int conn_id) {
     rio_connection_t* conn = &ring->rio_connections[conn_id];
     if (!conn->active) return -3;
 
+    // Calculate slab-based buffer pointer
+    uint32_t conns_per_slab = RIO_CONNECTIONS_PER_SLAB;
+    if (conns_per_slab > ring->rio_max_connections) conns_per_slab = ring->rio_max_connections;
+    uint32_t slab_index = (uint32_t)conn_id / conns_per_slab;
+    size_t slab_base = (size_t)slab_index * ring->rio_slab_size;
+
     // Get pointer to the recv buffer for this connection
-    char* recv_buf = ring->rio_buffer + conn->recv_offset;
+    char* recv_buf = ring->rio_buffer + slab_base + conn->recv_offset;
 
     // Return first 4 bytes as an integer (to see if any data was written)
     // "Hell" = 0x6C6C6548 in little-endian
@@ -1651,6 +1816,14 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
         closesocket(ctx->accept_socket);
         ctx->accept_socket = INVALID_SOCKET;
         last_error = WSAENOBUFS;
+        return FALSE;
+    }
+
+    // Ensure we have buffer capacity for this slot (lazy commit)
+    if (!ensure_rio_capacity(ring, (uint32_t)conn_slot + 1)) {
+        closesocket(ctx->accept_socket);
+        ctx->accept_socket = INVALID_SOCKET;
+        // last_error set by ensure_rio_capacity
         return FALSE;
     }
 

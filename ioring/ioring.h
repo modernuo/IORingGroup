@@ -225,6 +225,16 @@ IORING_API uint32_t ioring_rio_get_max_connections(ioring_t* ring);
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
 
+// Lazy commit buffer stats (memory is committed on-demand as connections are registered)
+// Get currently committed buffer bytes (actual physical memory used)
+IORING_API size_t ioring_rio_get_committed_bytes(ioring_t* ring);
+// Get total reserved buffer bytes (virtual address space, not physical memory)
+IORING_API size_t ioring_rio_get_reserved_bytes(ioring_t* ring);
+// Get number of committed buffer slabs
+IORING_API uint32_t ioring_rio_get_committed_slabs(ioring_t* ring);
+// Get number of connection slots with committed buffers
+IORING_API uint32_t ioring_rio_get_committed_connections(ioring_t* ring);
+
 // Diagnostic: Get connection state for debugging
 // Returns packed value: (active << 0) | (rq_valid << 1) | (socket_valid << 2)
 // Value 7 = fully valid (active + rq_valid + socket_valid)

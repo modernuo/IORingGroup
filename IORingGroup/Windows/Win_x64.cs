@@ -189,6 +189,31 @@ public static partial class Win_x64
     public static partial uint ioring_rio_get_active_connections(nint ring);
 
     /// <summary>
+    /// Get currently committed buffer bytes (actual physical memory).
+    /// Lazy commit: memory is committed on-demand as connections are registered.
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial nuint ioring_rio_get_committed_bytes(nint ring);
+
+    /// <summary>
+    /// Get total reserved buffer bytes (virtual address space, not physical memory).
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial nuint ioring_rio_get_reserved_bytes(nint ring);
+
+    /// <summary>
+    /// Get number of committed buffer slabs.
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial uint ioring_rio_get_committed_slabs(nint ring);
+
+    /// <summary>
+    /// Get number of connection slots with committed buffers.
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial uint ioring_rio_get_committed_connections(nint ring);
+
+    /// <summary>
     /// Diagnostic: Get connection state for debugging.
     /// Returns packed value: (active) | (rq_valid &lt;&lt; 1) | (socket_valid &lt;&lt; 2)
     /// Value 7 = fully valid (active + rq_valid + socket_valid)
