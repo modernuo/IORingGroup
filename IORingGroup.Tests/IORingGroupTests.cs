@@ -435,7 +435,7 @@ public class WindowsRIOGroupTests
         try
         {
             // Create 5 connections
-            for (int i = 0; i < 5; i++)
+            for (var i = 0; i < 5; i++)
             {
                 var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 client.Connect(endpoint);
@@ -1163,7 +1163,7 @@ public class WindowsRIOGroupTests
 
             // Send multiple chunks through the buffer
             Span<Completion> completions = stackalloc Completion[16];
-            for (int i = 0; i < 5; i++)
+            for (var i = 0; i < 5; i++)
             {
                 var chunkData = new byte[100];
                 Array.Fill(chunkData, (byte)(i + 0x41)); // 'A', 'B', 'C', etc.

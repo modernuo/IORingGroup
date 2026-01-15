@@ -20,7 +20,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BACKEND="${1:-both}"
 DURATION="${2:-60}"
 CONNECTIONS="${CONNECTIONS:-100}"
-MESSAGES="${MESSAGES:-100000}"
+MESSAGES="${MESSAGES:-10000}"
 
 echo "========================================"
 echo "IORingGroup Linux Benchmark"

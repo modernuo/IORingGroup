@@ -12,6 +12,30 @@ namespace System.Network.IORing;
 /// </summary>
 public sealed unsafe class LinuxIORingGroup : IIORingGroup
 {
+    /// <summary>
+    /// Tests if io_uring is available and functional on this system.
+    /// </summary>
+    /// <param name="arch">Architecture-specific syscall implementation.</param>
+    /// <returns>True if io_uring is available, false if blocked or unsupported.</returns>
+    public static bool IsAvailable(ILinuxArch arch)
+    {
+        // Try to create a minimal io_uring (smallest valid queue size)
+        var p = new io_uring_params();
+        var fd = arch.io_uring_setup(8, ref p);
+
+        if (fd < 0)
+        {
+            // Failed - common errno values:
+            // ENOSYS (38) = syscall not implemented in kernel
+            // EPERM (1) = blocked by seccomp/security policy
+            return false;
+        }
+
+        // Success - clean up the test ring
+        arch.close(fd);
+        return true;
+    }
+
     private readonly ILinuxArch _arch;
     private readonly int _ringFd;
     private readonly uint _sqEntries;
@@ -382,7 +406,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // =============================================================================
 
     /// <inheritdoc/>
-    public unsafe nint CreateListener(string bindAddress, ushort port, int backlog)
+    public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
         // Create non-blocking TCP socket
         var fd = _arch.socket(
@@ -394,7 +418,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         if (fd < 0) return -1;
 
         // Disable SO_REUSEADDR (exclusive address use)
-        int optval = 0;
+        var optval = 0;
         _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_REUSEADDR, (nint)(&optval), sizeof(int));
 
         // Disable TCP_NODELAY (Nagle off)
@@ -446,7 +470,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             _arch.fcntl(fd, _arch.F_SETFL, flags | _arch.O_NONBLOCK);
 
         // TCP_NODELAY (disable Nagle)
-        int optval = 1;
+        var optval = 1;
         _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
 
         // Disable SO_LINGER
