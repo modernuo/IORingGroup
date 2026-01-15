@@ -827,6 +827,7 @@ public class Program
                 _pollTotalCompletions += count;
             }
 
+            // Handle sockets with events
             for (var i = 0; i < count; i++)
             {
                 var state = (PollClientState)handles[i].Target!;
@@ -889,6 +890,34 @@ public class Program
                     catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
                     {
                         break;
+                    }
+                }
+            }
+
+            // Flush pending sends for ALL clients, not just those with events
+            // This prevents deadlock when Poll() returns no events but we have buffered data
+            for (var i = 0; i < MaxClients; i++)
+            {
+                var state = _pollClients[i];
+                if (state?.Socket != null && state.Buffer.ReadableBytes > 0)
+                {
+                    try
+                    {
+                        if (state.Socket.Poll(0, SelectMode.SelectWrite))
+                        {
+                            var dataToSend = state.Buffer.GetReadSpan(out _);
+                            var sent = state.Socket.Send(dataToSend);
+                            if (sent > 0)
+                            {
+                                state.Buffer.CommitRead(sent);
+                                _totalMessages++;
+                                _totalBytes += sent;
+                            }
+                        }
+                    }
+                    catch (SocketException)
+                    {
+                        ClosePollClient(state);
                     }
                 }
             }
