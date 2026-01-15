@@ -15,12 +15,6 @@ public interface IIORingGroup : IDisposable
     int SubmissionQueueSpace { get; }
 
     /// <summary>
-    /// Gets the number of currently active connections (platform-specific tracking).
-    /// Returns -1 if not supported by the implementation.
-    /// </summary>
-    int ActiveConnections => -1;
-
-    /// <summary>
     /// Gets the number of pending completions in the completion queue.
     /// </summary>
     int CompletionQueueCount { get; }
@@ -56,26 +50,6 @@ public interface IIORingGroup : IDisposable
     /// <param name="addrLen">Length of the address structure.</param>
     /// <param name="userData">User data returned with the completion.</param>
     void PrepareConnect(nint fd, nint addr, int addrLen, ulong userData);
-
-    /// <summary>
-    /// Queues a send operation to transmit data.
-    /// </summary>
-    /// <param name="fd">Socket file descriptor.</param>
-    /// <param name="buf">Pointer to data buffer.</param>
-    /// <param name="len">Number of bytes to send.</param>
-    /// <param name="flags">Send flags.</param>
-    /// <param name="userData">User data returned with the completion.</param>
-    void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData);
-
-    /// <summary>
-    /// Queues a receive operation to receive data.
-    /// </summary>
-    /// <param name="fd">Socket file descriptor.</param>
-    /// <param name="buf">Pointer to buffer to receive data.</param>
-    /// <param name="len">Maximum bytes to receive.</param>
-    /// <param name="flags">Receive flags.</param>
-    /// <param name="userData">User data returned with the completion.</param>
-    void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData);
 
     /// <summary>
     /// Queues a close operation on a file descriptor.
@@ -120,17 +94,8 @@ public interface IIORingGroup : IDisposable
     int PeekCompletions(Span<Completion> completions);
 
     /// <summary>
-    /// Waits for and retrieves completed operations.
-    /// </summary>
-    /// <param name="completions">Buffer to receive completions.</param>
-    /// <param name="minComplete">Minimum number of completions to wait for.</param>
-    /// <param name="timeoutMs">Timeout in milliseconds (-1 for infinite).</param>
-    /// <returns>Number of completions retrieved.</returns>
-    int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs);
-
-    /// <summary>
     /// Advances the completion queue head, marking completions as consumed.
-    /// Call this after processing completions from PeekCompletions/WaitCompletions.
+    /// Call this after processing completions from PeekCompletions.
     /// </summary>
     /// <param name="count">Number of completions to mark as consumed.</param>
     void AdvanceCompletionQueue(int count);
@@ -174,6 +139,28 @@ public interface IIORingGroup : IDisposable
     /// Call this on sockets returned from accept completions.
     /// </remarks>
     void ConfigureSocket(nint socket);
+
+    /// <summary>
+    /// Registers a socket for I/O operations and returns a connection ID.
+    /// </summary>
+    /// <param name="socket">The socket handle to register.</param>
+    /// <returns>Connection ID on success (>= 0), -1 on failure.</returns>
+    /// <remarks>
+    /// On Windows RIO, this creates a Request Queue for the socket.
+    /// On Linux/Darwin, the socket handle is used directly as the connection ID.
+    /// The returned connection ID is used with <see cref="PrepareSendBuffer"/> and <see cref="PrepareRecvBuffer"/>.
+    /// </remarks>
+    int RegisterSocket(nint socket);
+
+    /// <summary>
+    /// Unregisters a previously registered socket.
+    /// </summary>
+    /// <param name="connId">The connection ID returned by <see cref="RegisterSocket"/>.</param>
+    /// <remarks>
+    /// Call this before closing the socket. On Windows RIO, this frees the Request Queue.
+    /// On Linux/Darwin, this is a no-op but should still be called for consistency.
+    /// </remarks>
+    void UnregisterSocket(int connId);
 
     /// <summary>
     /// Closes a socket.

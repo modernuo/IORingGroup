@@ -146,10 +146,23 @@ public class Program
             }
         }
 
+        // If io_uring is not available on Linux, fall back to PollGroup which handles epoll properly
+        if (backend == ServerBackend.IORing && IORingGroup.IsUsingEpollFallback)
+        {
+            Console.WriteLine("io_uring not available, falling back to PollGroup (epoll)...");
+            backend = ServerBackend.PollGroup;
+        }
+
+        // Darwin/macOS: kqueue is synchronous like epoll, fall back to PollGroup
+        if (backend == ServerBackend.IORing &&
+            (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD)))
+        {
+            Console.WriteLine("Darwin/BSD detected, falling back to PollGroup (kqueue)...");
+            backend = ServerBackend.PollGroup;
+        }
+
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
-        Console.WriteLine($"io_uring available: {IORingGroup.IsIOUringAvailable}");
-        Console.WriteLine($"Epoll fallback: {IORingGroup.IsUsingEpollFallback}");
         Console.WriteLine($"Backend: {backend}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
@@ -182,19 +195,17 @@ public class Program
         {
             // Create the appropriate ring based on platform
             IIORingGroup ring;
-            WindowsRIOGroup? rioRing = null;
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // On Windows, use WindowsRIOGroup for full RIO support
-                rioRing = new WindowsRIOGroup(
+                ring = new WindowsRIOGroup(
                     queueSize: MaxClients,
                     maxConnections: MaxClients,
                     recvBufferSize: BufferSize,
                     sendBufferSize: BufferSize
                 );
-                ring = rioRing;
-                Console.WriteLine($"Windows RIO ring created: MaxConnections={rioRing.MaxConnections}");
+                Console.WriteLine($"Windows RIO ring created: MaxConnections={MaxClients}");
             }
             else
             {
@@ -229,7 +240,7 @@ public class Program
 
             try
             {
-                RunServerLoop(ring, rioRing, listener, benchmarkMode);
+                RunServerLoop(ring, listener, benchmarkMode);
             }
             finally
             {
@@ -240,7 +251,7 @@ public class Program
                 {
                     if (_clients[i].Active)
                     {
-                        CloseClient(ring, rioRing, i);
+                        CloseClient(ring, i);
                     }
                 }
 
@@ -256,13 +267,14 @@ public class Program
         }
     }
 
-    private static void RunServerLoop(IIORingGroup ring, WindowsRIOGroup? rioRing, nint listener, bool benchmarkMode)
+    private static void RunServerLoop(IIORingGroup ring, nint listener, bool benchmarkMode)
     {
         // Reset stats
         _totalMessages = 0;
         _totalBytes = 0;
         _lastReportedMessages = 0;
         _pendingAcceptCount = 0;
+        _acceptSequence = 0;
         _benchmarkStarted = false;
         _finalStatsPrinted = false;
         _peakConnections = 0;
@@ -274,7 +286,7 @@ public class Program
         // Pre-post multiple accepts
         for (var i = 0; i < PendingAccepts; i++)
         {
-            ring.PrepareAccept(listener, 0, 0, OpAccept);
+            ring.PrepareAccept(listener, 0, 0, OpAccept | (_acceptSequence++ & IndexMask));
             _pendingAcceptCount++;
         }
 
@@ -309,10 +321,7 @@ public class Program
 
             for (var i = 0; i < count; i++)
             {
-                var cqe = completions[i];
-                var op = (cqe.UserData & OpMask) >> 56;
-                Console.WriteLine($"[DEBUG] CQE: userData=0x{cqe.UserData:X}, result={cqe.Result}, op={op}");
-                ProcessCompletion(ring, rioRing, listener, ref completions[i], benchmarkMode);
+                ProcessCompletion(ring, listener, ref completions[i], benchmarkMode);
             }
 
             ring.AdvanceCompletionQueue(count);
@@ -339,11 +348,11 @@ public class Program
         if (!_finalStatsPrinted)
         {
             _finalStatsPrinted = true;
-            PrintFinalStats(rioRing);
+            PrintFinalStats();
         }
     }
 
-    private static void ProcessCompletion(IIORingGroup ring, WindowsRIOGroup? rioRing, nint listener, ref Completion cqe, bool benchmarkMode)
+    private static void ProcessCompletion(IIORingGroup ring, nint listener, ref Completion cqe, bool benchmarkMode)
     {
         var op = cqe.UserData & OpMask;
         var index = (int)(cqe.UserData & IndexMask);
@@ -351,18 +360,18 @@ public class Program
         switch (op)
         {
             case OpAccept:
-                HandleAccept(ring, rioRing, listener, cqe.Result, benchmarkMode);
+                HandleAccept(ring, listener, cqe.Result, benchmarkMode);
                 break;
             case OpRecv:
-                HandleRecv(ring, rioRing, index, cqe.Result, benchmarkMode);
+                HandleRecv(ring, index, cqe.Result, benchmarkMode);
                 break;
             case OpSend:
-                HandleSend(ring, rioRing, index, cqe.Result, benchmarkMode);
+                HandleSend(ring, index, cqe.Result, benchmarkMode);
                 break;
         }
     }
 
-    private static void HandleAccept(IIORingGroup ring, WindowsRIOGroup? rioRing, nint listener, int result, bool benchmarkMode)
+    private static void HandleAccept(IIORingGroup ring, nint listener, int result, bool benchmarkMode)
     {
         _pendingAcceptCount--;
 
@@ -373,14 +382,11 @@ public class Program
             goto ReplenishAccepts;
         }
 
-        Console.WriteLine($"[DEBUG] Accept result: {result}");
-
         if (result >= 0)
         {
             // Result is socket handle
             var clientSocket = (nint)result;
             var clientIndex = FindFreeSlot();
-            Console.WriteLine($"[DEBUG] Accept: socket={clientSocket}, clientIndex={clientIndex}");
 
             if (clientIndex >= 0)
             {
@@ -405,28 +411,17 @@ public class Program
 
                 client.Buffer = buffer;
 
-                if (rioRing != null)
+                // Register socket to get connection ID
+                var connId = ring.RegisterSocket(clientSocket);
+                if (connId < 0)
                 {
-                    // Windows: Register socket with RIO to create RQ
-                    var connId = rioRing.RegisterSocket(clientSocket);
-                    if (connId >= 0)
-                    {
-                        client.ConnId = connId;
-                    }
-                    else
-                    {
-                        Console.WriteLine($"RIO registration failed for socket {clientSocket}");
-                        _bufferPool.Release(buffer);
-                        ring.CloseSocket(clientSocket);
-                        client = default;
-                        goto ReplenishAccepts;
-                    }
+                    Console.WriteLine($"Socket registration failed for socket {clientSocket}");
+                    _bufferPool.Release(buffer);
+                    ring.CloseSocket(clientSocket);
+                    client = default;
+                    goto ReplenishAccepts;
                 }
-                else
-                {
-                    // Linux/Darwin: Use socket fd directly as connId
-                    client.ConnId = (int)clientSocket;
-                }
+                client.ConnId = connId;
 
                 // Start timing on first connection
                 if (!_benchmarkStarted)
@@ -451,8 +446,6 @@ public class Program
                 var availableSpace = client.Buffer.WritableBytes;
                 if (availableSpace > 0)
                 {
-                    if (!_quietMode)
-                        Console.WriteLine($"[DEBUG] Posting recv: fd={client.ConnId}, bufferId={client.Buffer.BufferId}, offset={writeOffset}, len={availableSpace}, bufPtr=0x{client.Buffer.Pointer:X}");
                     ring.PrepareRecvBuffer(
                         client.ConnId,
                         client.Buffer.BufferId,
@@ -478,21 +471,19 @@ public class Program
         // Replenish accepts
         while (_pendingAcceptCount < PendingAccepts)
         {
-            ring.PrepareAccept(listener, 0, 0, OpAccept);
+            ring.PrepareAccept(listener, 0, 0, OpAccept | (_acceptSequence++ & IndexMask));
             _pendingAcceptCount++;
         }
     }
 
-    private static void HandleRecv(IIORingGroup ring, WindowsRIOGroup? rioRing, int index, int result, bool benchmarkMode)
+    private static void HandleRecv(IIORingGroup ring, int index, int result, bool benchmarkMode)
     {
         ref var client = ref _clients[index];
         client.RecvPending = false;
 
         if (result <= 0)
         {
-            if (!_quietMode)
-                Console.WriteLine($"[DEBUG] Recv result on client {index}: {result} {(result < 0 ? $"(errno={-result})" : "(EOF)")}");
-            CloseClient(ring, rioRing, index);
+            CloseClient(ring, index);
             return;
         }
 
@@ -540,14 +531,14 @@ public class Program
         }
     }
 
-    private static void HandleSend(IIORingGroup ring, WindowsRIOGroup? rioRing, int index, int result, bool benchmarkMode)
+    private static void HandleSend(IIORingGroup ring, int index, int result, bool benchmarkMode)
     {
         ref var client = ref _clients[index];
         client.SendPending = false;
 
         if (result <= 0)
         {
-            CloseClient(ring, rioRing, index);
+            CloseClient(ring, index);
             return;
         }
 
@@ -596,7 +587,7 @@ public class Program
         }
     }
 
-    private static void CloseClient(IIORingGroup ring, WindowsRIOGroup? rioRing, int index)
+    private static void CloseClient(IIORingGroup ring, int index)
     {
         ref var client = ref _clients[index];
         if (!client.Active) return;
@@ -604,9 +595,9 @@ public class Program
         if (!_quietMode)
             Console.WriteLine($"Client {index} disconnected");
 
-        // Unregister from RIO
-        if (client.ConnId >= 0 && rioRing != null)
-            rioRing.UnregisterSocket(client.ConnId);
+        // Unregister socket
+        if (client.ConnId >= 0)
+            ring.UnregisterSocket(client.ConnId);
 
         // Release buffer back to pool (buffer stays registered with ring)
         if (client.Buffer != null && _bufferPool != null)
@@ -617,13 +608,13 @@ public class Program
         ring.CloseSocket(client.Socket);
         client = default;
 
-        // Stop benchmark when all clients disconnect (only if not using duration mode)
-        if (_benchmarkStarted && CountActiveClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
+        // Stop benchmark when all clients disconnect
+        if (_benchmarkStarted && CountActiveClients() == 0 && !_finalStatsPrinted)
         {
             _benchmarkStopwatch.Stop();
-            Console.WriteLine("All clients disconnected - benchmark stopped!");
+            Console.WriteLine("All clients disconnected - benchmark complete!");
             _finalStatsPrinted = true;
-            PrintFinalStats(rioRing);
+            PrintFinalStats();
             _running = false;
         }
     }
@@ -769,13 +760,13 @@ public class Program
                     // Return to pool for reuse (avoids allocation on next accept)
                     ReleasePollClientState(state);
 
-                    // Stop benchmark when all clients disconnect (only if not using duration mode)
-                    if (_benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
+                    // Stop benchmark when all clients disconnect
+                    if (_benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted)
                     {
                         _benchmarkStopwatch.Stop();
-                        Console.WriteLine("[PollGroup] All clients disconnected - benchmark stopped!");
+                        Console.WriteLine("[PollGroup] All clients disconnected - benchmark complete!");
                         _finalStatsPrinted = true;
-                        PrintFinalStats(null);
+                        PrintFinalStats();
                         _running = false;
                     }
                     break;
@@ -965,7 +956,7 @@ public class Program
         if (!_finalStatsPrinted)
         {
             _finalStatsPrinted = true;
-            PrintFinalStats(null);
+            PrintFinalStats();
         }
 
         // Cleanup
@@ -1027,7 +1018,7 @@ public class Program
         }
     }
 
-    private static void PrintFinalStats(WindowsRIOGroup? rioRing)
+    private static void PrintFinalStats()
     {
         var elapsed = _benchmarkStopwatch.Elapsed.TotalSeconds;
         var messages = _totalMessages;
@@ -1079,13 +1070,9 @@ public class Program
             }
         }
 
-        if (rioRing != null)
-        {
-            Console.WriteLine();
-            Console.WriteLine("=== RIO Ring Info ===");
-            Console.WriteLine($"Active connections: {rioRing.ActiveConnections}");
-            Console.WriteLine($"Max connections: {rioRing.MaxConnections}");
-        }
+        Console.WriteLine();
+        Console.WriteLine("=== RIO Ring Info ===");
+        Console.WriteLine($"Max connections: {MaxClients}");
 
         if (_bufferPool != null)
         {

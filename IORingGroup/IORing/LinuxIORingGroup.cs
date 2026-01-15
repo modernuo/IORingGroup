@@ -86,8 +86,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         _sqEntries = p.sq_entries;
-        _sqMask = p.sq_off.ring_mask;
-        _cqMask = p.cq_off.ring_mask;
+        // Note: ring_mask values are OFFSETS - actual masks are read after mmap
 
         // Map submission queue ring
         _sqRingSize = p.sq_off.array + p.sq_entries * sizeof(uint);
@@ -152,6 +151,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         _cqHead = (uint*)(_cqRingPtr + (nint)p.cq_off.head);
         _cqTail = (uint*)(_cqRingPtr + (nint)p.cq_off.tail);
         _cqes = (io_uring_cqe*)(_cqRingPtr + (nint)p.cq_off.cqes);
+
+        // Read actual ring masks from mapped memory (ring_mask field is an OFFSET, not the value!)
+        _sqMask = *(uint*)(_sqRingPtr + (nint)p.sq_off.ring_mask);
+        _cqMask = *(uint*)(_cqRingPtr + (nint)p.cq_off.ring_mask);
 
         // Initialize local tail from shared memory
         _sqTailLocal = *_sqTail;
@@ -260,9 +263,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         sqe->user_data = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
         if (sqe == null) throw new InvalidOperationException("Submission queue full");
@@ -275,9 +277,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         sqe->user_data = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
         if (sqe == null) throw new InvalidOperationException("Submission queue full");
@@ -340,8 +341,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Release store: ensures all SQE writes are visible before kernel sees new tail
         Volatile.Write(ref *_sqTail, tail);
 
-        var ret = _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
-        return ret;
+        return _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
     }
 
     /// <inheritdoc/>
@@ -377,21 +377,6 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         return count;
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        // First check if we already have enough completions
-        var available = CompletionQueueCount;
-        if (available < minComplete)
-        {
-            // Need to wait for more completions
-            _arch.io_uring_enter(_ringFd, 0, (uint)minComplete, (uint)IORING_ENTER.GETEVENTS);
-        }
-
-        return PeekCompletions(completions);
     }
 
     /// <inheritdoc/>
@@ -476,6 +461,19 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Disable SO_LINGER
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+    }
+
+    /// <inheritdoc/>
+    public int RegisterSocket(nint socket)
+    {
+        // On Linux, the socket fd is used directly as the connection ID
+        return (int)socket;
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterSocket(int connId)
+    {
+        // No-op on Linux - socket fd is used directly
     }
 
     /// <inheritdoc/>

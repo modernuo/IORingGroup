@@ -5,6 +5,24 @@ using System.Network;
 
 namespace IORingGroup.Tests;
 
+// Helper to poll for completions with timeout (replaces blocking WaitCompletions)
+internal static class TestHelpers
+{
+    public static int WaitForCompletions(IIORingGroup ring, Span<Completion> completions, int minComplete, int timeoutMs)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var count = 0;
+        while (count < minComplete && Environment.TickCount64 < deadline)
+        {
+            ring.Submit();
+            count = ring.PeekCompletions(completions);
+            if (count < minComplete)
+                Thread.Sleep(1);
+        }
+        return count;
+    }
+}
+
 public class IORingGroupTests
 {
     [SkippableFact]
@@ -131,64 +149,6 @@ public class IORingGroupTests
     }
 }
 
-public class WindowsFactoryTests
-{
-    [SkippableFact]
-    public void Factory_ReturnsWindowsRIOGroup()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-        Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
-
-        using var ring = System.Network.IORingGroup.Create();
-        Assert.IsType<System.Network.Windows.WindowsRIOGroup>(ring);
-
-        var rioRing = (System.Network.Windows.WindowsRIOGroup)ring;
-        Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, rioRing.Backend);
-    }
-
-    [SkippableFact]
-    public void SendRecv_WithConnectedSockets_Works()
-    {
-        // Legacy PrepareSend/PrepareRecv is not supported in RIO mode.
-        // RIO requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead.
-        Skip.If(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
-            "Windows RIO mode requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead of PrepareSend/PrepareRecv.");
-
-        Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
-
-        using var ring = System.Network.IORingGroup.Create(256);
-        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        listener.Listen(1);
-        var endpoint = (IPEndPoint)listener.LocalEndPoint!;
-
-        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        client.Connect(endpoint);
-
-        using var server = listener.Accept();
-
-        // Test send
-        var sendBuffer = "Hello, IORing!"u8.ToArray();
-        unsafe
-        {
-            fixed (byte* pSend = sendBuffer)
-            {
-#pragma warning disable CS0618 // Type or member is obsolete
-                ring.PrepareSend(client.Handle, (nint)pSend, sendBuffer.Length, MsgFlags.None, 1);
-#pragma warning restore CS0618
-            }
-        }
-        ring.Submit();
-
-        // Receive on server side (synchronous for test simplicity)
-        var recvBuffer = new byte[sendBuffer.Length];
-        var received = server.Receive(recvBuffer);
-
-        Assert.Equal(sendBuffer.Length, received);
-        Assert.Equal(sendBuffer, recvBuffer);
-    }
-}
-
 public class CompletionStructTests
 {
     [Fact]
@@ -236,32 +196,6 @@ public class WindowsRIOGroupTests
     private const int MaxConnections = 128;
 
     [SkippableFact]
-    public void RIO_IsAvailable()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        // This test verifies RIO is available on the system
-        // Create a minimal ring to test RIO initialization
-        try
-        {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(
-                queueSize: 256,
-                maxConnections: 16,
-                recvBufferSize: 1024,
-                sendBufferSize: 1024
-            );
-
-            Assert.True(ring.IsRIO, "Ring should be in RIO mode");
-            Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, ring.Backend);
-        }
-        catch (InvalidOperationException ex)
-        {
-            var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-            Skip.If(true, $"RIO not available on this system: {ex.Message}, error code: {error}");
-        }
-    }
-
-    [SkippableFact]
     public void RegisterSocket_DiagnosticInfo()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -300,9 +234,7 @@ public class WindowsRIOGroupTests
                 Skip.If(error == 10045, $"RegisterSocket failed with WSAEOPNOTSUPP - rebuild ioring.dll with latest changes");
 
                 Assert.Fail($"RegisterSocket failed: {errorMsg}\n" +
-                    $"Socket handle: {server.Handle}\n" +
-                    $"Ring IsRIO: {ring.IsRIO}\n" +
-                    $"Ring Backend: {ring.Backend}");
+                    $"Socket handle: {server.Handle}");
             }
 
             Assert.True(connId >= 0);
@@ -327,8 +259,6 @@ public class WindowsRIOGroupTests
         );
 
         Assert.NotNull(ring);
-        Assert.True(ring.IsRIO);
-        Assert.Equal(MaxConnections, ring.MaxConnections);
         Assert.Equal(BufferSize, ring.RecvBufferSize);
         Assert.Equal(BufferSize, ring.SendBufferSize);
     }
@@ -347,7 +277,6 @@ public class WindowsRIOGroupTests
         );
 
         Assert.NotNull(ring);
-        Assert.True(ring.IsRIO);
     }
 
     [SkippableFact]
@@ -369,16 +298,6 @@ public class WindowsRIOGroupTests
 
         Assert.Throws<ArgumentException>(() =>
             new System.Network.Windows.WindowsRIOGroup(100, MaxConnections, BufferSize, BufferSize));
-    }
-
-    [SkippableFact]
-    public void ActiveConnections_InitiallyZero()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-
-        Assert.Equal(0, ring.ActiveConnections);
     }
 
     [SkippableFact]
@@ -410,10 +329,8 @@ public class WindowsRIOGroupTests
         }
 
         Assert.True(connId >= 0, $"RegisterSocket failed with connId={connId}");
-        Assert.Equal(1, ring.ActiveConnections);
 
         ring.UnregisterSocket(connId);
-        Assert.Equal(0, ring.ActiveConnections);
     }
 
     [SkippableFact]
@@ -455,15 +372,11 @@ public class WindowsRIOGroupTests
                 connIds.Add(connId);
             }
 
-            Assert.Equal(5, ring.ActiveConnections);
-
             // Unregister all
             foreach (var connId in connIds)
             {
                 ring.UnregisterSocket(connId);
             }
-
-            Assert.Equal(0, ring.ActiveConnections);
         }
         finally
         {
@@ -503,61 +416,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void Backend_ReturnsRIO()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-
-        Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, ring.Backend);
-    }
-
-    [SkippableFact]
-    public void CreateAcceptSocket_ReturnsValidSocket()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        try
-        {
-            var acceptSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-
-            if (acceptSocket == -1)
-            {
-                var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                Skip.If(true, $"CreateAcceptSocket failed with error {error}");
-            }
-
-            Assert.NotEqual(-1, acceptSocket);
-
-            // Clean up - close the socket
-            System.Net.Sockets.Socket.OSSupportsUnixDomainSockets.ToString(); // Force socket init
-            // Use closesocket via P/Invoke or just let it leak for the test
-        }
-        catch (EntryPointNotFoundException)
-        {
-            Skip.If(true, "ioring_rio_create_accept_socket not available - rebuild ioring.dll");
-        }
-    }
-
-    [SkippableFact]
-    public void GetAcceptEx_ReturnsValidPointer()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        try
-        {
-            var acceptExPtr = System.Network.Windows.WindowsRIOGroup.GetAcceptEx();
-
-            // Should succeed - the function creates a temp socket if none provided
-            Assert.NotEqual(nint.Zero, acceptExPtr);
-        }
-        catch (EntryPointNotFoundException)
-        {
-            Skip.If(true, "ioring_get_acceptex not available - rebuild ioring.dll");
-        }
-    }
-
-    [SkippableFact]
     public void RIO_PrepareAccept_AutomaticallyUsesAcceptEx()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -569,12 +427,12 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-            // Use library-owned listener to avoid .NET IOCP conflicts
+            // Use library-owned listener with WSA_FLAG_REGISTERED_IO
             const ushort testPort = 0;  // Let OS assign port
             var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
                 ring.Handle, "127.0.0.1", testPort, 128);
 
-            if (listenerHandle == -1 || listenerHandle == 0)
+            if (listenerHandle is -1 or 0)
             {
                 var err = System.Network.Windows.Win_x64.ioring_get_last_error();
                 Skip.If(true, $"Failed to create library-owned listener: error {err}");
@@ -612,7 +470,7 @@ public class WindowsRIOGroupTests
 
             // Wait for accept completion
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 5000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
 
             Assert.True(count > 0, "No accept completion received - AcceptEx may not be working");
             Assert.Equal(acceptUserData, completions[0].UserData);
@@ -626,7 +484,7 @@ public class WindowsRIOGroupTests
             // Try to register the socket with RIO
             // NOTE: AcceptEx now creates sockets WITHOUT WSA_FLAG_REGISTERED_IO for legacy compatibility.
             // This means RegisterSocket will FAIL with WSAEOPNOTSUPP (10045).
-            // For server-side RIO, users must create accept sockets manually with CreateAcceptSocket().
+            // For server-side RIO, users must create accept sockets manually with WSASocketW with WSA_FLAG_REGISTERED_IO.
             var connId = ring.RegisterSocket(acceptedSocket);
             if (connId < 0)
             {
@@ -635,7 +493,7 @@ public class WindowsRIOGroupTests
                 Skip.If(error == 10045,
                     "RegisterSocket failed with WSAEOPNOTSUPP - expected behavior. " +
                     "AcceptEx creates regular sockets for legacy compatibility. " +
-                    "For server-side RIO, create accept sockets manually with CreateAcceptSocket().");
+                    "For server-side RIO, create accept sockets manually with WSASocketW with WSA_FLAG_REGISTERED_IO.");
                 Assert.Fail($"RegisterSocket failed with unexpected error {error}");
             }
             Assert.True(connId >= 0, $"RegisterSocket failed");
@@ -662,7 +520,7 @@ public class WindowsRIOGroupTests
             var sent = client.Send(testData);
             Assert.Equal(testData.Length, sent);
 
-            count = ring.WaitCompletions(completions, 1, 2000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "No recv completion received");
             Assert.Equal(testData.Length, completions[0].Result);
@@ -683,7 +541,7 @@ public class WindowsRIOGroupTests
             ring.PrepareSendExternal(connId, sendBufId, sendOffset, testData.Length, 2);
             ring.Submit();
 
-            count = ring.WaitCompletions(completions, 1, 1000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 1000);
             Assert.True(count > 0, "No send completion");
             ring.AdvanceCompletionQueue(count);
 
@@ -726,11 +584,11 @@ public class WindowsRIOGroupTests
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
             // Create a pre-allocated socket with WSA_FLAG_REGISTERED_IO
-            var acceptSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            var acceptSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
             if (acceptSocket == -1)
             {
                 var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                Skip.If(true, $"CreateAcceptSocket failed with error {error}");
+                Skip.If(true, $"WSASocketW failed with error {error}");
             }
 
             // For now, just verify we can create the socket and it's valid
@@ -805,8 +663,8 @@ public class WindowsRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create a CLIENT socket with WSA_FLAG_REGISTERED_IO using C library
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             // Connect our RIO socket to the listener using direct P/Invoke
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
@@ -859,7 +717,7 @@ public class WindowsRIOGroupTests
 
             // Wait for completion on RIO client
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "CLIENT socket RIO recv failed");
             Assert.Equal(testData.Length, completions[0].Result);
@@ -1032,8 +890,8 @@ public class WindowsRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create RIO client socket
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in
@@ -1080,7 +938,7 @@ public class WindowsRIOGroupTests
 
             // Wait for send completion
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "No send completion received");
             Assert.Equal(sendUserData, completions[0].UserData);
@@ -1132,8 +990,8 @@ public class WindowsRIOGroupTests
             listener.Listen(1);
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in
@@ -1176,7 +1034,7 @@ public class WindowsRIOGroupTests
                 ring.PrepareSendExternal(connId, extBufId, readOffset, 100, (ulong)i);
                 ring.Submit();
 
-                var count = ring.WaitCompletions(completions, 1, 2000);
+                var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
                 Assert.True(count > 0, $"No completion for chunk {i}");
                 Assert.Equal(100, completions[0].Result);
                 ring.AdvanceCompletionQueue(count);
@@ -1226,8 +1084,8 @@ public class WindowsRIOGroupTests
             listener.Listen(1);
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in
@@ -1270,7 +1128,7 @@ public class WindowsRIOGroupTests
             ring.Submit();
 
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
             Assert.True(count > 0);
             ring.AdvanceCompletionQueue(count);
             buffer.CommitRead(fillSize);
@@ -1297,7 +1155,7 @@ public class WindowsRIOGroupTests
             ring.PrepareSendExternal(connId, extBufId, readOffset, wrapData.Length, 2);
             ring.Submit();
 
-            count = ring.WaitCompletions(completions, 1, 2000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
             Assert.True(count > 0, "No completion for wrapped send");
             Assert.Equal(wrapData.Length, completions[0].Result);
             ring.AdvanceCompletionQueue(count);

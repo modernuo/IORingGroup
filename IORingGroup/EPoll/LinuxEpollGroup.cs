@@ -43,7 +43,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
     private int _externalBufferCount;
 
     // Pending poll operations - maps fd to userData for poll events
-    private readonly System.Collections.Generic.Dictionary<int, ulong> _pendingPolls = new();
+    private readonly Dictionary<int, ulong> _pendingPolls = new();
 
     private struct PendingOp
     {
@@ -150,9 +150,8 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         sqe.UserData = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         ref var sqe = ref GetSqe();
         sqe.Opcode = (byte)IORingOp.Send;
@@ -163,9 +162,8 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         sqe.UserData = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         ref var sqe = ref GetSqe();
         sqe.Opcode = (byte)IORingOp.Recv;
@@ -221,7 +219,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
 
             // Add completion for each operation (synchronous execution)
             var cqIndex = _cqTail & _cqMask;
-            _cqEntries[cqIndex] = new Completion(sqe.UserData, result, CompletionFlags.None);
+            _cqEntries[cqIndex] = new Completion(sqe.UserData, result);
             _cqTail++;
 
             _sqHead++;
@@ -405,10 +403,8 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
                 fd = (int)(*(ulong*)(evPtr + 8));
 
             // Check if this is a pending poll
-            if (_pendingPolls.TryGetValue(fd, out var userData))
+            if (_pendingPolls.Remove(fd, out var userData))
             {
-                _pendingPolls.Remove(fd);
-
                 // Convert epoll events to result
                 var result = 0;
                 if ((events & epoll_events.EPOLLERR) != 0)
@@ -418,7 +414,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
 
                 // Add completion
                 var cqIndex = _cqTail & _cqMask;
-                _cqEntries[cqIndex] = new Completion(userData, result, CompletionFlags.None);
+                _cqEntries[cqIndex] = new Completion(userData, result);
                 _cqTail++;
             }
         }
@@ -438,31 +434,6 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         }
 
         return count;
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        // Wait for completions using epoll_wait
-        while (CompletionQueueCount < minComplete)
-        {
-            fixed (byte* eventsPtr = _epollEventsBuffer)
-            {
-                var result = _arch.epoll_wait(_epollFd, (nint)eventsPtr, _queueSize, timeoutMs);
-
-                if (result > 0)
-                {
-                    ProcessEpollEvents(eventsPtr, result);
-                }
-                else if (result == 0)
-                {
-                    break; // Timeout
-                }
-            }
-        }
-
-        return PeekCompletions(completions);
     }
 
     /// <inheritdoc/>
@@ -545,6 +516,19 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         // Disable SO_LINGER
         var linger = new linger { l_onoff = 0, l_linger = 0 };
         _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(linger));
+    }
+
+    /// <inheritdoc/>
+    public int RegisterSocket(nint socket)
+    {
+        // On Linux epoll, the socket fd is used directly as the connection ID
+        return (int)socket;
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterSocket(int connId)
+    {
+        // No-op on Linux epoll - socket fd is used directly
     }
 
     /// <inheritdoc/>
