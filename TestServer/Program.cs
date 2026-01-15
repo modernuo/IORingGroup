@@ -146,6 +146,13 @@ public class Program
             }
         }
 
+        // If io_uring is not available on Linux, fall back to PollGroup which handles epoll properly
+        if (backend == ServerBackend.IORing && IORingGroup.IsUsingEpollFallback)
+        {
+            Console.WriteLine("io_uring not available, falling back to PollGroup (epoll)...");
+            backend = ServerBackend.PollGroup;
+        }
+
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
         Console.WriteLine($"io_uring available: {IORingGroup.IsIOUringAvailable}");
@@ -263,6 +270,7 @@ public class Program
         _totalBytes = 0;
         _lastReportedMessages = 0;
         _pendingAcceptCount = 0;
+        _acceptSequence = 0;
         _benchmarkStarted = false;
         _finalStatsPrinted = false;
         _peakConnections = 0;
@@ -274,7 +282,7 @@ public class Program
         // Pre-post multiple accepts
         for (var i = 0; i < PendingAccepts; i++)
         {
-            ring.PrepareAccept(listener, 0, 0, OpAccept);
+            ring.PrepareAccept(listener, 0, 0, OpAccept | (_acceptSequence++ & IndexMask));
             _pendingAcceptCount++;
         }
 
@@ -310,8 +318,16 @@ public class Program
             for (var i = 0; i < count; i++)
             {
                 var cqe = completions[i];
-                var op = (cqe.UserData & OpMask) >> 56;
-                Console.WriteLine($"[DEBUG] CQE: userData=0x{cqe.UserData:X}, result={cqe.Result}, op={op}");
+                // var op = cqe.UserData & OpMask;
+                // var idx = (long)(cqe.UserData & IndexMask);
+                // var opName = op switch
+                // {
+                //     OpAccept => "Accept",
+                //     OpRecv => "Recv",
+                //     OpSend => "Send",
+                //     _ => $"Unknown(0x{op >> 56:X})"
+                // };
+                // Console.WriteLine($"[DEBUG] CQE: op={opName} seq/idx={idx} result={cqe.Result} (listener={listener}) userData=0x{cqe.UserData:X16}");
                 ProcessCompletion(ring, rioRing, listener, ref completions[i], benchmarkMode);
             }
 
@@ -373,14 +389,14 @@ public class Program
             goto ReplenishAccepts;
         }
 
-        Console.WriteLine($"[DEBUG] Accept result: {result}");
+        // Console.WriteLine($"[DEBUG] Accept result: {result}");
 
         if (result >= 0)
         {
             // Result is socket handle
             var clientSocket = (nint)result;
             var clientIndex = FindFreeSlot();
-            Console.WriteLine($"[DEBUG] Accept: socket={clientSocket}, clientIndex={clientIndex}");
+            // Console.WriteLine($"[DEBUG] Accept: socket={clientSocket}, clientIndex={clientIndex}");
 
             if (clientIndex >= 0)
             {
@@ -451,8 +467,8 @@ public class Program
                 var availableSpace = client.Buffer.WritableBytes;
                 if (availableSpace > 0)
                 {
-                    if (!_quietMode)
-                        Console.WriteLine($"[DEBUG] Posting recv: fd={client.ConnId}, bufferId={client.Buffer.BufferId}, offset={writeOffset}, len={availableSpace}, bufPtr=0x{client.Buffer.Pointer:X}");
+                    // if (!_quietMode)
+                        // Console.WriteLine($"[DEBUG] Posting recv: fd={client.ConnId}, bufferId={client.Buffer.BufferId}, offset={writeOffset}, len={availableSpace}, bufPtr=0x{client.Buffer.Pointer:X}");
                     ring.PrepareRecvBuffer(
                         client.ConnId,
                         client.Buffer.BufferId,
@@ -478,7 +494,7 @@ public class Program
         // Replenish accepts
         while (_pendingAcceptCount < PendingAccepts)
         {
-            ring.PrepareAccept(listener, 0, 0, OpAccept);
+            ring.PrepareAccept(listener, 0, 0, OpAccept | (_acceptSequence++ & IndexMask));
             _pendingAcceptCount++;
         }
     }
@@ -490,8 +506,8 @@ public class Program
 
         if (result <= 0)
         {
-            if (!_quietMode)
-                Console.WriteLine($"[DEBUG] Recv result on client {index}: {result} {(result < 0 ? $"(errno={-result})" : "(EOF)")}");
+            // if (!_quietMode)
+                // Console.WriteLine($"[DEBUG] Recv result on client {index}: {result} {(result < 0 ? $"(errno={-result})" : "(EOF)")}");
             CloseClient(ring, rioRing, index);
             return;
         }
@@ -617,11 +633,11 @@ public class Program
         ring.CloseSocket(client.Socket);
         client = default;
 
-        // Stop benchmark when all clients disconnect (only if not using duration mode)
-        if (_benchmarkStarted && CountActiveClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
+        // Stop benchmark when all clients disconnect
+        if (_benchmarkStarted && CountActiveClients() == 0 && !_finalStatsPrinted)
         {
             _benchmarkStopwatch.Stop();
-            Console.WriteLine("All clients disconnected - benchmark stopped!");
+            Console.WriteLine("All clients disconnected - benchmark complete!");
             _finalStatsPrinted = true;
             PrintFinalStats(rioRing);
             _running = false;
@@ -769,11 +785,11 @@ public class Program
                     // Return to pool for reuse (avoids allocation on next accept)
                     ReleasePollClientState(state);
 
-                    // Stop benchmark when all clients disconnect (only if not using duration mode)
-                    if (_benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted && _benchmarkDuration == 0)
+                    // Stop benchmark when all clients disconnect
+                    if (_benchmarkStarted && CountActivePollClients() == 0 && !_finalStatsPrinted)
                     {
                         _benchmarkStopwatch.Stop();
-                        Console.WriteLine("[PollGroup] All clients disconnected - benchmark stopped!");
+                        Console.WriteLine("[PollGroup] All clients disconnected - benchmark complete!");
                         _finalStatsPrinted = true;
                         PrintFinalStats(null);
                         _running = false;
