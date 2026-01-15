@@ -8,16 +8,14 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
+# Copy LICENSE first (referenced by IORingGroup.csproj as ../LICENSE)
+COPY LICENSE .
+
 # Copy project files first for better layer caching
 COPY IORingGroup/IORingGroup.csproj IORingGroup/
 COPY TestServer/TestServer.csproj TestServer/
 COPY TestClient/TestClient.csproj TestClient/
 COPY IORingGroup.Tests/IORingGroup.Tests.csproj IORingGroup.Tests/
-
-# Restore dependencies
-RUN dotnet restore IORingGroup/IORingGroup.csproj -r linux-x64
-RUN dotnet restore TestServer/TestServer.csproj -r linux-x64
-RUN dotnet restore TestClient/TestClient.csproj -r linux-x64
 
 # Copy source code
 COPY IORingGroup/ IORingGroup/
@@ -25,7 +23,13 @@ COPY TestServer/ TestServer/
 COPY TestClient/ TestClient/
 COPY IORingGroup.Tests/ IORingGroup.Tests/
 
-# Build all projects
+# Restore dependencies
+RUN dotnet restore IORingGroup/IORingGroup.csproj
+RUN dotnet restore IORingGroup.Tests/IORingGroup.Tests.csproj
+RUN dotnet restore TestServer/TestServer.csproj
+RUN dotnet restore TestClient/TestClient.csproj
+
+# Build all projects (with runtime identifier to match publish)
 RUN dotnet build TestServer/TestServer.csproj -c Release -r linux-x64 --no-restore
 RUN dotnet build TestClient/TestClient.csproj -c Release -r linux-x64 --no-restore
 
@@ -69,6 +73,6 @@ WORKDIR /src
 
 COPY . .
 
-RUN dotnet restore IORingGroup.Tests/IORingGroup.Tests.csproj -r linux-x64
+RUN dotnet restore IORingGroup.Tests/IORingGroup.Tests.csproj
 
 ENTRYPOINT ["dotnet", "test", "IORingGroup.Tests/IORingGroup.Tests.csproj", "-c", "Release", "-r", "linux-x64", "--logger", "console;verbosity=detailed"]

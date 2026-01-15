@@ -75,29 +75,29 @@ public sealed partial class Linux_arm64 : ILinuxArch
 
     // libc bindings - memory
     [LibraryImport("libc", SetLastError = true)]
-    private static partial nint mmap_native(nint addr, nuint length, int prot, int flags, int fd, long offset);
+    private static partial nint mmap(nint addr, nuint length, int prot, int flags, int fd, long offset);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int munmap_native(nint addr, nuint length);
+    private static partial int munmap(nint addr, nuint length);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int close_native(int fd);
+    private static partial int close(int fd);
 
     // libc bindings - sockets
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int socket_native(int domain, int type, int protocol);
+    private static partial int socket(int domain, int type, int protocol);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int bind_native(int sockfd, nint addr, int addrlen);
+    private static partial int bind(int sockfd, nint addr, int addrlen);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int listen_native(int sockfd, int backlog);
+    private static partial int listen(int sockfd, int backlog);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int setsockopt_native(int sockfd, int level, int optname, nint optval, int optlen);
+    private static partial int setsockopt(int sockfd, int level, int optname, nint optval, int optlen);
 
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int fcntl_native(int fd, int cmd, int arg);
+    private static partial int fcntl(int fd, int cmd, int arg);
 
     /// <summary>
     /// io_uring_setup syscall wrapper.
@@ -130,19 +130,19 @@ public sealed partial class Linux_arm64 : ILinuxArch
     }
 
     nint ILinuxArch.mmap(nint addr, nuint length, int prot, int flags, int fd, long offset)
-        => mmap_native(addr, length, prot, flags, fd, offset);
+        => mmap(addr, length, prot, flags, fd, offset);
 
     int ILinuxArch.munmap(nint addr, nuint length)
-        => munmap_native(addr, length);
+        => munmap(addr, length);
 
-    int ILinuxArch.close(int fd) => close_native(fd);
+    int ILinuxArch.close(int fd) => close(fd);
 
-    int ILinuxArch.socket(int domain, int type, int protocol) => socket_native(domain, type, protocol);
-    int ILinuxArch.bind(int sockfd, nint addr, int addrlen) => bind_native(sockfd, addr, addrlen);
-    int ILinuxArch.listen(int sockfd, int backlog) => listen_native(sockfd, backlog);
+    int ILinuxArch.socket(int domain, int type, int protocol) => socket(domain, type, protocol);
+    int ILinuxArch.bind(int sockfd, nint addr, int addrlen) => bind(sockfd, addr, addrlen);
+    int ILinuxArch.listen(int sockfd, int backlog) => listen(sockfd, backlog);
     int ILinuxArch.setsockopt(int sockfd, int level, int optname, nint optval, int optlen)
-        => setsockopt_native(sockfd, level, optname, optval, optlen);
-    int ILinuxArch.fcntl(int fd, int cmd, int arg) => fcntl_native(fd, cmd, arg);
+        => setsockopt(sockfd, level, optname, optval, optlen);
+    int ILinuxArch.fcntl(int fd, int cmd, int arg) => fcntl(fd, cmd, arg);
 
     // Raw syscall implementation
     [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
