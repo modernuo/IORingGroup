@@ -33,6 +33,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     private bool _disposed;
 
+    // External buffer tracking (for IORingBuffer/Pool support)
+    private const int MaxExternalBuffers = 16;
+    private readonly nint[] _externalBufferPtrs = new nint[MaxExternalBuffers];
+    private readonly int[] _externalBufferLengths = new int[MaxExternalBuffers];
+    private int _externalBufferCount;
+
     private struct PendingOp
     {
         public byte Opcode;
@@ -459,39 +465,99 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     // =============================================================================
-    // Registered Buffer Operations (Zero-Copy I/O) - Not supported on macOS/kqueue
+    // Registered Buffer Operations
     // =============================================================================
+    // macOS kqueue does not have kernel-level buffer registration like Windows RIO.
+    // However, we track buffers locally and use the pointers directly with send/recv,
+    // providing a consistent API across all platforms.
 
     /// <inheritdoc/>
     /// <remarks>
-    /// macOS kqueue does not support registered buffers.
+    /// Registers a buffer for use with PrepareSendBuffer/PrepareRecvBuffer.
+    /// Unlike Windows RIO, macOS doesn't have kernel-level buffer registration -
+    /// the buffer pointer is tracked locally and used directly with send/recv operations.
     /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int RegisterBuffer(IORingBuffer buffer)
     {
-        throw new NotSupportedException(
-            "Registered buffer operations are not supported on macOS/kqueue.");
+        if (buffer == null)
+            throw new ArgumentNullException(nameof(buffer));
+
+        if (_externalBufferCount >= MaxExternalBuffers)
+            throw new InvalidOperationException($"Maximum of {MaxExternalBuffers} external buffers reached");
+
+        // Find first free slot
+        for (var i = 0; i < MaxExternalBuffers; i++)
+        {
+            if (_externalBufferPtrs[i] == 0)
+            {
+                _externalBufferPtrs[i] = buffer.Pointer;
+                _externalBufferLengths[i] = buffer.VirtualSize;
+                _externalBufferCount++;
+                return i;
+            }
+        }
+
+        throw new InvalidOperationException("No free buffer slots available");
     }
 
     /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void UnregisterBuffer(int bufferId)
     {
-        throw new NotSupportedException(
-            "Registered buffer operations are not supported on macOS/kqueue.");
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            return; // Silently ignore invalid IDs for consistency with other platforms
+
+        if (_externalBufferPtrs[bufferId] != 0)
+        {
+            _externalBufferPtrs[bufferId] = 0;
+            _externalBufferLengths[bufferId] = 0;
+            _externalBufferCount--;
+        }
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Queues a send operation using the registered buffer.
+    /// The connId parameter is the socket file descriptor on macOS.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        throw new NotSupportedException(
-            "Registered buffer operations are not supported on macOS/kqueue.");
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            throw new ArgumentOutOfRangeException(nameof(bufferId));
+
+        var bufPtr = _externalBufferPtrs[bufferId];
+        if (bufPtr == 0)
+            throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+
+        // Use regular send with calculated buffer address
+        PrepareSend(connId, bufPtr + offset, length, MsgFlags.None, userData);
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Queues a receive operation using the registered buffer.
+    /// The connId parameter is the socket file descriptor on macOS.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        throw new NotSupportedException(
-            "Registered buffer operations are not supported on macOS/kqueue.");
+        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+            throw new ArgumentOutOfRangeException(nameof(bufferId));
+
+        var bufPtr = _externalBufferPtrs[bufferId];
+        if (bufPtr == 0)
+            throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+
+        // Use regular recv with calculated buffer address
+        PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
     }
+
+    /// <summary>
+    /// Gets the number of registered external buffers.
+    /// </summary>
+    public int ExternalBufferCount => _externalBufferCount;
 
     private static uint ParseIPv4(string address)
     {

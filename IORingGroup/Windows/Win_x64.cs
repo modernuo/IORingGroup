@@ -51,9 +51,6 @@ public static partial class Win_x64
         public uint Flags;
     }
 
-    [LibraryImport(LibraryName, SetLastError = true)]
-    public static partial nint ioring_create(uint entries);
-
     [LibraryImport(LibraryName)]
     public static partial void ioring_destroy(nint ring);
 
@@ -157,6 +154,20 @@ public static partial class Win_x64
     [LibraryImport(LibraryName)]
     public static partial uint ioring_rio_get_active_connections(nint ring);
 
+    /// <summary>
+    /// Get the socket handle for a connection ID.
+    /// Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid.
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial nint ioring_rio_get_socket(nint ring, int connId);
+
+    /// <summary>
+    /// Create a regular accept socket (can use legacy recv/send, CANNOT use RIO).
+    /// Use this for legacy I/O mode.
+    /// </summary>
+    [LibraryImport(LibraryName)]
+    public static partial nint ioring_create_accept_socket();
+
     // =============================================================================
     // RIO AcceptEx Support (for server-side RIO)
     // =============================================================================
@@ -220,16 +231,6 @@ public static partial class Win_x64
     [LibraryImport(LibraryName)]
     public static partial void ioring_rio_configure_socket(nint socket);
 
-    /// <summary>
-    /// Creates a listener socket with optimal settings (non-RIO mode).
-    /// </summary>
-    /// <param name="bindAddr">IP address to bind to</param>
-    /// <param name="port">Port to listen on</param>
-    /// <param name="backlog">Listen backlog</param>
-    /// <returns>Socket handle or -1 on error</returns>
-    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
-    public static partial nint ioring_create_listener(string bindAddr, ushort port, int backlog);
-
     // =============================================================================
     // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
     // =============================================================================
@@ -289,6 +290,14 @@ public static partial class Win_x64
     /// <returns>Number of registered external buffers</returns>
     [LibraryImport(LibraryName)]
     public static partial uint ioring_rio_get_external_buffer_count(nint ring);
+
+    /// <summary>
+    /// Get the maximum number of external buffers (based on max_connections * 3).
+    /// </summary>
+    /// <param name="ring">Ring handle</param>
+    /// <returns>Maximum number of external buffers</returns>
+    [LibraryImport(LibraryName)]
+    public static partial uint ioring_rio_get_max_external_buffers(nint ring);
 
     // =============================================================================
     // Winsock2 Helpers

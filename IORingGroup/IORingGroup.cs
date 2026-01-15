@@ -16,16 +16,22 @@ public static class IORingGroup
     public const int DefaultQueueSize = 4096;
 
     /// <summary>
+    /// Default maximum connections for Windows RIO mode.
+    /// </summary>
+    public const int DefaultMaxConnections = 1024;
+
+    /// <summary>
     /// Creates an IIORingGroup instance appropriate for the current platform.
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
+    /// <param name="maxConnections">Maximum concurrent connections (Windows RIO only, ignored on other platforms).</param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
-    public static IIORingGroup Create(int queueSize = DefaultQueueSize)
+    public static IIORingGroup Create(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return CreateWindowsRing(queueSize);
+            return CreateWindowsRing(queueSize, maxConnections);
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
@@ -43,10 +49,12 @@ public static class IORingGroup
             $"IORingGroup is not supported on platform: {RuntimeInformation.OSDescription}");
     }
 
-    private static IIORingGroup CreateWindowsRing(int queueSize)
+    private static IIORingGroup CreateWindowsRing(int queueSize, int maxConnections)
     {
-        // Windows implementation uses ioring.dll which handles IoRing/RIO selection
-        return new Windows.WindowsIORingGroup(queueSize);
+        // Windows uses RIO (Registered I/O) for high-performance socket I/O with zero-copy buffers.
+        // Buffer sizes are unused (external buffers are managed via IORingBufferPool).
+        const int unusedBufferSize = 4096;
+        return new Windows.WindowsRIOGroup(queueSize, maxConnections, unusedBufferSize, unusedBufferSize);
     }
 
     private static IIORingGroup CreateLinuxRing(int queueSize)

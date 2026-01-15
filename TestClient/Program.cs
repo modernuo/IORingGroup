@@ -243,25 +243,55 @@ public class Program
             {
                 using var client = new TcpClient();
                 client.NoDelay = true;
+                client.SendBufferSize = 65536;
+                client.ReceiveBufferSize = 65536;
                 // Set SO_LINGER to 0 to avoid TIME_WAIT accumulation
                 client.LingerState = new LingerOption(true, 0);
                 await client.ConnectAsync(host, port);
 
                 using var stream = client.GetStream();
-                var buffer = new byte[4096];
                 var message = $"Benchmark message from connection {connectionId:D4}";
                 var data = Encoding.UTF8.GetBytes(message);
 
-                for (var i = 0; i < messageCount; i++)
+                // Pipelined I/O: send and receive concurrently
+                long bytesSent = 0;
+                long bytesReceived = 0;
+                long messagesReceived = 0;
+
+                // Sender task - sends all messages as fast as possible
+                var sendTask = Task.Run(async () =>
                 {
-                    await stream.WriteAsync(data);
-                    result.Bytes += data.Length;
+                    for (var i = 0; i < messageCount; i++)
+                    {
+                        await stream.WriteAsync(data);
+                        Interlocked.Add(ref bytesSent, data.Length);
+                    }
+                    // Signal end of sending by shutting down the send side
+                    // (Don't shutdown - server needs to keep receiving)
+                });
 
-                    var bytesRead = await stream.ReadAsync(buffer);
-                    result.Bytes += bytesRead;
-                    result.Messages++;
-                }
+                // Receiver task - receives all responses as fast as possible
+                var recvTask = Task.Run(async () =>
+                {
+                    var buffer = new byte[65536];  // Larger buffer for batched reads
+                    var totalExpected = messageCount * data.Length;
+                    long totalReceived = 0;
 
+                    while (totalReceived < totalExpected)
+                    {
+                        var bytesRead = await stream.ReadAsync(buffer);
+                        if (bytesRead == 0) break;  // Connection closed
+                        totalReceived += bytesRead;
+                        Interlocked.Add(ref bytesReceived, bytesRead);
+                        // Count complete messages (approximate - assumes no partial messages)
+                        Interlocked.Add(ref messagesReceived, bytesRead / data.Length);
+                    }
+                });
+
+                await Task.WhenAll(sendTask, recvTask);
+
+                result.Bytes = bytesSent + bytesReceived;
+                result.Messages = messagesReceived;
                 result.Success = true;
                 return result;
             }

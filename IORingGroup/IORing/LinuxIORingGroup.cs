@@ -556,6 +556,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
     }
 
+    /// <summary>
+    /// Gets the number of registered external buffers.
+    /// </summary>
+    public int ExternalBufferCount => _externalBufferCount;
+
     private static uint ParseIPv4(string address)
     {
         if (address == "0.0.0.0") return 0; // INADDR_ANY

@@ -86,11 +86,10 @@ typedef enum ioring_backend {
 } ioring_backend_t;
 
 // =============================================================================
-// LEGACY API (synchronous fallback, for compatibility)
+// Core API
 // =============================================================================
 
-// Create/destroy ring (legacy - no RIO buffer registration)
-IORING_API ioring_t* ioring_create(uint32_t entries);
+// Destroy a ring created by ioring_create_rio_ex()
 IORING_API void ioring_destroy(ioring_t* ring);
 
 // Get backend type
@@ -186,6 +185,16 @@ IORING_API int ioring_is_rio(ioring_t* ring);
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
 
+// Get the socket handle for a connection ID
+// Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid
+IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id);
+
+// DEPRECATED: Creates a socket without WSA_FLAG_REGISTERED_IO.
+// Such sockets cannot use RIO operations.
+// Use ioring_rio_create_accept_socket() or let the ring's AcceptEx pool create sockets.
+// Kept for API compatibility only.
+IORING_API SOCKET ioring_create_accept_socket(void);
+
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
 // =============================================================================
@@ -258,14 +267,6 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
 // Configure an accepted socket with optimal settings (TCP_NODELAY, non-blocking, etc.)
 // Call this on sockets from accept completions if not using PrepareAccept
 IORING_API void ioring_rio_configure_socket(SOCKET socket);
-
-// Create a listener socket with optimal settings (non-RIO mode)
-// Uses standard socket (not WSA_FLAG_REGISTERED_IO) for non-RIO use cases
-IORING_API SOCKET ioring_create_listener(
-    const char* bind_addr,
-    uint16_t port,
-    int backlog
-);
 
 // =============================================================================
 // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
@@ -353,6 +354,9 @@ IORING_API void ioring_prep_recv_external(
 
 // Get the number of registered external buffers
 IORING_API uint32_t ioring_rio_get_external_buffer_count(ioring_t* ring);
+
+// Get the maximum number of external buffers (based on max_connections * 3)
+IORING_API uint32_t ioring_rio_get_max_external_buffers(ioring_t* ring);
 
 #ifdef __cplusplus
 }
