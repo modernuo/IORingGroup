@@ -52,9 +52,7 @@ public static class IORingGroup
     private static IIORingGroup CreateWindowsRing(int queueSize, int maxConnections)
     {
         // Windows uses RIO (Registered I/O) for high-performance socket I/O with zero-copy buffers.
-        // Buffer sizes are unused (external buffers are managed via IORingBufferPool).
-        const int unusedBufferSize = 4096;
-        return new Windows.WindowsRIOGroup(queueSize, maxConnections, unusedBufferSize, unusedBufferSize);
+        return new Windows.WindowsRIOGroup(queueSize, maxConnections);
     }
 
     private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)

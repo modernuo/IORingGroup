@@ -585,9 +585,7 @@ IIORingGroup ring = IORingGroup.Create(queueSize: 4096);
 // Windows-specific: RIO ring with connection tracking
 WindowsRIOGroup rioRing = new WindowsRIOGroup(
     queueSize: 8192,
-    maxConnections: 10000,
-    recvBufferSize: 4096,  // unused, retained for API compat
-    sendBufferSize: 4096   // unused, retained for API compat
+    maxConnections: 10000
 );
 ```
 

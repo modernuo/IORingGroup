@@ -194,9 +194,7 @@ public class Program
                 // On Windows, use WindowsRIOGroup for full RIO support
                 ring = new WindowsRIOGroup(
                     queueSize: MaxClients,
-                    maxConnections: MaxClients,
-                    recvBufferSize: BufferSize,
-                    sendBufferSize: BufferSize
+                    maxConnections: MaxClients
                 );
                 Console.WriteLine($"Windows RIO ring created: MaxConnections={MaxClients}");
             }

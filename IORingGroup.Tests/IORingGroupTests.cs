@@ -202,7 +202,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Create connected socket pair
             using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -253,14 +253,10 @@ public class WindowsRIOGroupTests
 
         using var ring = new System.Network.Windows.WindowsRIOGroup(
             queueSize: 256,
-            maxConnections: MaxConnections,
-            recvBufferSize: BufferSize,
-            sendBufferSize: BufferSize
+            maxConnections: MaxConnections
         );
 
         Assert.NotNull(ring);
-        Assert.Equal(BufferSize, ring.RecvBufferSize);
-        Assert.Equal(BufferSize, ring.SendBufferSize);
     }
 
     [SkippableFact]
@@ -271,8 +267,6 @@ public class WindowsRIOGroupTests
         using var ring = new System.Network.Windows.WindowsRIOGroup(
             queueSize: 256,
             maxConnections: MaxConnections,
-            recvBufferSize: BufferSize,
-            sendBufferSize: BufferSize,
             outstandingPerSocket: 4
         );
 
@@ -285,10 +279,10 @@ public class WindowsRIOGroupTests
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize, 0));
+            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, 0));
 
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize, 100));
+            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, 100));
     }
 
     [SkippableFact]
@@ -297,7 +291,7 @@ public class WindowsRIOGroupTests
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
         Assert.Throws<ArgumentException>(() =>
-            new System.Network.Windows.WindowsRIOGroup(100, MaxConnections, BufferSize, BufferSize));
+            new System.Network.Windows.WindowsRIOGroup(100, MaxConnections));
     }
 
     [SkippableFact]
@@ -305,7 +299,7 @@ public class WindowsRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
         // Create connected socket pair
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -338,7 +332,7 @@ public class WindowsRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
@@ -390,7 +384,7 @@ public class WindowsRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+        var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
         ring.Dispose();
         ring.Dispose(); // Should not throw
     }
@@ -400,7 +394,7 @@ public class WindowsRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
         // Create a socket for poll operation
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -425,7 +419,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Use library-owned listener with WSA_FLAG_REGISTERED_IO
             const ushort testPort = 0;  // Let OS assign port
@@ -581,7 +575,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Create a pre-allocated socket with WSA_FLAG_REGISTERED_IO
             var acceptSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
@@ -654,7 +648,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Create a simple server using regular .NET sockets
             using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -748,7 +742,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
             using var buffer = IORingBuffer.Create(64 * 1024);
 
             var bufferId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
@@ -782,7 +776,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
             using var buffer1 = IORingBuffer.Create(64 * 1024);
             using var buffer2 = IORingBuffer.Create(64 * 1024);
             using var buffer3 = IORingBuffer.Create(64 * 1024);
@@ -824,7 +818,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Should not throw for invalid IDs
             ring.UnregisterExternalBuffer(-1);
@@ -850,7 +844,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
             Assert.Equal(0, ring.ExternalBufferCount);
         }
         catch (InvalidOperationException ex)
@@ -874,7 +868,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Create an IORingBuffer for zero-copy sends
             using var buffer = IORingBuffer.Create(64 * 1024);
@@ -978,7 +972,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
             using var buffer = IORingBuffer.Create(64 * 1024);
 
             var extBufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
@@ -1069,7 +1063,7 @@ public class WindowsRIOGroupTests
 
         try
         {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
 
             // Use a small buffer to force wrap-around
             var pageSize = Environment.SystemPageSize;

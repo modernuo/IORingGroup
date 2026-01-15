@@ -723,13 +723,8 @@ IORING_API int ioring_get_last_error(void) {
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
     uint32_t max_connections,
-    uint32_t recv_buffer_size,      // Unused - buffers now managed externally
-    uint32_t send_buffer_size,      // Unused - buffers now managed externally
     uint32_t outstanding_per_socket
 ) {
-    (void)recv_buffer_size;  // Suppress unused warning
-    (void)send_buffer_size;  // Suppress unused warning
-
     if (!init_rio()) {
         last_error = ERROR_NOT_SUPPORTED;
         return NULL;

@@ -137,9 +137,7 @@ IORING_API int ioring_get_last_error(void);
  * 6. Unregister socket before closing with ioring_rio_unregister()
  * 7. Destroy ring with ioring_destroy()
  *
- * NOTE: Buffers are now managed externally (e.g., via IORingBufferPool in C#).
- * The recv_buffer_size and send_buffer_size parameters are retained for
- * API compatibility but are unused.
+ * NOTE: Buffers are managed externally (e.g., via IORingBufferPool in C#).
  */
 
 // Create ring with RIO support
@@ -147,12 +145,9 @@ IORING_API int ioring_get_last_error(void);
 //   Default is 2 (enough for request-response patterns like echo)
 //   Higher values (4-8) for pipelined protocols
 //   CQ is auto-sized to max_connections * outstanding_per_socket * 2
-// NOTE: recv_buffer_size and send_buffer_size are unused (buffers managed externally)
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
     uint32_t max_connections,
-    uint32_t recv_buffer_size,
-    uint32_t send_buffer_size,
     uint32_t outstanding_per_socket
 );
 

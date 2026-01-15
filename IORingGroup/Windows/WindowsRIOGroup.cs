@@ -26,15 +26,12 @@ namespace System.Network.Windows;
 /// can be directly registered with RegisterSocket().
 /// </para>
 /// <para>
-/// <b>Note:</b> Buffers are now managed externally via IORingBufferPool. The recv_buffer_size
-/// and send_buffer_size constructor parameters are retained for API compatibility but unused.
+/// <b>Note:</b> Buffers are managed externally via IORingBufferPool.
 /// </para>
 /// </remarks>
 public sealed class WindowsRIOGroup : IIORingGroup
 {
     private readonly nint _ring;
-    private readonly int _recvBufferSize;
-    private readonly int _sendBufferSize;
     private bool _disposed;
 
     // Pre-allocated CQE buffer for marshalling
@@ -58,31 +55,27 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public nint Handle => _ring;
 
     /// <summary>
-    /// Creates a new RIO ring with pre-allocated buffer pool.
+    /// Creates a new RIO ring.
     /// </summary>
     /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
     /// <param name="maxConnections">Maximum concurrent connections</param>
-    /// <param name="recvBufferSize">Receive buffer size per connection</param>
-    /// <param name="sendBufferSize">Send buffer size per connection</param>
-    public WindowsRIOGroup(int queueSize, int maxConnections, int recvBufferSize, int sendBufferSize)
-        : this(queueSize, maxConnections, recvBufferSize, sendBufferSize, DefaultOutstandingPerSocket)
+    public WindowsRIOGroup(int queueSize, int maxConnections)
+        : this(queueSize, maxConnections, DefaultOutstandingPerSocket)
     {
     }
 
     /// <summary>
-    /// Creates a new RIO ring with pre-allocated buffer pool and configurable outstanding operations.
+    /// Creates a new RIO ring with configurable outstanding operations.
     /// </summary>
     /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
     /// <param name="maxConnections">Maximum concurrent connections</param>
-    /// <param name="recvBufferSize">Receive buffer size per connection</param>
-    /// <param name="sendBufferSize">Send buffer size per connection</param>
     /// <param name="outstandingPerSocket">Max outstanding ops per direction per socket (1-16, default 2)</param>
     /// <remarks>
     /// The completion queue is auto-sized to: maxConnections * outstandingPerSocket * 2.
     /// For simple request-response patterns (like echo), use 1-2.
     /// For pipelined protocols, use 4-8.
     /// </remarks>
-    public WindowsRIOGroup(int queueSize, int maxConnections, int recvBufferSize, int sendBufferSize, int outstandingPerSocket)
+    public WindowsRIOGroup(int queueSize, int maxConnections, int outstandingPerSocket)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
@@ -95,11 +88,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
                 $"Must be between 1 and {MaxOutstandingPerSocket}");
         }
 
-        _recvBufferSize = recvBufferSize;
-        _sendBufferSize = sendBufferSize;
-
-        _ring = Win_x64.ioring_create_rio_ex((uint)queueSize, (uint)maxConnections,
-            (uint)recvBufferSize, (uint)sendBufferSize, (uint)outstandingPerSocket);
+        _ring = Win_x64.ioring_create_rio_ex((uint)queueSize, (uint)maxConnections, (uint)outstandingPerSocket);
 
         if (_ring == 0)
         {
@@ -124,16 +113,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// with the connection ID directly.
     /// </remarks>
     public nint GetSocket(int connId) => Win_x64.ioring_rio_get_socket(_ring, connId);
-
-    /// <summary>
-    /// Gets the receive buffer size per connection.
-    /// </summary>
-    public int RecvBufferSize => _recvBufferSize;
-
-    /// <summary>
-    /// Gets the send buffer size per connection (unused - buffers managed externally).
-    /// </summary>
-    public int SendBufferSize => _sendBufferSize;
 
     /// <inheritdoc/>
     public int SubmissionQueueSpace => (int)Win_x64.ioring_sq_space_left(_ring);
