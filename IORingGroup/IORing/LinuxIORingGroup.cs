@@ -340,22 +340,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         if (toSubmit == 0) return 0;
 
-        // Console.WriteLine($"[URING] Submit: head={head} tail={tail} toSubmit={toSubmit}");
-        for (uint i = 0; i < toSubmit && i < 10; i++) // Limit to first 10 for readability
-        {
-            var index = (head + i) & _sqMask;
-            var sqeIdx = _sqArray[index];
-            var sqe = &_sqes[sqeIdx];
-            // Console.WriteLine($"[URING]   SQE[{i}]: sqeIdx={sqeIdx} opcode={sqe->opcode} fd={sqe->fd} userData=0x{sqe->user_data:X}");
-        }
-        // if (toSubmit > 10) Console.WriteLine($"[URING]   ... and {toSubmit - 10} more SQEs");
-
         // Release store: ensures all SQE writes are visible before kernel sees new tail
         Volatile.Write(ref *_sqTail, tail);
 
-        var ret = _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
-        // Console.WriteLine($"[URING] io_uring_enter returned: {ret}");
-        return ret;
+        return _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
     }
 
     /// <inheritdoc/>
@@ -383,13 +371,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         var count = Math.Min((int)available, completions.Length);
 
-        // Console.WriteLine($"[URING] PeekCompletions: head={head} tail={tail} available={available} count={count} mask=0x{_cqMask:X}");
-
         for (var i = 0; i < count; i++)
         {
             var index = (head + (uint)i) & _cqMask;
             ref var cqe = ref _cqes[index];
-            // Console.WriteLine($"[URING]   CQE[{i}]: index={index} userData=0x{cqe.user_data:X} res={cqe.res}");
             completions[i] = new Completion(cqe.user_data, cqe.res, (CompletionFlags)cqe.flags);
         }
 
@@ -415,10 +400,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AdvanceCompletionQueue(int count)
     {
-        var oldHead = *_cqHead;
-        var newHead = oldHead + (uint)count;
-        // Console.WriteLine($"[URING] AdvanceCompletionQueue: count={count} oldHead={oldHead} newHead={newHead}");
-        Volatile.Write(ref *_cqHead, newHead);
+        Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
     }
 
     // =============================================================================

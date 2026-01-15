@@ -153,10 +153,16 @@ public class Program
             backend = ServerBackend.PollGroup;
         }
 
+        // Darwin/macOS: kqueue is synchronous like epoll, fall back to PollGroup
+        if (backend == ServerBackend.IORing &&
+            (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD)))
+        {
+            Console.WriteLine("Darwin/BSD detected, falling back to PollGroup (kqueue)...");
+            backend = ServerBackend.PollGroup;
+        }
+
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
-        Console.WriteLine($"io_uring available: {IORingGroup.IsIOUringAvailable}");
-        Console.WriteLine($"Epoll fallback: {IORingGroup.IsUsingEpollFallback}");
         Console.WriteLine($"Backend: {backend}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
@@ -317,17 +323,6 @@ public class Program
 
             for (var i = 0; i < count; i++)
             {
-                var cqe = completions[i];
-                // var op = cqe.UserData & OpMask;
-                // var idx = (long)(cqe.UserData & IndexMask);
-                // var opName = op switch
-                // {
-                //     OpAccept => "Accept",
-                //     OpRecv => "Recv",
-                //     OpSend => "Send",
-                //     _ => $"Unknown(0x{op >> 56:X})"
-                // };
-                // Console.WriteLine($"[DEBUG] CQE: op={opName} seq/idx={idx} result={cqe.Result} (listener={listener}) userData=0x{cqe.UserData:X16}");
                 ProcessCompletion(ring, rioRing, listener, ref completions[i], benchmarkMode);
             }
 
@@ -389,14 +384,11 @@ public class Program
             goto ReplenishAccepts;
         }
 
-        // Console.WriteLine($"[DEBUG] Accept result: {result}");
-
         if (result >= 0)
         {
             // Result is socket handle
             var clientSocket = (nint)result;
             var clientIndex = FindFreeSlot();
-            // Console.WriteLine($"[DEBUG] Accept: socket={clientSocket}, clientIndex={clientIndex}");
 
             if (clientIndex >= 0)
             {
@@ -467,8 +459,6 @@ public class Program
                 var availableSpace = client.Buffer.WritableBytes;
                 if (availableSpace > 0)
                 {
-                    // if (!_quietMode)
-                        // Console.WriteLine($"[DEBUG] Posting recv: fd={client.ConnId}, bufferId={client.Buffer.BufferId}, offset={writeOffset}, len={availableSpace}, bufPtr=0x{client.Buffer.Pointer:X}");
                     ring.PrepareRecvBuffer(
                         client.ConnId,
                         client.Buffer.BufferId,
@@ -506,8 +496,6 @@ public class Program
 
         if (result <= 0)
         {
-            // if (!_quietMode)
-                // Console.WriteLine($"[DEBUG] Recv result on client {index}: {result} {(result < 0 ? $"(errno={-result})" : "(EOF)")}");
             CloseClient(ring, rioRing, index);
             return;
         }

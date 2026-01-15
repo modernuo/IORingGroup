@@ -23,24 +23,6 @@ public static partial class Win_x64
     }
 
     /// <summary>
-    /// Submission queue entry structure matching C ioring_sqe_t.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct IORingSqe
-    {
-        public byte Opcode;
-        public byte Flags;
-        public ushort IoPrio;
-        public int Fd;
-        public ulong Off;
-        public ulong Addr;
-        public uint Len;
-        public uint OpFlags;  // Union: poll_events, msg_flags, accept_flags
-        public ulong UserData;
-        public ulong Addr3;
-    }
-
-    /// <summary>
     /// Completion queue entry structure matching C ioring_cqe_t.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
@@ -328,7 +310,7 @@ public static partial class Win_x64
     /// Set the last Winsock error.
     /// </summary>
     [LibraryImport("ws2_32.dll")]
-    public static partial void WSASetLastError(int iError);
+    internal static partial void WSASetLastError(int iError);
 
     /// <summary>
     /// Poll events.
@@ -353,7 +335,7 @@ public static partial class Win_x64
     /// Get the last Winsock error.
     /// </summary>
     [LibraryImport("ws2_32.dll")]
-    public static partial int WSAGetLastError();
+    internal static partial int WSAGetLastError();
 
     /// <summary>
     /// Get socket option (simplified for SO_TYPE check).

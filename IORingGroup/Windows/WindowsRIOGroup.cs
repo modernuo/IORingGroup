@@ -33,7 +33,6 @@ namespace System.Network.Windows;
 public sealed class WindowsRIOGroup : IIORingGroup
 {
     private readonly nint _ring;
-    private readonly int _queueSize;
     private readonly int _maxConnections;
     private readonly int _recvBufferSize;
     private readonly int _sendBufferSize;
@@ -97,7 +96,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
                 $"Must be between 1 and {MaxOutstandingPerSocket}");
         }
 
-        _queueSize = queueSize;
         _maxConnections = maxConnections;
         _recvBufferSize = recvBufferSize;
         _sendBufferSize = sendBufferSize;
