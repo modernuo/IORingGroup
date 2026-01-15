@@ -72,15 +72,7 @@ public static class IORingGroup
             return new IORing.LinuxIORingGroup(ioUringArch, queueSize, maxConnections);
         }
 
-        // Fall back to epoll
-        EPoll.ILinuxEpollArch epollArch = RuntimeInformation.ProcessArchitecture switch
-        {
-            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6
-                => EPoll.Architectures.LinuxEpoll_arm64.Instance,
-            _ => EPoll.Architectures.LinuxEpoll_x64.Instance,
-        };
-
-        return new EPoll.LinuxEpollGroup(epollArch, queueSize, maxConnections);
+        throw new InvalidOperationException("io_uring is not available (blocked by seccomp or kernel too old)");
     }
 
     private static IIORingGroup CreateDarwinRing(int queueSize, int maxConnections)
@@ -96,82 +88,6 @@ public static class IORingGroup
         RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
         RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
         RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD);
-
-    /// <summary>
-    /// Checks if Linux io_uring is available and functional.
-    /// Returns false on non-Linux platforms, or if io_uring is blocked by seccomp/security policy.
-    /// </summary>
-    public static bool IsIOUringAvailable
-    {
-        get
-        {
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return false;
-
-            IORing.ILinuxArch arch = RuntimeInformation.ProcessArchitecture switch
-            {
-                Architecture.Arm or Architecture.Arm64 or Architecture.Armv6
-                    => IORing.Architectures.Linux_arm64.Instance,
-                _ => IORing.Architectures.Linux_x64.Instance,
-            };
-
-            return IORing.LinuxIORingGroup.IsAvailable(arch);
-        }
-    }
-
-    /// <summary>
-    /// Returns true if Linux epoll fallback is being used (io_uring not available).
-    /// </summary>
-    public static bool IsUsingEpollFallback =>
-        RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && !IsIOUringAvailable;
-
-    /// <summary>
-    /// Creates a Linux io_uring implementation. Throws if io_uring is not available.
-    /// </summary>
-    /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
-    /// <param name="maxConnections">Maximum concurrent connections.</param>
-    /// <returns>Linux io_uring IIORingGroup implementation.</returns>
-    /// <exception cref="PlatformNotSupportedException">Thrown if not running on Linux.</exception>
-    /// <exception cref="InvalidOperationException">Thrown if io_uring is blocked by seccomp or kernel.</exception>
-    public static IIORingGroup CreateLinuxIOUring(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            throw new PlatformNotSupportedException("io_uring requires Linux");
-
-        IORing.ILinuxArch arch = RuntimeInformation.ProcessArchitecture switch
-        {
-            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6
-                => IORing.Architectures.Linux_arm64.Instance,
-            _ => IORing.Architectures.Linux_x64.Instance,
-        };
-
-        if (!IORing.LinuxIORingGroup.IsAvailable(arch))
-            throw new InvalidOperationException("io_uring is not available (blocked by seccomp or kernel too old)");
-
-        return new IORing.LinuxIORingGroup(arch, queueSize, maxConnections);
-    }
-
-    /// <summary>
-    /// Creates a Linux epoll implementation. Always available on Linux.
-    /// </summary>
-    /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
-    /// <param name="maxConnections">Maximum concurrent connections.</param>
-    /// <returns>Linux epoll IIORingGroup implementation.</returns>
-    /// <exception cref="PlatformNotSupportedException">Thrown if not running on Linux.</exception>
-    public static IIORingGroup CreateLinuxEpoll(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            throw new PlatformNotSupportedException("epoll requires Linux");
-
-        EPoll.ILinuxEpollArch arch = RuntimeInformation.ProcessArchitecture switch
-        {
-            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6
-                => EPoll.Architectures.LinuxEpoll_arm64.Instance,
-            _ => EPoll.Architectures.LinuxEpoll_x64.Instance,
-        };
-
-        return new EPoll.LinuxEpollGroup(arch, queueSize, maxConnections);
-    }
 
     /// <summary>
     /// Returns true if this is a power of 2 (used to validate queue size).

@@ -146,13 +146,6 @@ public class Program
             }
         }
 
-        // If io_uring is not available on Linux, fall back to PollGroup which handles epoll properly
-        if (backend == ServerBackend.IORing && IORingGroup.IsUsingEpollFallback)
-        {
-            Console.WriteLine("io_uring not available, falling back to PollGroup (epoll)...");
-            backend = ServerBackend.PollGroup;
-        }
-
         // Darwin/macOS: kqueue is synchronous like epoll, fall back to PollGroup
         if (backend == ServerBackend.IORing &&
             (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD)))
@@ -212,8 +205,7 @@ public class Program
                 // On Linux/macOS, use IORingGroup.Create() for native io_uring/kqueue/epoll
                 ring = IORingGroup.Create(queueSize: MaxClients);
                 var backendName = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-                    ? (IORingGroup.IsIOUringAvailable ? "io_uring" : "epoll")
-                    : "kqueue";
+                    ? "io_uring" : "kqueue";
                 Console.WriteLine($"IORing created (native {backendName})");
             }
 
