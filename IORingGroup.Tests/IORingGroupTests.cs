@@ -2,7 +2,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Network;
-using TestServer;
 
 namespace IORingGroup.Tests;
 
@@ -132,29 +131,29 @@ public class IORingGroupTests
     }
 }
 
-public class WindowsIORingGroupTests
+public class WindowsFactoryTests
 {
     [SkippableFact]
-    public void Backend_ReturnsValidValue()
+    public void Factory_ReturnsWindowsRIOGroup()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
         Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
 
         using var ring = System.Network.IORingGroup.Create();
-        if (ring is System.Network.Windows.WindowsIORingGroup winRing)
-        {
-            var backend = winRing.Backend;
-            Assert.True(
-                backend == System.Network.Windows.Win_x64.IORingBackend.IoRing ||
-                backend == System.Network.Windows.Win_x64.IORingBackend.RIO
-            );
-        }
+        Assert.IsType<System.Network.Windows.WindowsRIOGroup>(ring);
+
+        var rioRing = (System.Network.Windows.WindowsRIOGroup)ring;
+        Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, rioRing.Backend);
     }
 
     [SkippableFact]
     public void SendRecv_WithConnectedSockets_Works()
     {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+        // Legacy PrepareSend/PrepareRecv is not supported in RIO mode.
+        // RIO requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead.
+        Skip.If(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+            "Windows RIO mode requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead of PrepareSend/PrepareRecv.");
+
         Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
 
         using var ring = System.Network.IORingGroup.Create(256);
@@ -174,7 +173,9 @@ public class WindowsIORingGroupTests
         {
             fixed (byte* pSend = sendBuffer)
             {
+#pragma warning disable CS0618 // Type or member is obsolete
                 ring.PrepareSend(client.Handle, (nint)pSend, sendBuffer.Length, MsgFlags.None, 1);
+#pragma warning restore CS0618
             }
         }
         ring.Submit();
@@ -472,98 +473,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void SendRecv_WithPinnedBuffers_EchoWorks()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-
-        // Create connected socket pair
-        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        listener.Listen(1);
-        var endpoint = (IPEndPoint)listener.LocalEndPoint!;
-
-        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        client.Connect(endpoint);
-
-        using var server = listener.Accept();
-        server.Blocking = false;
-
-        // Register server socket with RIO
-        var connId = ring.RegisterSocket(server.Handle);
-        if (connId < 0)
-        {
-            var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-            Skip.If(error == 10045, "RIOCreateRequestQueue failed with WSAEOPNOTSUPP - rebuild ioring.dll");
-        }
-        Assert.True(connId >= 0, $"RegisterSocket failed: {System.Network.Windows.Win_x64.ioring_get_last_error()}");
-
-        // Send data from client
-        var testData = "Hello, RIO!"u8.ToArray();
-        client.Send(testData);
-
-        // Use pinned buffers for RIO operations
-        var recvBuffer = new byte[BufferSize];
-        var sendBuffer = new byte[BufferSize];
-
-        // Receive using pinned buffer
-        const ulong recvUserData = 1;
-        unsafe
-        {
-            fixed (byte* pRecv = recvBuffer)
-            {
-                ring.PrepareRecv(connId, (nint)pRecv, BufferSize, MsgFlags.None, recvUserData);
-            }
-        }
-        ring.Submit();
-
-        // Wait for completion
-        Span<Completion> completions = stackalloc Completion[16];
-        var count = ring.WaitCompletions(completions, 1, 1000);
-
-        Assert.True(count > 0, "No completion received");
-        Assert.Equal(recvUserData, completions[0].UserData);
-        Assert.Equal(testData.Length, completions[0].Result);
-
-        ring.AdvanceCompletionQueue(count);
-
-        // Verify received data
-        Assert.True(recvBuffer.AsSpan(0, testData.Length).SequenceEqual(testData));
-
-        // Copy to send buffer and echo back
-        recvBuffer.AsSpan(0, testData.Length).CopyTo(sendBuffer);
-
-        // Send echo using pinned buffer
-        const ulong sendUserData = 2;
-        unsafe
-        {
-            fixed (byte* pSend = sendBuffer)
-            {
-                ring.PrepareSend(connId, (nint)pSend, testData.Length, MsgFlags.None, sendUserData);
-            }
-        }
-        ring.Submit();
-
-        // Wait for send completion
-        count = ring.WaitCompletions(completions, 1, 1000);
-        Assert.True(count > 0, "No send completion received");
-        Assert.Equal(sendUserData, completions[0].UserData);
-        Assert.True(completions[0].Result > 0, $"Send failed with result {completions[0].Result}");
-
-        ring.AdvanceCompletionQueue(count);
-
-        // Receive echo on client
-        var echoBuffer = new byte[testData.Length];
-        var received = client.Receive(echoBuffer);
-
-        Assert.Equal(testData.Length, received);
-        Assert.Equal(testData, echoBuffer);
-
-        ring.UnregisterSocket(connId);
-    }
-
-    [SkippableFact]
     public void Dispose_MultipleTimes_DoesNotThrow()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -580,41 +489,17 @@ public class WindowsRIOGroupTests
 
         using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-        // Create and register a socket
+        // Create a socket for poll operation
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
-        var endpoint = (IPEndPoint)listener.LocalEndPoint!;
-
-        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        client.Connect(endpoint);
-
-        using var server = listener.Accept();
-        server.Blocking = false;
-
-        var connId = ring.RegisterSocket(server.Handle);
-        if (connId < 0)
-        {
-            var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-            Skip.If(error == 10045, "RIOCreateRequestQueue failed with WSAEOPNOTSUPP - rebuild ioring.dll");
-        }
-        Assert.True(connId >= 0);
 
         var initialSpace = ring.SubmissionQueueSpace;
 
-        // Use pinned buffer with PrepareRecv instead of PrepareRecvRegistered
-        var recvBuffer = new byte[BufferSize];
-        unsafe
-        {
-            fixed (byte* pRecv = recvBuffer)
-            {
-                ring.PrepareRecv(connId, (nint)pRecv, BufferSize, MsgFlags.None, 1);
-            }
-        }
+        // Use poll operation (doesn't require external buffers)
+        ring.PreparePollAdd(listener.Handle, PollMask.In, 1);
 
         Assert.Equal(initialSpace - 1, ring.SubmissionQueueSpace);
-
-        ring.UnregisterSocket(connId);
     }
 
     [SkippableFact]
@@ -663,12 +548,7 @@ public class WindowsRIOGroupTests
         {
             var acceptExPtr = System.Network.Windows.WindowsRIOGroup.GetAcceptEx();
 
-            if (acceptExPtr == 0)
-            {
-                var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                Skip.If(true, $"GetAcceptEx failed with error {error}");
-            }
-
+            // Should succeed - the function creates a temp socket if none provided
             Assert.NotEqual(nint.Zero, acceptExPtr);
         }
         catch (EntryPointNotFoundException)
@@ -737,48 +617,40 @@ public class WindowsRIOGroupTests
             Assert.True(count > 0, "No accept completion received - AcceptEx may not be working");
             Assert.Equal(acceptUserData, completions[0].UserData);
 
-            // The result should be a valid socket handle
-            // NOTE: Result is int32 but socket handles on x64 can be larger - check for truncation
-            var rawResult = completions[0].Result;
-            var acceptedSocket = (nint)rawResult;
-
-            // Diagnostic: Output raw values to detect truncation
-            // If the socket handle is > INT32_MAX, it would be negative after cast
-            Assert.True(rawResult > 0, $"Accept returned invalid socket (raw int32): {rawResult}. " +
-                $"This could indicate socket handle truncation if the value was > 2^31.");
-            Assert.True(acceptedSocket > 0, $"Accept returned invalid socket (nint): {acceptedSocket}");
+            // Result is the socket handle (RQ is NOT created automatically)
+            var acceptedSocket = (nint)completions[0].Result;
+            Assert.True(acceptedSocket > 0, $"Accept returned invalid socket: {acceptedSocket}");
 
             ring.AdvanceCompletionQueue(count);
 
-            // NOTE: RIO sockets (created with WSA_FLAG_REGISTERED_IO) cannot use regular
-            // Winsock recv/send - they can ONLY use RIO operations (RIOReceive/RIOSend).
-            // This is by design - RIO bypasses the normal Winsock stack entirely.
-
-            // Now register the accepted socket with RIO - this should work because
-            // PrepareAccept used AcceptEx with a pre-created WSA_FLAG_REGISTERED_IO socket
+            // Try to register the socket with RIO
+            // NOTE: AcceptEx now creates sockets WITHOUT WSA_FLAG_REGISTERED_IO for legacy compatibility.
+            // This means RegisterSocket will FAIL with WSAEOPNOTSUPP (10045).
+            // For server-side RIO, users must create accept sockets manually with CreateAcceptSocket().
             var connId = ring.RegisterSocket(acceptedSocket);
-
             if (connId < 0)
             {
                 var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                // If this still fails with 10045, the DLL needs to be rebuilt
-                Skip.If(error == 10045, "RegisterSocket still failing - rebuild ioring.dll with AcceptEx pool support");
-                Assert.Fail($"RegisterSocket failed with error {error}");
+                // Expected: AcceptEx sockets don't have WSA_FLAG_REGISTERED_IO, so RIO won't work
+                Skip.If(error == 10045,
+                    "RegisterSocket failed with WSAEOPNOTSUPP - expected behavior. " +
+                    "AcceptEx creates regular sockets for legacy compatibility. " +
+                    "For server-side RIO, create accept sockets manually with CreateAcceptSocket().");
+                Assert.Fail($"RegisterSocket failed with unexpected error {error}");
             }
-
             Assert.True(connId >= 0, $"RegisterSocket failed");
 
-            // RIO requires pre-registered buffers - use external buffer API with Pipe
-            using var recvPipe = new Pipe(64 * 1024);
-            using var sendPipe = new Pipe(64 * 1024);
+            // RIO requires pre-registered buffers - use external buffer API with IORingBuffer
+            using var recvBuffer = IORingBuffer.Create(64 * 1024);
+            using var sendBuffer = IORingBuffer.Create(64 * 1024);
 
-            var recvBufId = ring.RegisterExternalBuffer(recvPipe.GetBufferPointer(), recvPipe.GetVirtualSize());
+            var recvBufId = ring.RegisterExternalBuffer(recvBuffer.Pointer, (uint)recvBuffer.VirtualSize);
             Skip.If(recvBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
-            var sendBufId = ring.RegisterExternalBuffer(sendPipe.GetBufferPointer(), sendPipe.GetVirtualSize());
+            var sendBufId = ring.RegisterExternalBuffer(sendBuffer.Pointer, (uint)sendBuffer.VirtualSize);
 
             // IMPORTANT: Post recv BEFORE client sends data
             // RIO may require the receive to be pending before data arrives
-            var recvOffset = recvPipe.Writer.GetWriteOffset();
+            recvBuffer.GetWriteSpan(out var recvOffset);
             ring.PrepareRecvExternal(connId, recvBufId, recvOffset, BufferSize, 1);
             ring.Submit();
 
@@ -795,19 +667,19 @@ public class WindowsRIOGroupTests
             Assert.True(count > 0, "No recv completion received");
             Assert.Equal(testData.Length, completions[0].Result);
             ring.AdvanceCompletionQueue(count);
-            recvPipe.Writer.Advance((uint)testData.Length);
+            recvBuffer.CommitWrite(testData.Length);
 
             // Verify data
-            var receivedData = recvPipe.Reader.AvailableToRead();
+            var receivedData = recvBuffer.GetReadSpan(out _);
             Assert.True(receivedData.Slice(0, testData.Length).SequenceEqual(testData), "Received data doesn't match");
 
-            // Echo back - copy to send pipe
-            var writeSpan = sendPipe.Writer.AvailableToWrite();
+            // Echo back - copy to send buffer
+            var writeSpan = sendBuffer.GetWriteSpan(out _);
             receivedData.Slice(0, testData.Length).CopyTo(writeSpan);
-            sendPipe.Writer.Advance((uint)testData.Length);
-            recvPipe.Reader.Advance((uint)testData.Length);
+            sendBuffer.CommitWrite(testData.Length);
+            recvBuffer.CommitRead(testData.Length);
 
-            var sendOffset = sendPipe.Reader.GetReadOffset();
+            sendBuffer.GetReadSpan(out var sendOffset);
             ring.PrepareSendExternal(connId, sendBufId, sendOffset, testData.Length, 2);
             ring.Submit();
 
@@ -846,8 +718,8 @@ public class WindowsRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        // This test demonstrates using AcceptEx-created sockets with RIO
-        // This is the correct way to use RIO for server-side sockets
+        // This test demonstrates that sockets from .NET accept() do NOT work with RIO
+        // because they lack WSA_FLAG_REGISTERED_IO. Use AcceptEx with library-created sockets.
 
         try
         {
@@ -861,26 +733,19 @@ public class WindowsRIOGroupTests
                 Skip.If(true, $"CreateAcceptSocket failed with error {error}");
             }
 
-            // For this simplified test, we'll simulate what happens after AcceptEx completes
-            // by just using a client-side socket (which we can control)
-            // In real usage, you'd use AcceptEx with the pre-created socket
-
             // For now, just verify we can create the socket and it's valid
             Assert.NotEqual(-1, acceptSocket);
 
-            // Test that the client socket (created with RIO flag) works with RIO
+            // Test that .NET accepted sockets DON'T work with RIO
             using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
             listener.Listen(1);
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            // Create a RIO-enabled client socket using WSASocket internally
-            // For this test, use a regular socket since we just want to verify the concept
             using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             client.Connect(endpoint);
 
             // Accept - the accepted socket WON'T have RIO flag
-            // This demonstrates why we need AcceptEx
             using var server = listener.Accept();
             server.Blocking = false;
 
@@ -889,44 +754,27 @@ public class WindowsRIOGroupTests
             var error2 = System.Network.Windows.Win_x64.ioring_get_last_error();
 
             // Expected: This will fail with 10045 on accepted sockets
-            // The fix is to use AcceptEx with pre-created sockets
             if (connId < 0 && error2 == 10045)
             {
                 // This is expected behavior - document it
                 Assert.True(true,
                     "As expected, accept() socket doesn't work with RIO. " +
-                    "Use AcceptEx with CreateAcceptSocket() for server-side RIO.");
+                    "Use PrepareAccept with library-owned listener for server-side RIO.");
             }
             else if (connId >= 0)
             {
-                // Unexpectedly worked - test the echo using pinned buffers
-                var testData = "Hello, RIO AcceptEx!"u8.ToArray();
-                client.Send(testData);
-
-                var recvBuffer = new byte[BufferSize];
-                unsafe
-                {
-                    fixed (byte* pRecv = recvBuffer)
-                    {
-                        ring.PrepareRecv(connId, (nint)pRecv, BufferSize, MsgFlags.None, 1);
-                    }
-                }
-                ring.Submit();
-
-                Span<Completion> completions = stackalloc Completion[16];
-                var count = ring.WaitCompletions(completions, 1, 1000);
-
-                Assert.True(count > 0, "No completion received");
-                Assert.Equal(testData.Length, completions[0].Result);
-                ring.AdvanceCompletionQueue(count);
-
+                // Unexpectedly worked - clean up
                 ring.UnregisterSocket(connId);
+                Assert.True(true, "RegisterSocket unexpectedly succeeded");
             }
             else
             {
                 // Different error - skip test
                 Skip.If(true, $"RegisterSocket failed with unexpected error {error2}");
             }
+
+            // Clean up the pre-created accept socket
+            System.Network.Windows.Win_x64.closesocket(acceptSocket);
         }
         catch (InvalidOperationException ex)
         {
@@ -990,9 +838,9 @@ public class WindowsRIOGroupTests
                 Skip.If(true, $"RegisterSocket failed with error {err}");
             }
 
-            // RIO requires pre-registered buffers - use external buffer API with Pipe
-            using var recvPipe = new Pipe(64 * 1024);
-            var recvBufId = ring.RegisterExternalBuffer(recvPipe.GetBufferPointer(), recvPipe.GetVirtualSize());
+            // RIO requires pre-registered buffers - use external buffer API with IORingBuffer
+            using var recvBuffer = IORingBuffer.Create(64 * 1024);
+            var recvBufId = ring.RegisterExternalBuffer(recvBuffer.Pointer, (uint)recvBuffer.VirtualSize);
             if (recvBufId < 0)
             {
                 ring.UnregisterSocket(connId);
@@ -1001,7 +849,7 @@ public class WindowsRIOGroupTests
             }
 
             // Post recv FIRST
-            var recvOffset = recvPipe.Writer.GetWriteOffset();
+            recvBuffer.GetWriteSpan(out var recvOffset);
             ring.PrepareRecvExternal(connId, recvBufId, recvOffset, BufferSize, 1);
             ring.Submit();
 
@@ -1043,9 +891,9 @@ public class WindowsRIOGroupTests
         try
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-            using var pipe = new Pipe(64 * 1024);
+            using var buffer = IORingBuffer.Create(64 * 1024);
 
-            var bufferId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            var bufferId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
 
             if (bufferId < 0)
             {
@@ -1077,15 +925,15 @@ public class WindowsRIOGroupTests
         try
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-            using var pipe1 = new Pipe(64 * 1024);
-            using var pipe2 = new Pipe(64 * 1024);
-            using var pipe3 = new Pipe(64 * 1024);
+            using var buffer1 = IORingBuffer.Create(64 * 1024);
+            using var buffer2 = IORingBuffer.Create(64 * 1024);
+            using var buffer3 = IORingBuffer.Create(64 * 1024);
 
-            var id1 = ring.RegisterExternalBuffer(pipe1.GetBufferPointer(), pipe1.GetVirtualSize());
+            var id1 = ring.RegisterExternalBuffer(buffer1.Pointer, (uint)buffer1.VirtualSize);
             Skip.If(id1 < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
 
-            var id2 = ring.RegisterExternalBuffer(pipe2.GetBufferPointer(), pipe2.GetVirtualSize());
-            var id3 = ring.RegisterExternalBuffer(pipe3.GetBufferPointer(), pipe3.GetVirtualSize());
+            var id2 = ring.RegisterExternalBuffer(buffer2.Pointer, (uint)buffer2.VirtualSize);
+            var id3 = ring.RegisterExternalBuffer(buffer3.Pointer, (uint)buffer3.VirtualSize);
 
             Assert.Equal(3, ring.ExternalBufferCount);
 
@@ -1158,11 +1006,11 @@ public class WindowsRIOGroupTests
     }
 
     // =============================================================================
-    // Pipe + RIO Integration Tests (Zero-Copy Sends)
+    // IORingBuffer + RIO Integration Tests (Zero-Copy Sends)
     // =============================================================================
 
     [SkippableFact]
-    public void PrepareSendExternal_WithPipe_SendsData()
+    public void PrepareSendExternal_WithIORingBuffer_SendsData()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
@@ -1170,11 +1018,11 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-            // Create a Pipe for zero-copy sends
-            using var pipe = new Pipe(64 * 1024);
+            // Create an IORingBuffer for zero-copy sends
+            using var buffer = IORingBuffer.Create(64 * 1024);
 
-            // Register pipe memory with RIO
-            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            // Register buffer memory with RIO
+            var extBufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
             Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
 
             // Create connected socket pair
@@ -1215,17 +1063,17 @@ public class WindowsRIOGroupTests
                 Skip.If(true, $"RegisterSocket failed with error {err}");
             }
 
-            // Write test data to the pipe
-            var testData = "Hello from Pipe zero-copy!"u8.ToArray();
-            var writeSpan = pipe.Writer.AvailableToWrite();
+            // Write test data to the buffer
+            var testData = "Hello from IORingBuffer zero-copy!"u8.ToArray();
+            var writeSpan = buffer.GetWriteSpan(out _);
             testData.CopyTo(writeSpan);
-            pipe.Writer.Advance((uint)testData.Length);
+            buffer.CommitWrite(testData.Length);
 
             // Get the read offset for the send
-            var readOffset = pipe.Reader.GetReadOffset();
-            var readLength = pipe.Reader.AvailableToRead().Length;
+            var readSpan = buffer.GetReadSpan(out var readOffset);
+            var readLength = readSpan.Length;
 
-            // Send using external buffer (zero-copy from Pipe memory!)
+            // Send using external buffer (zero-copy from IORingBuffer memory!)
             const ulong sendUserData = 42;
             ring.PrepareSendExternal(connId, extBufId, readOffset, readLength, sendUserData);
             ring.Submit();
@@ -1240,8 +1088,8 @@ public class WindowsRIOGroupTests
 
             ring.AdvanceCompletionQueue(count);
 
-            // Advance pipe reader (data was sent)
-            pipe.Reader.Advance((uint)testData.Length);
+            // Advance buffer reader (data was sent)
+            buffer.CommitRead(testData.Length);
 
             // Receive on server side to verify data
             var recvBuffer = new byte[testData.Length];
@@ -1273,9 +1121,9 @@ public class WindowsRIOGroupTests
         try
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-            using var pipe = new Pipe(64 * 1024);
+            using var buffer = IORingBuffer.Create(64 * 1024);
 
-            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            var extBufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
             Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
 
             // Create connected socket pair
@@ -1313,18 +1161,18 @@ public class WindowsRIOGroupTests
                 Skip.If(true, "RegisterSocket failed");
             }
 
-            // Send multiple chunks through the pipe
+            // Send multiple chunks through the buffer
             Span<Completion> completions = stackalloc Completion[16];
             for (int i = 0; i < 5; i++)
             {
                 var chunkData = new byte[100];
                 Array.Fill(chunkData, (byte)(i + 0x41)); // 'A', 'B', 'C', etc.
 
-                var writeSpan = pipe.Writer.AvailableToWrite();
+                var writeSpan = buffer.GetWriteSpan(out _);
                 chunkData.CopyTo(writeSpan);
-                pipe.Writer.Advance(100);
+                buffer.CommitWrite(100);
 
-                var readOffset = pipe.Reader.GetReadOffset();
+                buffer.GetReadSpan(out var readOffset);
                 ring.PrepareSendExternal(connId, extBufId, readOffset, 100, (ulong)i);
                 ring.Submit();
 
@@ -1333,7 +1181,7 @@ public class WindowsRIOGroupTests
                 Assert.Equal(100, completions[0].Result);
                 ring.AdvanceCompletionQueue(count);
 
-                pipe.Reader.Advance(100);
+                buffer.CommitRead(100);
 
                 // Verify on server
                 var recvBuffer = new byte[100];
@@ -1357,7 +1205,7 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void PrepareSendExternal_WithWrappedPipe_SendsCorrectData()
+    public void PrepareSendExternal_WithWrappedBuffer_SendsCorrectData()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
@@ -1365,11 +1213,11 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-            // Use a small pipe to force wrap-around
-            var pageSize = (uint)Environment.SystemPageSize;
-            using var pipe = new Pipe(pageSize);
+            // Use a small buffer to force wrap-around
+            var pageSize = Environment.SystemPageSize;
+            using var buffer = IORingBuffer.Create(pageSize);
 
-            var extBufId = ring.RegisterExternalBuffer(pipe.GetBufferPointer(), pipe.GetVirtualSize());
+            var extBufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
             Skip.If(extBufId < 0, "RegisterExternalBuffer failed - rebuild ioring.dll");
 
             // Create connected socket pair
@@ -1408,23 +1256,24 @@ public class WindowsRIOGroupTests
             }
 
             // Fill most of the buffer to force wrap-around on next write
-            var fillSize = (int)(pageSize - 200);
+            var fillSize = pageSize - 200;
             var fillData = new byte[fillSize];
             new Random(42).NextBytes(fillData);
 
-            var writeSpan = pipe.Writer.AvailableToWrite();
+            var writeSpan = buffer.GetWriteSpan(out _);
             fillData.CopyTo(writeSpan);
-            pipe.Writer.Advance((uint)fillSize);
+            buffer.CommitWrite(fillSize);
 
             // Send and consume
-            ring.PrepareSendExternal(connId, extBufId, pipe.Reader.GetReadOffset(), fillSize, 1);
+            buffer.GetReadSpan(out var fillReadOffset);
+            ring.PrepareSendExternal(connId, extBufId, fillReadOffset, fillSize, 1);
             ring.Submit();
 
             Span<Completion> completions = stackalloc Completion[16];
             var count = ring.WaitCompletions(completions, 1, 2000);
             Assert.True(count > 0);
             ring.AdvanceCompletionQueue(count);
-            pipe.Reader.Advance((uint)fillSize);
+            buffer.CommitRead(fillSize);
 
             var recvBuffer = new byte[fillSize];
             var totalReceived = 0;
@@ -1439,12 +1288,12 @@ public class WindowsRIOGroupTests
 
             // Now write data that wraps around the ring buffer
             var wrapData = "Wrapped data test!"u8.ToArray();
-            writeSpan = pipe.Writer.AvailableToWrite();
+            writeSpan = buffer.GetWriteSpan(out _);
             wrapData.CopyTo(writeSpan);
-            pipe.Writer.Advance((uint)wrapData.Length);
+            buffer.CommitWrite(wrapData.Length);
 
             // The double-mapping magic allows us to read contiguously even across the wrap
-            var readOffset = pipe.Reader.GetReadOffset();
+            buffer.GetReadSpan(out var readOffset);
             ring.PrepareSendExternal(connId, extBufId, readOffset, wrapData.Length, 2);
             ring.Submit();
 
@@ -1452,7 +1301,7 @@ public class WindowsRIOGroupTests
             Assert.True(count > 0, "No completion for wrapped send");
             Assert.Equal(wrapData.Length, completions[0].Result);
             ring.AdvanceCompletionQueue(count);
-            pipe.Reader.Advance((uint)wrapData.Length);
+            buffer.CommitRead(wrapData.Length);
 
             var wrapRecv = new byte[wrapData.Length];
             var wrapReceived = serverSide.Receive(wrapRecv);

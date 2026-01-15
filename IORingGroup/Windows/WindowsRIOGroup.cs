@@ -138,6 +138,18 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public int ActiveConnections => (int)Win_x64.ioring_rio_get_active_connections(_ring);
 
     /// <summary>
+    /// Gets the socket handle for a connection ID.
+    /// </summary>
+    /// <param name="connId">Connection ID returned by AcceptEx completion or RegisterSocket.</param>
+    /// <returns>Socket handle, or -1 (INVALID_SOCKET) if not found.</returns>
+    /// <remarks>
+    /// Use this method to get the actual socket handle for shutdown/close operations.
+    /// For send/recv, use <see cref="PrepareSendBuffer"/> and <see cref="PrepareRecvBuffer"/>
+    /// with the connection ID directly.
+    /// </remarks>
+    public nint GetSocket(int connId) => Win_x64.ioring_rio_get_socket(_ring, connId);
+
+    /// <summary>
     /// Gets the receive buffer size per connection.
     /// </summary>
     public int RecvBufferSize => _recvBufferSize;
@@ -231,9 +243,9 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// <b>Note:</b> This is only needed for advanced scenarios. PrepareAccept handles
     /// AcceptEx internally for normal use.
     /// </remarks>
-    /// <param name="listenSocket">Optional listening socket (0 to use temp socket)</param>
+    /// <param name="listenSocket">Optional listening socket (-1 to use temp socket)</param>
     /// <returns>AcceptEx function pointer, or IntPtr.Zero on failure</returns>
-    public static nint GetAcceptEx(nint listenSocket = 0)
+    public static nint GetAcceptEx(nint listenSocket = -1)
     {
         return Win_x64.ioring_get_acceptex(listenSocket);
     }
@@ -375,6 +387,11 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public int ExternalBufferCount => (int)Win_x64.ioring_rio_get_external_buffer_count(_ring);
 
     /// <summary>
+    /// Gets the maximum number of external buffers (based on max_connections * 3).
+    /// </summary>
+    public int MaxExternalBuffers => (int)Win_x64.ioring_rio_get_max_external_buffers(_ring);
+
+    /// <summary>
     /// Prepares a receive operation from an external registered buffer.
     /// </summary>
     /// <param name="connId">Connection ID from <see cref="RegisterSocket"/></param>
@@ -470,8 +487,10 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     /// <remarks>
-    /// For registered connections, prefer PrepareSendRegistered for better performance.
+    /// <b>WARNING:</b> This method is NOT supported in RIO mode and will return -EINVAL.
+    /// RIO mode requires external buffers. Use <see cref="PrepareSendBuffer"/> instead.
     /// </remarks>
+    [Obsolete("Use PrepareSendBuffer with external buffers. Legacy send is not supported in RIO mode.")]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
@@ -481,8 +500,10 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     /// <remarks>
-    /// For registered connections, prefer PrepareRecvRegistered for better performance.
+    /// <b>WARNING:</b> This method is NOT supported in RIO mode and will return -EINVAL.
+    /// RIO mode requires external buffers. Use <see cref="PrepareRecvBuffer"/> instead.
     /// </remarks>
+    [Obsolete("Use PrepareRecvBuffer with external buffers. Legacy recv is not supported in RIO mode.")]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {

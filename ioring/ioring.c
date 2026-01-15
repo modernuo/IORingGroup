@@ -10,16 +10,15 @@
 #include <intrin.h>  // For _mm_pause()
 
 /*
- * Windows IORing Implementation with True RIO Support
+ * Windows IORing Implementation with RIO (Registered I/O)
  *
- * This library provides two modes:
- * 1. Legacy mode (ioring_create): Uses synchronous recv/send with WSAPoll
- * 2. RIO mode (ioring_create_rio): Uses true async RIO with registered buffers
- *
- * RIO mode provides:
+ * This library provides high-performance async socket I/O using Windows RIO:
  * - Zero-copy I/O with pre-registered buffers
  * - Batched submissions and completions
  * - True async operations that don't block
+ * - AcceptEx integration for server-side RIO
+ *
+ * Use ioring_create_rio_ex() to create a ring instance.
  */
 
 // RIO function table
@@ -152,10 +151,11 @@ struct ioring {
     uint32_t pending_capacity;
 
     // External buffer support (for zero-copy from user-owned memory like Pipe)
-    #define RIO_MAX_EXTERNAL_BUFFERS 16
-    RIO_BUFFERID external_buffer_ids[16];   // Registered buffer IDs
-    void* external_buffer_ptrs[16];          // Pointers for tracking
-    uint32_t external_buffer_lengths[16];    // Lengths for validation
+    // Dynamically allocated based on max_connections * 3 (recv + send + pipe per connection)
+    uint32_t max_external_buffers;           // Max external buffers (derived from max_connections)
+    RIO_BUFFERID* external_buffer_ids;       // Registered buffer IDs (dynamically allocated)
+    void** external_buffer_ptrs;             // Pointers for tracking (dynamically allocated)
+    uint32_t* external_buffer_lengths;       // Lengths for validation (dynamically allocated)
     uint32_t external_buffer_count;          // Number of registered external buffers
 };
 
@@ -206,7 +206,8 @@ static BOOL init_rio(void) {
 }
 
 // =============================================================================
-// Legacy API Implementation (synchronous fallback)
+// Synchronous Operations (poll, accept, close, shutdown)
+// NOTE: recv/send MUST use RIO external buffers - legacy recv/send removed
 // =============================================================================
 
 // Helper to complete an operation
@@ -235,43 +236,6 @@ static BOOL add_pending_op(ioring_t* ring, uint64_t user_data, uint8_t opcode,
         .addrlen = addrlen
     };
     return TRUE;
-}
-
-IORING_API ioring_t* ioring_create(uint32_t entries) {
-    init_winsock();
-    init_rio();
-
-    if (entries == 0) entries = 4096;
-    entries = next_power_of_two(entries);
-
-    ioring_t* ring = calloc(1, sizeof(ioring_t));
-    if (!ring) {
-        last_error = ERROR_OUTOFMEMORY;
-        return NULL;
-    }
-
-    ring->sq_entries = entries;
-    ring->cq_entries = entries * 2;
-    ring->sq_mask = entries - 1;
-    ring->cq_mask = ring->cq_entries - 1;
-    ring->rio_mode = FALSE;
-    ring->backend = IORING_BACKEND_RIO;
-
-    ring->sq = (ioring_sqe_t*)calloc(entries, sizeof(ioring_sqe_t));
-    ring->cq = (ioring_cqe_t*)calloc(ring->cq_entries, sizeof(ioring_cqe_t));
-    ring->pending_ops = calloc(entries, sizeof(struct pending_op));
-    ring->pending_capacity = entries;
-
-    if (!ring->sq || !ring->cq || !ring->pending_ops) {
-        free(ring->sq);
-        free(ring->cq);
-        free(ring->pending_ops);
-        free(ring);
-        last_error = ERROR_OUTOFMEMORY;
-        return NULL;
-    }
-
-    return ring;
 }
 
 IORING_API void ioring_destroy(ioring_t* ring) {
@@ -321,13 +285,18 @@ IORING_API void ioring_destroy(ioring_t* ring) {
         }
 
         // Cleanup external buffers (user is responsible for freeing memory)
-        if (rio.RIODeregisterBuffer) {
-            for (uint32_t i = 0; i < 16; i++) {
+        if (rio.RIODeregisterBuffer && ring->external_buffer_ids) {
+            for (uint32_t i = 0; i < ring->max_external_buffers; i++) {
                 if (ring->external_buffer_ids[i] != RIO_INVALID_BUFFERID) {
                     rio.RIODeregisterBuffer(ring->external_buffer_ids[i]);
                 }
             }
         }
+
+        // Free external buffer arrays
+        free(ring->external_buffer_ids);
+        free(ring->external_buffer_ptrs);
+        free(ring->external_buffer_lengths);
 
         // Close handles
         if (ring->rio_iocp) {
@@ -470,32 +439,11 @@ static int legacy_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
             complete_op(ring, sqe->user_data, -err, 0);
             return 1;
         }
-        case IORING_OP_SEND: {
-            const char* buf = (const char*)sqe->addr;
-            int len = (int)sqe->len;
-            int flags = sqe->msg_flags;
-            int sent = send(fd, buf, len, flags);
-            if (sent >= 0) {
-                complete_op(ring, sqe->user_data, sent, 0);
-                return 1;
-            }
-            err = WSAGetLastError();
-            complete_op(ring, sqe->user_data, -err, 0);
+        // RECV/SEND removed - RIO mode requires external buffers
+        case IORING_OP_SEND:
+        case IORING_OP_RECV:
+            complete_op(ring, sqe->user_data, -EINVAL, 0);
             return 1;
-        }
-        case IORING_OP_RECV: {
-            char* buf = (char*)sqe->addr;
-            int len = (int)sqe->len;
-            int flags = sqe->msg_flags;
-            int recvd = recv(fd, buf, len, flags);
-            if (recvd >= 0) {
-                complete_op(ring, sqe->user_data, recvd, 0);
-                return 1;
-            }
-            err = WSAGetLastError();
-            complete_op(ring, sqe->user_data, -err, 0);
-            return 1;
-        }
         case IORING_OP_CLOSE: {
             int res = closesocket(fd);
             complete_op(ring, sqe->user_data, res == 0 ? 0 : -WSAGetLastError(), 0);
@@ -546,7 +494,7 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
 
         // External buffer - use buffer_id from sqe
         int ext_buf_id = (int)sqe->buf_index;
-        if (ext_buf_id < 0 || ext_buf_id >= 16 ||
+        if (ext_buf_id < 0 || (uint32_t)ext_buf_id >= ring->max_external_buffers ||
             ring->external_buffer_ids[ext_buf_id] == RIO_INVALID_BUFFERID) {
             complete_op(ring, sqe->user_data, -EINVAL, 0);
             return 1;
@@ -605,11 +553,19 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
         return 0;  // Operation pending, completion will come from RIO CQ
     }
 
-    // Non-external buffer operations use legacy path
+    // RIO mode requires external buffers for RECV/SEND operations
+    // Non-RIO operations (POLL, CLOSE, SHUTDOWN, etc.) still use legacy path
+    if (sqe->opcode == IORING_OP_RECV || sqe->opcode == IORING_OP_SEND) {
+        // RECV/SEND in RIO mode requires external buffers
+        complete_op(ring, sqe->user_data, -EINVAL, 0);
+        return 1;
+    }
+
+    // Other operations (POLL, CLOSE, SHUTDOWN) use synchronous path
     return legacy_execute_op(ring, sqe);
 }
 
-// Process pending poll operations (legacy mode)
+// Process pending operations (poll and accept only - recv/send require RIO external buffers)
 static void process_pending_polls(ioring_t* ring) {
     for (uint32_t i = 0; i < ring->pending_count; ) {
         struct pending_op* op = &ring->pending_ops[i];
@@ -646,6 +602,13 @@ static void process_pending_polls(ioring_t* ring) {
                 }
                 break;
             }
+            // RECV/SEND removed - RIO mode requires external buffers
+            case IORING_OP_RECV:
+            case IORING_OP_SEND:
+                // These should never be pending in RIO mode
+                complete_op(ring, op->user_data, -EINVAL, 0);
+                completed = TRUE;
+                break;
         }
 
         if (completed) {
@@ -870,12 +833,19 @@ IORING_API ioring_t* ioring_create_rio_ex(
         ring->rio_connections[i].reserved = FALSE;
     }
 
-    // Initialize external buffer tracking
+    // Allocate external buffer tracking arrays
+    // Size = max_connections * 3 to support recv + send + pipe per connection
+    ring->max_external_buffers = max_connections * 3;
     ring->external_buffer_count = 0;
-    for (uint32_t i = 0; i < 16; i++) {
+    ring->external_buffer_ids = calloc(ring->max_external_buffers, sizeof(RIO_BUFFERID));
+    ring->external_buffer_ptrs = calloc(ring->max_external_buffers, sizeof(void*));
+    ring->external_buffer_lengths = calloc(ring->max_external_buffers, sizeof(uint32_t));
+    if (!ring->external_buffer_ids || !ring->external_buffer_ptrs || !ring->external_buffer_lengths) {
+        goto fail;
+    }
+    // Initialize all buffer IDs to invalid
+    for (uint32_t i = 0; i < ring->max_external_buffers; i++) {
         ring->external_buffer_ids[i] = RIO_INVALID_BUFFERID;
-        ring->external_buffer_ptrs[i] = NULL;
-        ring->external_buffer_lengths[i] = 0;
     }
 
     // Create IOCP for RIO completions (optional, can use polling)
@@ -904,7 +874,8 @@ IORING_API ioring_t* ioring_create_rio_ex(
     ring->rio_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     // Initialize AcceptEx pool for server-side RIO support
-    uint32_t accept_pool_size = max_connections < 64 ? max_connections : 64;
+    // Pool size = min(max_connections, 256) to support high-volume servers
+    uint32_t accept_pool_size = max_connections < 256 ? max_connections : 256;
     ring->accept_pool_size = accept_pool_size;
     ring->accept_pool = calloc(accept_pool_size, sizeof(acceptex_context_t));
     if (!ring->accept_pool) {
@@ -1045,6 +1016,14 @@ IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring) {
     return ring && ring->rio_mode ? ring->rio_active_connections : 0;
 }
 
+IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id) {
+    if (!ring || !ring->rio_mode) return INVALID_SOCKET;
+    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return INVALID_SOCKET;
+
+    rio_connection_t* conn = &ring->rio_connections[conn_id];
+    return conn->active ? conn->socket : INVALID_SOCKET;
+}
+
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
 // =============================================================================
@@ -1103,8 +1082,10 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 
     acceptex_context_t* ctx = &ring->accept_pool[slot];
 
-    // Create accept socket with RIO flag ONLY (no OVERLAPPED - that's for the operation, not the socket)
-    // The working client socket test uses only WSA_FLAG_REGISTERED_IO
+    // Create accept socket WITH WSA_FLAG_REGISTERED_IO for RIO support.
+    // NOTE: Sockets with WSA_FLAG_REGISTERED_IO can ONLY use RIO recv/send!
+    // For legacy recv/send, use ioring_create_accept_socket() which creates
+    // sockets with WSA_FLAG_OVERLAPPED instead.
     ctx->accept_socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                                      WSA_FLAG_REGISTERED_IO);
     if (ctx->accept_socket == INVALID_SOCKET) {
@@ -1208,59 +1189,24 @@ static void check_acceptex_completions(ioring_t* ring) {
             found_ctx->bytes_received = bytes_transferred;
 
             // Update socket context so getsockname/getpeername work
-            // NOTE: This does NOT interfere with RIO - the fix was creating the
-            // listener socket with WSA_FLAG_REGISTERED_IO (see ioring_rio_create_listener)
             setsockopt(found_ctx->accept_socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
                        (char*)&found_ctx->listen_socket, sizeof(found_ctx->listen_socket));
 
+            // Clear the connection slot reservation (we're not creating an RQ yet)
+            // The RQ will be created lazily when RegisterSocket is called
             int conn_slot = found_ctx->conn_slot;
             if (conn_slot >= 0 && (uint32_t)conn_slot < ring->rio_max_connections) {
-                rio_connection_t* conn = &ring->rio_connections[conn_slot];
-
-                // NOW create the RQ - AFTER SO_UPDATE_ACCEPT_CONTEXT (per Gemini/RioSharp pattern)
-                // This is the key timing change from the previous implementation
-                WSASetLastError(0);
-                RIO_RQ rq = rio.RIOCreateRequestQueue(
-                    found_ctx->accept_socket,
-                    ring->rio_outstanding_per_socket,
-                    1,
-                    ring->rio_outstanding_per_socket,
-                    1,
-                    ring->rio_cq,
-                    ring->rio_cq,
-                    (PVOID)(uintptr_t)conn_slot
-                );
-
-                if (rq == RIO_INVALID_RQ) {
-                    // RQ creation failed - report error and clean up
-                    int rq_error = WSAGetLastError();
-                    conn->reserved = FALSE;
-                    closesocket(found_ctx->accept_socket);
-                    complete_op(ring, found_ctx->user_data, -rq_error, 0);
-
-                    found_ctx->accept_socket = INVALID_SOCKET;
-                    found_ctx->conn_slot = -1;
-                    found_ctx->completed = FALSE;
-                    continue;  // Process next completion
-                }
-
-                // Success - activate the connection
-                conn->socket = found_ctx->accept_socket;
-                conn->rq = rq;
-                conn->active = TRUE;
-                conn->reserved = FALSE;  // Clear reservation now that it's active
-                ring->rio_active_connections++;
-
-                // Add completion to user-space CQ
-                // Result is the accepted socket handle (users can also use conn_slot)
-                complete_op(ring, found_ctx->user_data, (int32_t)found_ctx->accept_socket, 0);
-            } else {
-                // Invalid conn_slot - shouldn't happen, but handle gracefully
-                closesocket(found_ctx->accept_socket);
-                complete_op(ring, found_ctx->user_data, -EINVAL, 0);
+                ring->rio_connections[conn_slot].reserved = FALSE;
             }
 
-            // Reset context for reuse (socket now owned by connection slot)
+            // Return the socket handle directly
+            // NOTE: Socket handles on x64 can theoretically exceed INT32_MAX, but in practice
+            // Windows assigns small values. We truncate here for API compatibility.
+            // The socket is created with WSA_FLAG_REGISTERED_IO so it CAN be registered
+            // with RIO later via RegisterSocket, but it can also be used with legacy recv/send.
+            complete_op(ring, found_ctx->user_data, (int32_t)found_ctx->accept_socket, 0);
+
+            // Reset context for reuse (socket now owned by user)
             found_ctx->accept_socket = INVALID_SOCKET;
             found_ctx->conn_slot = -1;
             found_ctx->completed = FALSE;
@@ -1291,8 +1237,24 @@ IORING_API SOCKET ioring_rio_create_accept_socket(void) {
     init_winsock();
 
     // Create a socket with WSA_FLAG_REGISTERED_IO so it can be used with RIO
-    // after AcceptEx completes
+    // after AcceptEx completes. NOTE: This socket CANNOT use regular recv/send!
     SOCKET sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_REGISTERED_IO);
+    if (sock == INVALID_SOCKET) {
+        last_error = WSAGetLastError();
+        return INVALID_SOCKET;
+    }
+
+    return sock;
+}
+
+IORING_API SOCKET ioring_create_accept_socket(void) {
+    init_winsock();
+
+    // DEPRECATED: This function creates sockets without WSA_FLAG_REGISTERED_IO.
+    // Such sockets cannot use RIO operations. Use ioring_rio_create_accept_socket()
+    // or let the ring's AcceptEx pool create sockets automatically.
+    // This function is kept for API compatibility but should not be used in RIO mode.
+    SOCKET sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
     if (sock == INVALID_SOCKET) {
         last_error = WSAGetLastError();
         return INVALID_SOCKET;
@@ -1514,58 +1476,6 @@ IORING_API void ioring_rio_configure_socket(SOCKET socket) {
     setsockopt(socket, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
 }
 
-IORING_API SOCKET ioring_create_listener(const char* bind_addr, uint16_t port, int backlog) {
-    // Create standard TCP socket (not RIO)
-    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener == INVALID_SOCKET) {
-        return INVALID_SOCKET;
-    }
-
-    // Set non-blocking
-    u_long mode = 1;
-    ioctlsocket(listener, FIONBIO, &mode);
-
-    // Disable SO_REUSEADDR (exclusive address use)
-    int opt = 0;
-    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-
-    // TCP_NODELAY
-    opt = 1;
-    setsockopt(listener, IPPROTO_TCP, TCP_NODELAY, (char*)&opt, sizeof(opt));
-
-    // Disable linger
-    struct linger lin = { .l_onoff = 0, .l_linger = 0 };
-    setsockopt(listener, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
-
-    // Bind
-    struct sockaddr_in addr = { 0 };
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (bind_addr && bind_addr[0]) {
-        if (InetPtonA(AF_INET, bind_addr, &addr.sin_addr) != 1) {
-            closesocket(listener);
-            last_error = WSAGetLastError();
-            return INVALID_SOCKET;
-        }
-    } else {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    }
-
-    if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(listener);
-        last_error = WSAGetLastError();
-        return INVALID_SOCKET;
-    }
-
-    // Listen
-    if (listen(listener, backlog) == SOCKET_ERROR) {
-        closesocket(listener);
-        return INVALID_SOCKET;
-    }
-
-    return listener;
-}
-
 // =============================================================================
 // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
 // =============================================================================
@@ -1587,7 +1497,7 @@ IORING_API int ioring_rio_register_external_buffer(
 
     // Find a free slot
     int slot = -1;
-    for (uint32_t i = 0; i < 16; i++) {
+    for (uint32_t i = 0; i < ring->max_external_buffers; i++) {
         if (ring->external_buffer_ids[i] == RIO_INVALID_BUFFERID) {
             slot = (int)i;
             break;
@@ -1617,7 +1527,7 @@ IORING_API int ioring_rio_register_external_buffer(
 
 IORING_API void ioring_rio_unregister_external_buffer(ioring_t* ring, int buffer_id) {
     if (!ring || !ring->rio_mode) return;
-    if (buffer_id < 0 || buffer_id >= 16) return;
+    if (buffer_id < 0 || (uint32_t)buffer_id >= ring->max_external_buffers) return;
 
     if (ring->external_buffer_ids[buffer_id] != RIO_INVALID_BUFFERID) {
         rio.RIODeregisterBuffer(ring->external_buffer_ids[buffer_id]);
@@ -1667,4 +1577,9 @@ IORING_API void ioring_prep_recv_external(
 IORING_API uint32_t ioring_rio_get_external_buffer_count(ioring_t* ring) {
     if (!ring || !ring->rio_mode) return 0;
     return ring->external_buffer_count;
+}
+
+IORING_API uint32_t ioring_rio_get_max_external_buffers(ioring_t* ring) {
+    if (!ring || !ring->rio_mode) return 0;
+    return ring->max_external_buffers;
 }
