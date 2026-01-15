@@ -119,8 +119,6 @@ struct ioring {
     uint32_t rio_outstanding_per_socket;// Max outstanding ops per direction per socket
     uint32_t rio_cq_size;               // Actual CQ size
     rio_connection_t* rio_connections;  // Per-connection state
-    HANDLE rio_event;                   // Event for completion notification
-    HANDLE rio_iocp;                    // IOCP for RIO completions (if using IOCP mode)
 
     // Owned listener sockets (library creates these)
     SOCKET* owned_listeners;            // Array of listener sockets we created
@@ -132,7 +130,6 @@ struct ioring {
     uint32_t accept_pool_size;          // Size of accept pool
     LPFN_ACCEPTEX fn_acceptex;          // Cached AcceptEx function pointer
     LPFN_GETACCEPTEXSOCKADDRS fn_getacceptexsockaddrs;  // For extracting addresses
-    HANDLE accept_iocp;                 // IOCP for AcceptEx completions
 
     // Legacy mode data (pending operations for sync fallback)
     struct pending_op {
@@ -261,9 +258,6 @@ IORING_API void ioring_destroy(ioring_t* ring) {
         }
         free(ring->accept_pool);
     }
-    if (ring->accept_iocp) {
-        CloseHandle(ring->accept_iocp);
-    }
 
     // Cleanup RIO connections (close sockets)
     if (ring->rio_connections) {
@@ -294,14 +288,6 @@ IORING_API void ioring_destroy(ioring_t* ring) {
     free(ring->external_buffer_ids);
     free(ring->external_buffer_ptrs);
     free(ring->external_buffer_lengths);
-
-    // Close handles
-    if (ring->rio_iocp) {
-        CloseHandle(ring->rio_iocp);
-    }
-    if (ring->rio_event) {
-        CloseHandle(ring->rio_event);
-    }
 
     free(ring->pending_ops);
     free(ring->sq);
@@ -824,10 +810,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
         ring->external_buffer_ids[i] = RIO_INVALID_BUFFERID;
     }
 
-    // Create IOCP for RIO completions (optional, can use polling)
-    ring->rio_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
-    // Not fatal if this fails - we can use polling
-
     // Create RIO completion queue
     // CQ must be large enough for all outstanding operations across all RQs
     uint32_t rio_cq_size = max_connections * outstanding_per_socket * 2;
@@ -845,9 +827,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
     if (ring->rio_cq == RIO_INVALID_CQ) {
         goto fail;
     }
-
-    // Create event for fallback notification (not used in polling mode)
-    ring->rio_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     // Initialize AcceptEx pool for server-side RIO support
     // Pool size = min(max_connections, 256) to support high-volume servers
@@ -869,10 +848,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
             goto fail;
         }
     }
-
-    // NOTE: We no longer use IOCP for AcceptEx - using events instead
-    // This avoids potential interference with RIO
-    ring->accept_iocp = NULL;
 
     // Initialize owned listeners array
     ring->owned_listener_capacity = 16;
@@ -1339,15 +1314,6 @@ IORING_API SOCKET ioring_rio_create_listener(
         last_error = WSAGetLastError();
         closesocket(listener);
         return INVALID_SOCKET;
-    }
-
-    // Associate with our AcceptEx IOCP (NOT the .NET runtime's IOCP)
-    if (ring->accept_iocp) {
-        if (!CreateIoCompletionPort((HANDLE)listener, ring->accept_iocp, (ULONG_PTR)listener, 0)) {
-            last_error = GetLastError();
-            closesocket(listener);
-            return INVALID_SOCKET;
-        }
     }
 
     // Track the listener in our owned_listeners array
