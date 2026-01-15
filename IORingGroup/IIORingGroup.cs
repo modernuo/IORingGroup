@@ -150,6 +150,28 @@ public interface IIORingGroup : IDisposable
     void ConfigureSocket(nint socket);
 
     /// <summary>
+    /// Registers a socket for I/O operations and returns a connection ID.
+    /// </summary>
+    /// <param name="socket">The socket handle to register.</param>
+    /// <returns>Connection ID on success (>= 0), -1 on failure.</returns>
+    /// <remarks>
+    /// On Windows RIO, this creates a Request Queue for the socket.
+    /// On Linux/Darwin, the socket handle is used directly as the connection ID.
+    /// The returned connection ID is used with <see cref="PrepareSendBuffer"/> and <see cref="PrepareRecvBuffer"/>.
+    /// </remarks>
+    int RegisterSocket(nint socket);
+
+    /// <summary>
+    /// Unregisters a previously registered socket.
+    /// </summary>
+    /// <param name="connId">The connection ID returned by <see cref="RegisterSocket"/>.</param>
+    /// <remarks>
+    /// Call this before closing the socket. On Windows RIO, this frees the Request Queue.
+    /// On Linux/Darwin, this is a no-op but should still be called for consistency.
+    /// </remarks>
+    void UnregisterSocket(int connId);
+
+    /// <summary>
     /// Closes a socket.
     /// </summary>
     /// <param name="socket">The socket handle to close.</param>

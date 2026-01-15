@@ -479,6 +479,19 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
+    public int RegisterSocket(nint socket)
+    {
+        // On Linux, the socket fd is used directly as the connection ID
+        return (int)socket;
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterSocket(int connId)
+    {
+        // No-op on Linux - socket fd is used directly
+    }
+
+    /// <inheritdoc/>
     public void CloseSocket(nint socket)
     {
         if (socket >= 0)

@@ -462,6 +462,19 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
+    public int RegisterSocket(nint socket)
+    {
+        // On Darwin, the socket fd is used directly as the connection ID
+        return (int)socket;
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterSocket(int connId)
+    {
+        // No-op on Darwin - socket fd is used directly
+    }
+
+    /// <inheritdoc/>
     public void CloseSocket(nint socket)
     {
         if (socket >= 0)

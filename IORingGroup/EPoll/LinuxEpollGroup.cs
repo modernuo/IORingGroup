@@ -43,7 +43,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
     private int _externalBufferCount;
 
     // Pending poll operations - maps fd to userData for poll events
-    private readonly System.Collections.Generic.Dictionary<int, ulong> _pendingPolls = new();
+    private readonly Dictionary<int, ulong> _pendingPolls = new();
 
     private struct PendingOp
     {
@@ -543,6 +543,19 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         // Disable SO_LINGER
         var linger = new linger { l_onoff = 0, l_linger = 0 };
         _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(linger));
+    }
+
+    /// <inheritdoc/>
+    public int RegisterSocket(nint socket)
+    {
+        // On Linux epoll, the socket fd is used directly as the connection ID
+        return (int)socket;
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterSocket(int connId)
+    {
+        // No-op on Linux epoll - socket fd is used directly
     }
 
     /// <inheritdoc/>

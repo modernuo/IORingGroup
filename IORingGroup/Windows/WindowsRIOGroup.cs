@@ -33,7 +33,6 @@ namespace System.Network.Windows;
 public sealed class WindowsRIOGroup : IIORingGroup
 {
     private readonly nint _ring;
-    private readonly int _maxConnections;
     private readonly int _recvBufferSize;
     private readonly int _sendBufferSize;
     private bool _disposed;
@@ -96,7 +95,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
                 $"Must be between 1 and {MaxOutstandingPerSocket}");
         }
 
-        _maxConnections = maxConnections;
         _recvBufferSize = recvBufferSize;
         _sendBufferSize = sendBufferSize;
 
@@ -114,11 +112,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
         _cqeBufferHandle = GCHandle.Alloc(_cqeBuffer, GCHandleType.Pinned);
         _cqeBufferPtr = _cqeBufferHandle.AddrOfPinnedObject();
     }
-
-    /// <summary>
-    /// Gets the maximum number of connections this ring supports.
-    /// </summary>
-    public int MaxConnections => _maxConnections;
 
     /// <summary>
     /// Gets the socket handle for a connection ID.

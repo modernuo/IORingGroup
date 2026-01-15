@@ -241,7 +241,6 @@ public class WindowsRIOGroupTests
         );
 
         Assert.NotNull(ring);
-        Assert.Equal(MaxConnections, ring.MaxConnections);
         Assert.Equal(BufferSize, ring.RecvBufferSize);
         Assert.Equal(BufferSize, ring.SendBufferSize);
     }
