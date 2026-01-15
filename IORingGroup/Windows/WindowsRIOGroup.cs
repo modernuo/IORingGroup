@@ -92,18 +92,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
         _cqeBufferPtr = _cqeBufferHandle.AddrOfPinnedObject();
     }
 
-    /// <summary>
-    /// Gets the socket handle for a connection ID.
-    /// </summary>
-    /// <param name="connId">Connection ID returned by AcceptEx completion or RegisterSocket.</param>
-    /// <returns>Socket handle, or -1 (INVALID_SOCKET) if not found.</returns>
-    /// <remarks>
-    /// Use this method to get the actual socket handle for shutdown/close operations.
-    /// For send/recv, use <see cref="PrepareSendBuffer"/> and <see cref="PrepareRecvBuffer"/>
-    /// with the connection ID directly.
-    /// </remarks>
-    public nint GetSocket(int connId) => Win_x64.ioring_rio_get_socket(_ring, connId);
-
     /// <inheritdoc/>
     public int SubmissionQueueSpace => (int)Win_x64.ioring_sq_space_left(_ring);
 

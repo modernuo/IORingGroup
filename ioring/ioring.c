@@ -953,14 +953,6 @@ IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id) {
     ring->rio_active_connections--;
 }
 
-IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id) {
-    if (!ring) return INVALID_SOCKET;
-    if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return INVALID_SOCKET;
-
-    rio_connection_t* conn = &ring->rio_connections[conn_id];
-    return conn->active ? conn->socket : INVALID_SOCKET;
-}
-
 // =============================================================================
 // RIO AcceptEx Support (for server-side RIO)
 // =============================================================================

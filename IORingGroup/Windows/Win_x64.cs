@@ -109,13 +109,6 @@ public static partial class Win_x64
     [LibraryImport(LibraryName)]
     public static partial void ioring_rio_unregister(nint ring, int connId);
 
-    /// <summary>
-    /// Get the socket handle for a connection ID.
-    /// Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial nint ioring_rio_get_socket(nint ring, int connId);
-
     // =============================================================================
     // RIO Listener Support
     // =============================================================================

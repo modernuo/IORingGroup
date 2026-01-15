@@ -163,10 +163,6 @@ IORING_API int ioring_rio_register(
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
 
-// Get the socket handle for a connection ID
-// Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid
-IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id);
-
 // =============================================================================
 // RIO Listener Support
 // =============================================================================
