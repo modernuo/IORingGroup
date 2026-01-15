@@ -248,7 +248,7 @@ public class Program
                 }
 
                 // Dispose buffer pool
-                _bufferPool?.Dispose();
+                _bufferPool.Dispose();
                 _bufferPool = null;
             }
         }
@@ -454,7 +454,7 @@ public class Program
                 ring.CloseSocket(clientSocket);
             }
         }
-        else if (result != -11 && result != -4) // EAGAIN, EINTR
+        else if (result != -4) // EINTR
         {
             Console.WriteLine($"Accept error: {result}");
         }
