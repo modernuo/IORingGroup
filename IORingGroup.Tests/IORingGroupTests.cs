@@ -5,6 +5,24 @@ using System.Network;
 
 namespace IORingGroup.Tests;
 
+// Helper to poll for completions with timeout (replaces blocking WaitCompletions)
+internal static class TestHelpers
+{
+    public static int WaitForCompletions(IIORingGroup ring, Span<Completion> completions, int minComplete, int timeoutMs)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var count = 0;
+        while (count < minComplete && Environment.TickCount64 < deadline)
+        {
+            ring.Submit();
+            count = ring.PeekCompletions(completions);
+            if (count < minComplete)
+                Thread.Sleep(1);
+        }
+        return count;
+    }
+}
+
 public class IORingGroupTests
 {
     [SkippableFact]
@@ -452,7 +470,7 @@ public class WindowsRIOGroupTests
 
             // Wait for accept completion
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 5000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
 
             Assert.True(count > 0, "No accept completion received - AcceptEx may not be working");
             Assert.Equal(acceptUserData, completions[0].UserData);
@@ -502,7 +520,7 @@ public class WindowsRIOGroupTests
             var sent = client.Send(testData);
             Assert.Equal(testData.Length, sent);
 
-            count = ring.WaitCompletions(completions, 1, 2000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "No recv completion received");
             Assert.Equal(testData.Length, completions[0].Result);
@@ -523,7 +541,7 @@ public class WindowsRIOGroupTests
             ring.PrepareSendExternal(connId, sendBufId, sendOffset, testData.Length, 2);
             ring.Submit();
 
-            count = ring.WaitCompletions(completions, 1, 1000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 1000);
             Assert.True(count > 0, "No send completion");
             ring.AdvanceCompletionQueue(count);
 
@@ -699,7 +717,7 @@ public class WindowsRIOGroupTests
 
             // Wait for completion on RIO client
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "CLIENT socket RIO recv failed");
             Assert.Equal(testData.Length, completions[0].Result);
@@ -920,7 +938,7 @@ public class WindowsRIOGroupTests
 
             // Wait for send completion
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
 
             Assert.True(count > 0, "No send completion received");
             Assert.Equal(sendUserData, completions[0].UserData);
@@ -1016,7 +1034,7 @@ public class WindowsRIOGroupTests
                 ring.PrepareSendExternal(connId, extBufId, readOffset, 100, (ulong)i);
                 ring.Submit();
 
-                var count = ring.WaitCompletions(completions, 1, 2000);
+                var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
                 Assert.True(count > 0, $"No completion for chunk {i}");
                 Assert.Equal(100, completions[0].Result);
                 ring.AdvanceCompletionQueue(count);
@@ -1110,7 +1128,7 @@ public class WindowsRIOGroupTests
             ring.Submit();
 
             Span<Completion> completions = stackalloc Completion[16];
-            var count = ring.WaitCompletions(completions, 1, 2000);
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
             Assert.True(count > 0);
             ring.AdvanceCompletionQueue(count);
             buffer.CommitRead(fillSize);
@@ -1137,7 +1155,7 @@ public class WindowsRIOGroupTests
             ring.PrepareSendExternal(connId, extBufId, readOffset, wrapData.Length, 2);
             ring.Submit();
 
-            count = ring.WaitCompletions(completions, 1, 2000);
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
             Assert.True(count > 0, "No completion for wrapped send");
             Assert.Equal(wrapData.Length, completions[0].Result);
             ring.AdvanceCompletionQueue(count);

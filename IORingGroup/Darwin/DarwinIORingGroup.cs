@@ -212,7 +212,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
             // Add completion
             var cqIndex = _cqTail & _cqMask;
-            _cqEntries[cqIndex] = new Completion(sqe.UserData, result, CompletionFlags.None);
+            _cqEntries[cqIndex] = new Completion(sqe.UserData, result);
             _cqTail++;
 
             _sqHead++;
@@ -241,7 +241,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 {
                     ref var ev = ref _resultEvents[i];
                     var cqIndex = _cqTail & _cqMask;
-                    _cqEntries[cqIndex] = new Completion((ulong)ev.udata, (int)ev.data, CompletionFlags.None);
+                    _cqEntries[cqIndex] = new Completion((ulong)ev.udata, (int)ev.data);
                     _cqTail++;
                 }
             }
@@ -288,12 +288,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     private int ExecuteAccept(ref PendingOp sqe)
     {
-        unsafe
-        {
-            var addrLen = (int*)sqe.Addr2;
-            var result = Darwin.accept((int)sqe.Fd, sqe.Addr, addrLen);
-            return result;
-        }
+        var addrLen = (int*)sqe.Addr2;
+        var result = Darwin.accept((int)sqe.Fd, sqe.Addr, addrLen);
+        return result;
     }
 
     private int ExecuteConnect(ref PendingOp sqe)
@@ -344,40 +341,6 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        // Wait for completions using kevent
-        while (CompletionQueueCount < minComplete)
-        {
-            var timeout = new timespec
-            {
-                tv_sec = timeoutMs / 1000,
-                tv_nsec = (timeoutMs % 1000) * 1_000_000
-            };
-
-            var result = Darwin.kevent(_kqueueFd, null, 0, _resultEvents, _resultEvents.Length, ref timeout);
-
-            if (result > 0)
-            {
-                for (var i = 0; i < result; i++)
-                {
-                    ref var ev = ref _resultEvents[i];
-                    var cqIndex = _cqTail & _cqMask;
-                    _cqEntries[cqIndex] = new Completion((ulong)ev.udata, (int)ev.data, CompletionFlags.None);
-                    _cqTail++;
-                }
-            }
-            else if (result == 0)
-            {
-                break; // Timeout
-            }
-        }
-
-        return PeekCompletions(completions);
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AdvanceCompletionQueue(int count)
     {
         _cqHead += count;
@@ -388,7 +351,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     // =============================================================================
 
     /// <inheritdoc/>
-    public unsafe nint CreateListener(string bindAddress, ushort port, int backlog)
+    public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
         // Create TCP socket
         var fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -443,7 +406,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    public unsafe void ConfigureSocket(nint socket)
+    public void ConfigureSocket(nint socket)
     {
         var fd = (int)socket;
 
@@ -632,7 +595,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     // P/Invoke declarations
-    private static unsafe partial class Darwin
+    private static partial class Darwin
     {
         [LibraryImport("libSystem.dylib", SetLastError = true)]
         public static partial int kqueue();

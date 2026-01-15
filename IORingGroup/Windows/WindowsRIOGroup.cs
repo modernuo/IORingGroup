@@ -442,22 +442,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        var maxCount = Math.Min(completions.Length, _cqeBuffer.Length);
-        var count = Win_x64.ioring_wait_cqe(_ring, _cqeBufferPtr, (uint)maxCount, (uint)minComplete, timeoutMs);
-
-        for (var i = 0; i < count; i++)
-        {
-            ref var cqe = ref _cqeBuffer[i];
-            completions[i] = new Completion(cqe.UserData, cqe.Res, (CompletionFlags)cqe.Flags);
-        }
-
-        return (int)count;
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AdvanceCompletionQueue(int count) => Win_x64.ioring_cq_advance(_ring, (uint)count);
 
     public void Dispose()

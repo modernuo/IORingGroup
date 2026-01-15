@@ -195,7 +195,6 @@ public interface IIORingGroup : IDisposable
 
     // Completion Retrieval
     int PeekCompletions(Span<Completion> completions);
-    int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs);
     void AdvanceCompletionQueue(int count);
 
     // Zero-Copy Buffer Operations

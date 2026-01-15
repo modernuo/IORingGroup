@@ -219,7 +219,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
 
             // Add completion for each operation (synchronous execution)
             var cqIndex = _cqTail & _cqMask;
-            _cqEntries[cqIndex] = new Completion(sqe.UserData, result, CompletionFlags.None);
+            _cqEntries[cqIndex] = new Completion(sqe.UserData, result);
             _cqTail++;
 
             _sqHead++;
@@ -403,10 +403,8 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
                 fd = (int)(*(ulong*)(evPtr + 8));
 
             // Check if this is a pending poll
-            if (_pendingPolls.TryGetValue(fd, out var userData))
+            if (_pendingPolls.Remove(fd, out var userData))
             {
-                _pendingPolls.Remove(fd);
-
                 // Convert epoll events to result
                 var result = 0;
                 if ((events & epoll_events.EPOLLERR) != 0)
@@ -416,7 +414,7 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
 
                 // Add completion
                 var cqIndex = _cqTail & _cqMask;
-                _cqEntries[cqIndex] = new Completion(userData, result, CompletionFlags.None);
+                _cqEntries[cqIndex] = new Completion(userData, result);
                 _cqTail++;
             }
         }
@@ -436,31 +434,6 @@ public sealed unsafe class LinuxEpollGroup : IIORingGroup
         }
 
         return count;
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        // Wait for completions using epoll_wait
-        while (CompletionQueueCount < minComplete)
-        {
-            fixed (byte* eventsPtr = _epollEventsBuffer)
-            {
-                var result = _arch.epoll_wait(_epollFd, (nint)eventsPtr, _queueSize, timeoutMs);
-
-                if (result > 0)
-                {
-                    ProcessEpollEvents(eventsPtr, result);
-                }
-                else if (result == 0)
-                {
-                    break; // Timeout
-                }
-            }
-        }
-
-        return PeekCompletions(completions);
     }
 
     /// <inheritdoc/>

@@ -94,17 +94,8 @@ public interface IIORingGroup : IDisposable
     int PeekCompletions(Span<Completion> completions);
 
     /// <summary>
-    /// Waits for and retrieves completed operations.
-    /// </summary>
-    /// <param name="completions">Buffer to receive completions.</param>
-    /// <param name="minComplete">Minimum number of completions to wait for.</param>
-    /// <param name="timeoutMs">Timeout in milliseconds (-1 for infinite).</param>
-    /// <returns>Number of completions retrieved.</returns>
-    int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs);
-
-    /// <summary>
     /// Advances the completion queue head, marking completions as consumed.
-    /// Call this after processing completions from PeekCompletions/WaitCompletions.
+    /// Call this after processing completions from PeekCompletions.
     /// </summary>
     /// <param name="count">Number of completions to mark as consumed.</param>
     void AdvanceCompletionQueue(int count);

@@ -381,21 +381,6 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
-    {
-        // First check if we already have enough completions
-        var available = CompletionQueueCount;
-        if (available < minComplete)
-        {
-            // Need to wait for more completions
-            _arch.io_uring_enter(_ringFd, 0, (uint)minComplete, (uint)IORING_ENTER.GETEVENTS);
-        }
-
-        return PeekCompletions(completions);
-    }
-
-    /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AdvanceCompletionQueue(int count)
     {
         Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
