@@ -97,7 +97,6 @@ static void dequeue_rio_completions(ioring_t* ring);
 
 // Internal ring structure
 struct ioring {
-    ioring_backend_t backend;
     uint32_t sq_entries;
     uint32_t cq_entries;
     uint32_t sq_mask;
@@ -113,8 +112,7 @@ struct ioring {
     uint32_t cq_head;
     uint32_t cq_tail;
 
-    // RIO mode data
-    BOOL rio_mode;                      // True if created with ioring_create_rio
+    // RIO data
     RIO_CQ rio_cq;                      // RIO completion queue
     uint32_t rio_max_connections;       // Max concurrent connections
     uint32_t rio_active_connections;    // Current active connections
@@ -241,80 +239,74 @@ static BOOL add_pending_op(ioring_t* ring, uint64_t user_data, uint8_t opcode,
 IORING_API void ioring_destroy(ioring_t* ring) {
     if (!ring) return;
 
-    if (ring->rio_mode) {
-        // Cleanup owned listener sockets
-        if (ring->owned_listeners) {
-            for (uint32_t i = 0; i < ring->owned_listener_count; i++) {
-                if (ring->owned_listeners[i] != INVALID_SOCKET) {
-                    closesocket(ring->owned_listeners[i]);
-                }
-            }
-            free(ring->owned_listeners);
-        }
-
-        // Cleanup AcceptEx pool
-        if (ring->accept_pool) {
-            for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
-                if (ring->accept_pool[i].accept_socket != INVALID_SOCKET) {
-                    closesocket(ring->accept_pool[i].accept_socket);
-                }
-                if (ring->accept_pool[i].event) {
-                    CloseHandle(ring->accept_pool[i].event);
-                }
-            }
-            free(ring->accept_pool);
-        }
-        if (ring->accept_iocp) {
-            CloseHandle(ring->accept_iocp);
-        }
-
-        // Cleanup RIO connections (close sockets)
-        if (ring->rio_connections) {
-            for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
-                rio_connection_t* conn = &ring->rio_connections[i];
-                if ((conn->active || conn->reserved) && conn->socket != INVALID_SOCKET) {
-                    closesocket(conn->socket);
-                }
-            }
-            free(ring->rio_connections);
-        }
-
-        // Close RIO completion queue
-        if (ring->rio_cq != RIO_INVALID_CQ) {
-            rio.RIOCloseCompletionQueue(ring->rio_cq);
-        }
-
-        // Cleanup external buffers (user is responsible for freeing memory)
-        if (rio.RIODeregisterBuffer && ring->external_buffer_ids) {
-            for (uint32_t i = 0; i < ring->max_external_buffers; i++) {
-                if (ring->external_buffer_ids[i] != RIO_INVALID_BUFFERID) {
-                    rio.RIODeregisterBuffer(ring->external_buffer_ids[i]);
-                }
+    // Cleanup owned listener sockets
+    if (ring->owned_listeners) {
+        for (uint32_t i = 0; i < ring->owned_listener_count; i++) {
+            if (ring->owned_listeners[i] != INVALID_SOCKET) {
+                closesocket(ring->owned_listeners[i]);
             }
         }
+        free(ring->owned_listeners);
+    }
 
-        // Free external buffer arrays
-        free(ring->external_buffer_ids);
-        free(ring->external_buffer_ptrs);
-        free(ring->external_buffer_lengths);
+    // Cleanup AcceptEx pool
+    if (ring->accept_pool) {
+        for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
+            if (ring->accept_pool[i].accept_socket != INVALID_SOCKET) {
+                closesocket(ring->accept_pool[i].accept_socket);
+            }
+            if (ring->accept_pool[i].event) {
+                CloseHandle(ring->accept_pool[i].event);
+            }
+        }
+        free(ring->accept_pool);
+    }
+    if (ring->accept_iocp) {
+        CloseHandle(ring->accept_iocp);
+    }
 
-        // Close handles
-        if (ring->rio_iocp) {
-            CloseHandle(ring->rio_iocp);
+    // Cleanup RIO connections (close sockets)
+    if (ring->rio_connections) {
+        for (uint32_t i = 0; i < ring->rio_max_connections; i++) {
+            rio_connection_t* conn = &ring->rio_connections[i];
+            if ((conn->active || conn->reserved) && conn->socket != INVALID_SOCKET) {
+                closesocket(conn->socket);
+            }
         }
-        if (ring->rio_event) {
-            CloseHandle(ring->rio_event);
+        free(ring->rio_connections);
+    }
+
+    // Close RIO completion queue
+    if (ring->rio_cq != RIO_INVALID_CQ) {
+        rio.RIOCloseCompletionQueue(ring->rio_cq);
+    }
+
+    // Cleanup external buffers (user is responsible for freeing memory)
+    if (rio.RIODeregisterBuffer && ring->external_buffer_ids) {
+        for (uint32_t i = 0; i < ring->max_external_buffers; i++) {
+            if (ring->external_buffer_ids[i] != RIO_INVALID_BUFFERID) {
+                rio.RIODeregisterBuffer(ring->external_buffer_ids[i]);
+            }
         }
+    }
+
+    // Free external buffer arrays
+    free(ring->external_buffer_ids);
+    free(ring->external_buffer_ptrs);
+    free(ring->external_buffer_lengths);
+
+    // Close handles
+    if (ring->rio_iocp) {
+        CloseHandle(ring->rio_iocp);
+    }
+    if (ring->rio_event) {
+        CloseHandle(ring->rio_event);
     }
 
     free(ring->pending_ops);
     free(ring->sq);
     free(ring->cq);
     free(ring);
-}
-
-IORING_API ioring_backend_t ioring_get_backend(ioring_t* ring) {
-    return ring ? ring->backend : IORING_BACKEND_NONE;
 }
 
 IORING_API uint32_t ioring_sq_space_left(ioring_t* ring) {
@@ -621,8 +613,6 @@ static void process_pending_polls(ioring_t* ring) {
 
 // Dequeue RIO completions (and AcceptEx completions)
 static void dequeue_rio_completions(ioring_t* ring) {
-    if (!ring->rio_mode) return;
-
     // First check for AcceptEx completions (now using event-based notification)
     if (ring->accept_pool) {
         check_acceptex_completions(ring);
@@ -665,13 +655,7 @@ IORING_API int ioring_submit(ioring_t* ring) {
 
     for (uint32_t i = 0; i < to_submit; i++) {
         ioring_sqe_t* sqe = &ring->sq[ring->sq_head & ring->sq_mask];
-
-        if (ring->rio_mode) {
-            rio_execute_op(ring, sqe);
-        } else {
-            legacy_execute_op(ring, sqe);
-        }
-
+        rio_execute_op(ring, sqe);
         ring->sq_head++;
         submitted++;
     }
@@ -683,9 +667,7 @@ IORING_API int ioring_submit_and_wait(ioring_t* ring, uint32_t wait_nr) {
     int submitted = ioring_submit(ring);
 
     while (ioring_cq_ready(ring) < wait_nr) {
-        if (ring->rio_mode) {
-            dequeue_rio_completions(ring);
-        }
+        dequeue_rio_completions(ring);
         process_pending_polls(ring);
 
         if (ioring_cq_ready(ring) >= wait_nr) break;
@@ -700,9 +682,7 @@ IORING_API uint32_t ioring_peek_cqe(ioring_t* ring, ioring_cqe_t* cqes, uint32_t
     if (!ring || !cqes) return 0;
 
     // First, dequeue any RIO completions
-    if (ring->rio_mode) {
-        dequeue_rio_completions(ring);
-    }
+    dequeue_rio_completions(ring);
 
     uint32_t available = ioring_cq_ready(ring);
     uint32_t to_copy = count < available ? count : available;
@@ -722,9 +702,7 @@ IORING_API uint32_t ioring_wait_cqe(ioring_t* ring, ioring_cqe_t* cqes, uint32_t
     int spin_count = 0;
 
     while (ioring_cq_ready(ring) < min_complete) {
-        if (ring->rio_mode) {
-            dequeue_rio_completions(ring);
-        }
+        dequeue_rio_completions(ring);
         process_pending_polls(ring);
 
         if (ioring_cq_ready(ring) >= min_complete) break;
@@ -804,8 +782,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
     ring->cq_entries = next_power_of_two(ring->cq_entries);
     ring->sq_mask = entries - 1;
     ring->cq_mask = ring->cq_entries - 1;
-    ring->rio_mode = TRUE;
-    ring->backend = IORING_BACKEND_RIO;
     ring->rio_max_connections = max_connections;
     ring->rio_outstanding_per_socket = outstanding_per_socket;
     ring->rio_cq = RIO_INVALID_CQ;
@@ -919,7 +895,7 @@ IORING_API int ioring_rio_register(
     ioring_t* ring,
     SOCKET socket
 ) {
-    if (!ring || !ring->rio_mode) {
+    if (!ring) {
         last_error = EINVAL;
         return -1;
     }
@@ -994,7 +970,7 @@ IORING_API int ioring_rio_register(
 }
 
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id) {
-    if (!ring || !ring->rio_mode) return;
+    if (!ring) return;
     if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return;
 
     rio_connection_t* conn = &ring->rio_connections[conn_id];
@@ -1008,16 +984,12 @@ IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id) {
     ring->rio_active_connections--;
 }
 
-IORING_API int ioring_is_rio(ioring_t* ring) {
-    return ring && ring->rio_mode;
-}
-
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring) {
-    return ring && ring->rio_mode ? ring->rio_active_connections : 0;
+    return ring ? ring->rio_active_connections : 0;
 }
 
 IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id) {
-    if (!ring || !ring->rio_mode) return INVALID_SOCKET;
+    if (!ring) return INVALID_SOCKET;
     if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return INVALID_SOCKET;
 
     rio_connection_t* conn = &ring->rio_connections[conn_id];
@@ -1485,7 +1457,7 @@ IORING_API int ioring_rio_register_external_buffer(
     void* buffer,
     uint32_t length
 ) {
-    if (!ring || !ring->rio_mode) {
+    if (!ring) {
         last_error = EINVAL;
         return -1;
     }
@@ -1526,7 +1498,7 @@ IORING_API int ioring_rio_register_external_buffer(
 }
 
 IORING_API void ioring_rio_unregister_external_buffer(ioring_t* ring, int buffer_id) {
-    if (!ring || !ring->rio_mode) return;
+    if (!ring) return;
     if (buffer_id < 0 || (uint32_t)buffer_id >= ring->max_external_buffers) return;
 
     if (ring->external_buffer_ids[buffer_id] != RIO_INVALID_BUFFERID) {
@@ -1575,11 +1547,11 @@ IORING_API void ioring_prep_recv_external(
 }
 
 IORING_API uint32_t ioring_rio_get_external_buffer_count(ioring_t* ring) {
-    if (!ring || !ring->rio_mode) return 0;
+    if (!ring) return 0;
     return ring->external_buffer_count;
 }
 
 IORING_API uint32_t ioring_rio_get_max_external_buffers(ioring_t* ring) {
-    if (!ring || !ring->rio_mode) return 0;
+    if (!ring) return 0;
     return ring->max_external_buffers;
 }

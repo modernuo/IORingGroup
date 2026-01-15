@@ -134,19 +134,6 @@ public class IORingGroupTests
 public class WindowsFactoryTests
 {
     [SkippableFact]
-    public void Factory_ReturnsWindowsRIOGroup()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-        Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
-
-        using var ring = System.Network.IORingGroup.Create();
-        Assert.IsType<System.Network.Windows.WindowsRIOGroup>(ring);
-
-        var rioRing = (System.Network.Windows.WindowsRIOGroup)ring;
-        Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, rioRing.Backend);
-    }
-
-    [SkippableFact]
     public void SendRecv_WithConnectedSockets_Works()
     {
         // Legacy PrepareSend/PrepareRecv is not supported in RIO mode.
@@ -236,32 +223,6 @@ public class WindowsRIOGroupTests
     private const int MaxConnections = 128;
 
     [SkippableFact]
-    public void RIO_IsAvailable()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        // This test verifies RIO is available on the system
-        // Create a minimal ring to test RIO initialization
-        try
-        {
-            using var ring = new System.Network.Windows.WindowsRIOGroup(
-                queueSize: 256,
-                maxConnections: 16,
-                recvBufferSize: 1024,
-                sendBufferSize: 1024
-            );
-
-            Assert.True(ring.IsRIO, "Ring should be in RIO mode");
-            Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, ring.Backend);
-        }
-        catch (InvalidOperationException ex)
-        {
-            var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-            Skip.If(true, $"RIO not available on this system: {ex.Message}, error code: {error}");
-        }
-    }
-
-    [SkippableFact]
     public void RegisterSocket_DiagnosticInfo()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -300,9 +261,7 @@ public class WindowsRIOGroupTests
                 Skip.If(error == 10045, $"RegisterSocket failed with WSAEOPNOTSUPP - rebuild ioring.dll with latest changes");
 
                 Assert.Fail($"RegisterSocket failed: {errorMsg}\n" +
-                    $"Socket handle: {server.Handle}\n" +
-                    $"Ring IsRIO: {ring.IsRIO}\n" +
-                    $"Ring Backend: {ring.Backend}");
+                    $"Socket handle: {server.Handle}");
             }
 
             Assert.True(connId >= 0);
@@ -327,7 +286,6 @@ public class WindowsRIOGroupTests
         );
 
         Assert.NotNull(ring);
-        Assert.True(ring.IsRIO);
         Assert.Equal(MaxConnections, ring.MaxConnections);
         Assert.Equal(BufferSize, ring.RecvBufferSize);
         Assert.Equal(BufferSize, ring.SendBufferSize);
@@ -347,7 +305,6 @@ public class WindowsRIOGroupTests
         );
 
         Assert.NotNull(ring);
-        Assert.True(ring.IsRIO);
     }
 
     [SkippableFact]
@@ -500,16 +457,6 @@ public class WindowsRIOGroupTests
         ring.PreparePollAdd(listener.Handle, PollMask.In, 1);
 
         Assert.Equal(initialSpace - 1, ring.SubmissionQueueSpace);
-    }
-
-    [SkippableFact]
-    public void Backend_ReturnsRIO()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-
-        Assert.Equal(System.Network.Windows.Win_x64.IORingBackend.RIO, ring.Backend);
     }
 
     [SkippableFact]

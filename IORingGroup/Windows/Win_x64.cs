@@ -13,16 +13,6 @@ public static partial class Win_x64
     private const string LibraryName = "ioring.dll";
 
     /// <summary>
-    /// Backend type returned by ioring_get_backend.
-    /// </summary>
-    public enum IORingBackend : int
-    {
-        None = 0,
-        IoRing = 1,  // Windows 11+ IoRing
-        RIO = 2,     // Windows 8+ Registered I/O
-    }
-
-    /// <summary>
     /// Completion queue entry structure matching C ioring_cqe_t.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
@@ -35,9 +25,6 @@ public static partial class Win_x64
 
     [LibraryImport(LibraryName)]
     public static partial void ioring_destroy(nint ring);
-
-    [LibraryImport(LibraryName)]
-    public static partial IORingBackend ioring_get_backend(nint ring);
 
     [LibraryImport(LibraryName)]
     public static partial uint ioring_sq_space_left(nint ring);
@@ -123,12 +110,6 @@ public static partial class Win_x64
     /// </summary>
     [LibraryImport(LibraryName)]
     public static partial void ioring_rio_unregister(nint ring, int connId);
-
-    /// <summary>
-    /// Check if ring was created with RIO support.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial int ioring_is_rio(nint ring);
 
     /// <summary>
     /// Get number of active (registered) connections.

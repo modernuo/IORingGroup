@@ -116,16 +116,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
     }
 
     /// <summary>
-    /// Gets whether this ring is using RIO mode.
-    /// </summary>
-    public bool IsRIO => Win_x64.ioring_is_rio(_ring) != 0;
-
-    /// <summary>
-    /// Gets the backend type being used.
-    /// </summary>
-    public Win_x64.IORingBackend Backend => Win_x64.ioring_get_backend(_ring);
-
-    /// <summary>
     /// Gets the maximum number of connections this ring supports.
     /// </summary>
     public int MaxConnections => _maxConnections;

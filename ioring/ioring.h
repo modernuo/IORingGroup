@@ -78,22 +78,12 @@ typedef struct ioring_cqe {
     uint32_t flags;         // Completion flags
 } ioring_cqe_t;
 
-// Backend type
-typedef enum ioring_backend {
-    IORING_BACKEND_NONE = 0,
-    IORING_BACKEND_IORING = 1,  // Windows 11+ IoRing (not used - no socket support)
-    IORING_BACKEND_RIO = 2,     // Windows 8+ Registered I/O
-} ioring_backend_t;
-
 // =============================================================================
 // Core API
 // =============================================================================
 
 // Destroy a ring created by ioring_create_rio_ex()
 IORING_API void ioring_destroy(ioring_t* ring);
-
-// Get backend type
-IORING_API ioring_backend_t ioring_get_backend(ioring_t* ring);
 
 // Get queue state
 IORING_API uint32_t ioring_sq_space_left(ioring_t* ring);
@@ -178,9 +168,6 @@ IORING_API int ioring_rio_register(
 // Unregister a connection (call BEFORE closing the socket)
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
-
-// Check if ring was created with RIO support
-IORING_API int ioring_is_rio(ioring_t* ring);
 
 // Get number of active (registered) connections
 IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
