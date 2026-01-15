@@ -89,7 +89,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
-        if (outstandingPerSocket < 1 || outstandingPerSocket > MaxOutstandingPerSocket)
+        if (outstandingPerSocket is < 1 or > MaxOutstandingPerSocket)
         {
             throw new ArgumentOutOfRangeException(nameof(outstandingPerSocket),
                 $"Must be between 1 and {MaxOutstandingPerSocket}");

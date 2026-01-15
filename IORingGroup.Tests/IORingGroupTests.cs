@@ -432,7 +432,7 @@ public class WindowsRIOGroupTests
             var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
                 ring.Handle, "127.0.0.1", testPort, 128);
 
-            if (listenerHandle == -1 || listenerHandle == 0)
+            if (listenerHandle is -1 or 0)
             {
                 var err = System.Network.Windows.Win_x64.ioring_get_last_error();
                 Skip.If(true, $"Failed to create library-owned listener: error {err}");
