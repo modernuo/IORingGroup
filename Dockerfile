@@ -5,7 +5,7 @@
 # Supports both io_uring and epoll backends
 
 # Build stage
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Copy project files first for better layer caching
@@ -36,7 +36,7 @@ RUN dotnet publish TestServer/TestServer.csproj -c Release -r linux-x64 --no-bui
 RUN dotnet publish TestClient/TestClient.csproj -c Release -r linux-x64 --no-build -o /app/client
 
 # Server runtime image
-FROM mcr.microsoft.com/dotnet/runtime:9.0 AS server
+FROM mcr.microsoft.com/dotnet/runtime:10.0 AS server
 WORKDIR /app
 COPY --from=build /app/server .
 
@@ -51,7 +51,7 @@ EXPOSE 5000
 ENTRYPOINT ["sh", "-c", "./TestServer $BACKEND $BENCHMARK_ARGS -d $DURATION"]
 
 # Client runtime image
-FROM mcr.microsoft.com/dotnet/runtime:9.0 AS client
+FROM mcr.microsoft.com/dotnet/runtime:10.0 AS client
 WORKDIR /app
 COPY --from=build /app/client .
 
@@ -64,7 +64,7 @@ ENV MAX_CONCURRENT="1000"
 ENTRYPOINT ["sh", "-c", "./TestClient -h $SERVER_HOST -P $SERVER_PORT -b $MESSAGES -c $CONNECTIONS -C $MAX_CONCURRENT"]
 
 # Test runner image
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS test
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS test
 WORKDIR /src
 
 COPY . .
