@@ -112,58 +112,18 @@ public static partial class Win_x64
     public static partial void ioring_rio_unregister(nint ring, int connId);
 
     /// <summary>
-    /// Get number of active (registered) connections.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial uint ioring_rio_get_active_connections(nint ring);
-
-    /// <summary>
     /// Get the socket handle for a connection ID.
     /// Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid.
     /// </summary>
     [LibraryImport(LibraryName)]
     public static partial nint ioring_rio_get_socket(nint ring, int connId);
 
-    /// <summary>
-    /// Create a regular accept socket (can use legacy recv/send, CANNOT use RIO).
-    /// Use this for legacy I/O mode.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    public static partial nint ioring_create_accept_socket();
-
     // =============================================================================
-    // RIO AcceptEx Support (for server-side RIO)
+    // RIO Listener Support
     // =============================================================================
 
     /// <summary>
-    /// Create a socket suitable for AcceptEx that has WSA_FLAG_REGISTERED_IO.
-    /// Returns INVALID_SOCKET (-1) on failure.
-    /// </summary>
-    /// <remarks>
-    /// IMPORTANT: Sockets returned by accept() do NOT inherit WSA_FLAG_REGISTERED_IO.
-    /// For server-side RIO, you must:
-    /// 1. Create sockets with CreateAcceptSocket()
-    /// 2. Use AcceptEx to accept into these pre-created sockets
-    /// 3. After AcceptEx completes, call setsockopt with SO_UPDATE_ACCEPT_CONTEXT
-    /// 4. Then register them with ioring_rio_register()
-    /// </remarks>
-    [LibraryImport(LibraryName)]
-    public static partial nint ioring_rio_create_accept_socket();
-
-    /// <summary>
-    /// Get AcceptEx function pointer (convenience helper).
-    /// Returns null (IntPtr.Zero) on failure.
-    /// </summary>
-    /// <param name="listenSocket">The listening socket (can be IntPtr.Zero to use a temp socket)</param>
-    [LibraryImport(LibraryName)]
-    public static partial nint ioring_get_acceptex(nint listenSocket);
-
-    // =============================================================================
-    // RIO Listener Support (library-owned sockets to avoid IOCP conflicts)
-    // =============================================================================
-
-    /// <summary>
-    /// Create a listener socket owned by the ring (automatically associated with ring's IOCP).
+    /// Create a listener socket with WSA_FLAG_REGISTERED_IO.
     /// </summary>
     /// <param name="ring">Ring handle from ioring_create_rio</param>
     /// <param name="bindAddr">IP address to bind to (e.g., "0.0.0.0" or "127.0.0.1")</param>
@@ -171,9 +131,8 @@ public static partial class Win_x64
     /// <param name="backlog">Listen queue size (e.g., 128 or SOMAXCONN)</param>
     /// <returns>Listener socket on success, INVALID_SOCKET (-1) on failure</returns>
     /// <remarks>
-    /// For RIO mode, the library should own the listener socket to avoid IOCP
-    /// association conflicts with .NET's runtime. Use this API instead of creating
-    /// a Socket in C# and passing its handle.
+    /// The library owns the listener and uses AcceptEx internally to create
+    /// RIO-compatible accepted sockets.
     /// </remarks>
     [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
     public static partial nint ioring_rio_create_listener(nint ring, string bindAddr, ushort port, int backlog);
@@ -265,6 +224,18 @@ public static partial class Win_x64
     // =============================================================================
     // Winsock2 Helpers
     // =============================================================================
+
+    /// <summary>
+    /// WSA socket flags.
+    /// </summary>
+    public const uint WSA_FLAG_OVERLAPPED = 0x01;
+    public const uint WSA_FLAG_REGISTERED_IO = 0x100;
+
+    /// <summary>
+    /// Create a socket with specific flags.
+    /// </summary>
+    [LibraryImport("ws2_32.dll")]
+    public static partial nint WSASocketW(int af, int type, int protocol, nint lpProtocolInfo, uint g, uint dwFlags);
 
     /// <summary>
     /// Close a socket handle.

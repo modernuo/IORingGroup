@@ -131,51 +131,6 @@ public class IORingGroupTests
     }
 }
 
-public class WindowsFactoryTests
-{
-    [SkippableFact]
-    public void SendRecv_WithConnectedSockets_Works()
-    {
-        // Legacy PrepareSend/PrepareRecv is not supported in RIO mode.
-        // RIO requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead.
-        Skip.If(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
-            "Windows RIO mode requires external buffers. Use PrepareSendBuffer/PrepareRecvBuffer instead of PrepareSend/PrepareRecv.");
-
-        Skip.IfNot(System.Network.IORingGroup.IsSupported, "IORingGroup not supported");
-
-        using var ring = System.Network.IORingGroup.Create(256);
-        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        listener.Listen(1);
-        var endpoint = (IPEndPoint)listener.LocalEndPoint!;
-
-        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        client.Connect(endpoint);
-
-        using var server = listener.Accept();
-
-        // Test send
-        var sendBuffer = "Hello, IORing!"u8.ToArray();
-        unsafe
-        {
-            fixed (byte* pSend = sendBuffer)
-            {
-#pragma warning disable CS0618 // Type or member is obsolete
-                ring.PrepareSend(client.Handle, (nint)pSend, sendBuffer.Length, MsgFlags.None, 1);
-#pragma warning restore CS0618
-            }
-        }
-        ring.Submit();
-
-        // Receive on server side (synchronous for test simplicity)
-        var recvBuffer = new byte[sendBuffer.Length];
-        var received = server.Receive(recvBuffer);
-
-        Assert.Equal(sendBuffer.Length, received);
-        Assert.Equal(sendBuffer, recvBuffer);
-    }
-}
-
 public class CompletionStructTests
 {
     [Fact]
@@ -329,16 +284,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void ActiveConnections_InitiallyZero()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
-
-        Assert.Equal(0, ring.ActiveConnections);
-    }
-
-    [SkippableFact]
     public void RegisterSocket_WithValidSocket_ReturnsPositiveConnId()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -367,10 +312,8 @@ public class WindowsRIOGroupTests
         }
 
         Assert.True(connId >= 0, $"RegisterSocket failed with connId={connId}");
-        Assert.Equal(1, ring.ActiveConnections);
 
         ring.UnregisterSocket(connId);
-        Assert.Equal(0, ring.ActiveConnections);
     }
 
     [SkippableFact]
@@ -412,15 +355,11 @@ public class WindowsRIOGroupTests
                 connIds.Add(connId);
             }
 
-            Assert.Equal(5, ring.ActiveConnections);
-
             // Unregister all
             foreach (var connId in connIds)
             {
                 ring.UnregisterSocket(connId);
             }
-
-            Assert.Equal(0, ring.ActiveConnections);
         }
         finally
         {
@@ -460,51 +399,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void CreateAcceptSocket_ReturnsValidSocket()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        try
-        {
-            var acceptSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-
-            if (acceptSocket == -1)
-            {
-                var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                Skip.If(true, $"CreateAcceptSocket failed with error {error}");
-            }
-
-            Assert.NotEqual(-1, acceptSocket);
-
-            // Clean up - close the socket
-            System.Net.Sockets.Socket.OSSupportsUnixDomainSockets.ToString(); // Force socket init
-            // Use closesocket via P/Invoke or just let it leak for the test
-        }
-        catch (EntryPointNotFoundException)
-        {
-            Skip.If(true, "ioring_rio_create_accept_socket not available - rebuild ioring.dll");
-        }
-    }
-
-    [SkippableFact]
-    public void GetAcceptEx_ReturnsValidPointer()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        try
-        {
-            var acceptExPtr = System.Network.Windows.WindowsRIOGroup.GetAcceptEx();
-
-            // Should succeed - the function creates a temp socket if none provided
-            Assert.NotEqual(nint.Zero, acceptExPtr);
-        }
-        catch (EntryPointNotFoundException)
-        {
-            Skip.If(true, "ioring_get_acceptex not available - rebuild ioring.dll");
-        }
-    }
-
-    [SkippableFact]
     public void RIO_PrepareAccept_AutomaticallyUsesAcceptEx()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
@@ -516,7 +410,7 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
-            // Use library-owned listener to avoid .NET IOCP conflicts
+            // Use library-owned listener with WSA_FLAG_REGISTERED_IO
             const ushort testPort = 0;  // Let OS assign port
             var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
                 ring.Handle, "127.0.0.1", testPort, 128);
@@ -573,7 +467,7 @@ public class WindowsRIOGroupTests
             // Try to register the socket with RIO
             // NOTE: AcceptEx now creates sockets WITHOUT WSA_FLAG_REGISTERED_IO for legacy compatibility.
             // This means RegisterSocket will FAIL with WSAEOPNOTSUPP (10045).
-            // For server-side RIO, users must create accept sockets manually with CreateAcceptSocket().
+            // For server-side RIO, users must create accept sockets manually with WSASocketW with WSA_FLAG_REGISTERED_IO.
             var connId = ring.RegisterSocket(acceptedSocket);
             if (connId < 0)
             {
@@ -582,7 +476,7 @@ public class WindowsRIOGroupTests
                 Skip.If(error == 10045,
                     "RegisterSocket failed with WSAEOPNOTSUPP - expected behavior. " +
                     "AcceptEx creates regular sockets for legacy compatibility. " +
-                    "For server-side RIO, create accept sockets manually with CreateAcceptSocket().");
+                    "For server-side RIO, create accept sockets manually with WSASocketW with WSA_FLAG_REGISTERED_IO.");
                 Assert.Fail($"RegisterSocket failed with unexpected error {error}");
             }
             Assert.True(connId >= 0, $"RegisterSocket failed");
@@ -673,11 +567,11 @@ public class WindowsRIOGroupTests
             using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, BufferSize, BufferSize);
 
             // Create a pre-allocated socket with WSA_FLAG_REGISTERED_IO
-            var acceptSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
+            var acceptSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
             if (acceptSocket == -1)
             {
                 var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                Skip.If(true, $"CreateAcceptSocket failed with error {error}");
+                Skip.If(true, $"WSASocketW failed with error {error}");
             }
 
             // For now, just verify we can create the socket and it's valid
@@ -752,8 +646,8 @@ public class WindowsRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create a CLIENT socket with WSA_FLAG_REGISTERED_IO using C library
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             // Connect our RIO socket to the listener using direct P/Invoke
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
@@ -979,8 +873,8 @@ public class WindowsRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create RIO client socket
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in
@@ -1079,8 +973,8 @@ public class WindowsRIOGroupTests
             listener.Listen(1);
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in
@@ -1173,8 +1067,8 @@ public class WindowsRIOGroupTests
             listener.Listen(1);
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            var clientSocket = System.Network.Windows.WindowsRIOGroup.CreateAcceptSocket();
-            Skip.If(clientSocket == -1, "CreateAcceptSocket failed");
+            var clientSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0, System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(clientSocket == -1, "WSASocketW failed");
 
             System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
             var addr = new System.Network.Windows.Win_x64.sockaddr_in

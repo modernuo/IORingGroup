@@ -15,12 +15,6 @@ public interface IIORingGroup : IDisposable
     int SubmissionQueueSpace { get; }
 
     /// <summary>
-    /// Gets the number of currently active connections (platform-specific tracking).
-    /// Returns -1 if not supported by the implementation.
-    /// </summary>
-    int ActiveConnections => -1;
-
-    /// <summary>
     /// Gets the number of pending completions in the completion queue.
     /// </summary>
     int CompletionQueueCount { get; }
@@ -56,26 +50,6 @@ public interface IIORingGroup : IDisposable
     /// <param name="addrLen">Length of the address structure.</param>
     /// <param name="userData">User data returned with the completion.</param>
     void PrepareConnect(nint fd, nint addr, int addrLen, ulong userData);
-
-    /// <summary>
-    /// Queues a send operation to transmit data.
-    /// </summary>
-    /// <param name="fd">Socket file descriptor.</param>
-    /// <param name="buf">Pointer to data buffer.</param>
-    /// <param name="len">Number of bytes to send.</param>
-    /// <param name="flags">Send flags.</param>
-    /// <param name="userData">User data returned with the completion.</param>
-    void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData);
-
-    /// <summary>
-    /// Queues a receive operation to receive data.
-    /// </summary>
-    /// <param name="fd">Socket file descriptor.</param>
-    /// <param name="buf">Pointer to buffer to receive data.</param>
-    /// <param name="len">Maximum bytes to receive.</param>
-    /// <param name="flags">Receive flags.</param>
-    /// <param name="userData">User data returned with the completion.</param>
-    void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData);
 
     /// <summary>
     /// Queues a close operation on a file descriptor.

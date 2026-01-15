@@ -143,9 +143,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         sqe.UserData = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         ref var sqe = ref GetSqe();
         sqe.Opcode = (byte)IORingOp.Send;
@@ -156,9 +155,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         sqe.UserData = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         ref var sqe = ref GetSqe();
         sqe.Opcode = (byte)IORingOp.Recv;

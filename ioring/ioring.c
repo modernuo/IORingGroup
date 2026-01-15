@@ -129,7 +129,6 @@ struct ioring {
     acceptex_context_t* accept_pool;    // Pool of pending AcceptEx contexts
     uint32_t accept_pool_size;          // Size of accept pool
     LPFN_ACCEPTEX fn_acceptex;          // Cached AcceptEx function pointer
-    LPFN_GETACCEPTEXSOCKADDRS fn_getacceptexsockaddrs;  // For extracting addresses
 
     // Legacy mode data (pending operations for sync fallback)
     struct pending_op {
@@ -959,10 +958,6 @@ IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id) {
     ring->rio_active_connections--;
 }
 
-IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring) {
-    return ring ? ring->rio_active_connections : 0;
-}
-
 IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id) {
     if (!ring) return INVALID_SOCKET;
     if (conn_id < 0 || (uint32_t)conn_id >= ring->rio_max_connections) return INVALID_SOCKET;
@@ -975,24 +970,16 @@ IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id) {
 // RIO AcceptEx Support (for server-side RIO)
 // =============================================================================
 
-// Get AcceptEx and GetAcceptExSockaddrs function pointers
+// Get AcceptEx function pointer
 static BOOL load_acceptex_functions(ioring_t* ring, SOCKET listen_socket) {
     if (ring->fn_acceptex) return TRUE;  // Already loaded
 
     GUID acceptex_guid = WSAID_ACCEPTEX;
-    GUID getacceptexsockaddrs_guid = WSAID_GETACCEPTEXSOCKADDRS;
     DWORD bytes = 0;
 
     if (WSAIoctl(listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
                  &acceptex_guid, sizeof(acceptex_guid),
                  &ring->fn_acceptex, sizeof(ring->fn_acceptex),
-                 &bytes, NULL, NULL) != 0) {
-        return FALSE;
-    }
-
-    if (WSAIoctl(listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                 &getacceptexsockaddrs_guid, sizeof(getacceptexsockaddrs_guid),
-                 &ring->fn_getacceptexsockaddrs, sizeof(ring->fn_getacceptexsockaddrs),
                  &bytes, NULL, NULL) != 0) {
         return FALSE;
     }
@@ -1031,8 +1018,6 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 
     // Create accept socket WITH WSA_FLAG_REGISTERED_IO for RIO support.
     // NOTE: Sockets with WSA_FLAG_REGISTERED_IO can ONLY use RIO recv/send!
-    // For legacy recv/send, use ioring_create_accept_socket() which creates
-    // sockets with WSA_FLAG_OVERLAPPED instead.
     ctx->accept_socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                                      WSA_FLAG_REGISTERED_IO);
     if (ctx->accept_socket == INVALID_SOCKET) {
@@ -1180,80 +1165,6 @@ static void check_acceptex_completions(ioring_t* ring) {
     }
 }
 
-IORING_API SOCKET ioring_rio_create_accept_socket(void) {
-    init_winsock();
-
-    // Create a socket with WSA_FLAG_REGISTERED_IO so it can be used with RIO
-    // after AcceptEx completes. NOTE: This socket CANNOT use regular recv/send!
-    SOCKET sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_REGISTERED_IO);
-    if (sock == INVALID_SOCKET) {
-        last_error = WSAGetLastError();
-        return INVALID_SOCKET;
-    }
-
-    return sock;
-}
-
-IORING_API SOCKET ioring_create_accept_socket(void) {
-    init_winsock();
-
-    // DEPRECATED: This function creates sockets without WSA_FLAG_REGISTERED_IO.
-    // Such sockets cannot use RIO operations. Use ioring_rio_create_accept_socket()
-    // or let the ring's AcceptEx pool create sockets automatically.
-    // This function is kept for API compatibility but should not be used in RIO mode.
-    SOCKET sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-    if (sock == INVALID_SOCKET) {
-        last_error = WSAGetLastError();
-        return INVALID_SOCKET;
-    }
-
-    return sock;
-}
-
-// Cached AcceptEx function pointer
-static LPFN_ACCEPTEX cached_acceptex = NULL;
-
-IORING_API void* ioring_get_acceptex(SOCKET listen_socket) {
-    if (cached_acceptex) {
-        return cached_acceptex;
-    }
-
-    init_winsock();
-
-    if (listen_socket == INVALID_SOCKET) {
-        // Create a temporary socket to get the function pointer
-        listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listen_socket == INVALID_SOCKET) {
-            last_error = WSAGetLastError();
-            return NULL;
-        }
-
-        GUID acceptex_guid = WSAID_ACCEPTEX;
-        DWORD bytes = 0;
-        if (WSAIoctl(listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                     &acceptex_guid, sizeof(acceptex_guid),
-                     &cached_acceptex, sizeof(cached_acceptex),
-                     &bytes, NULL, NULL) != 0) {
-            last_error = WSAGetLastError();
-            closesocket(listen_socket);
-            return NULL;
-        }
-        closesocket(listen_socket);
-    } else {
-        GUID acceptex_guid = WSAID_ACCEPTEX;
-        DWORD bytes = 0;
-        if (WSAIoctl(listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                     &acceptex_guid, sizeof(acceptex_guid),
-                     &cached_acceptex, sizeof(cached_acceptex),
-                     &bytes, NULL, NULL) != 0) {
-            last_error = WSAGetLastError();
-            return NULL;
-        }
-    }
-
-    return cached_acceptex;
-}
-
 // =============================================================================
 // RIO Listener Support
 // =============================================================================
@@ -1338,15 +1249,6 @@ IORING_API SOCKET ioring_rio_create_listener(
         WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
                  &acceptex_guid, sizeof(acceptex_guid),
                  &ring->fn_acceptex, sizeof(ring->fn_acceptex),
-                 &bytes, NULL, NULL);
-    }
-
-    if (!ring->fn_getacceptexsockaddrs) {
-        GUID sockaddrs_guid = WSAID_GETACCEPTEXSOCKADDRS;
-        DWORD bytes = 0;
-        WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                 &sockaddrs_guid, sizeof(sockaddrs_guid),
-                 &ring->fn_getacceptexsockaddrs, sizeof(ring->fn_getacceptexsockaddrs),
                  &bytes, NULL, NULL);
     }
 

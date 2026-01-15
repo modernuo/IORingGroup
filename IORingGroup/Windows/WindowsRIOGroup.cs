@@ -121,11 +121,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public int MaxConnections => _maxConnections;
 
     /// <summary>
-    /// Gets the current number of active (registered) connections.
-    /// </summary>
-    public int ActiveConnections => (int)Win_x64.ioring_rio_get_active_connections(_ring);
-
-    /// <summary>
     /// Gets the socket handle for a connection ID.
     /// </summary>
     /// <param name="connId">Connection ID returned by AcceptEx completion or RegisterSocket.</param>
@@ -190,52 +185,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public void UnregisterSocket(int connId)
     {
         Win_x64.ioring_rio_unregister(_ring, connId);
-    }
-
-    /// <summary>
-    /// Creates a socket with WSA_FLAG_REGISTERED_IO for use with manual AcceptEx.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// <b>Note:</b> This is only needed for advanced scenarios where you want to
-    /// manually manage AcceptEx. For normal use, simply call PrepareAccept which
-    /// handles AcceptEx internally.
-    /// </para>
-    /// <para>
-    /// Manual AcceptEx pattern (advanced):
-    /// <code>
-    /// // 1. Create accept socket with RIO flag
-    /// var acceptSocket = WindowsRIOGroup.CreateAcceptSocket();
-    ///
-    /// // 2. Use AcceptEx to accept into this socket (via Windows API)
-    /// AcceptEx(listenSocket, acceptSocket, buffer, ...);
-    ///
-    /// // 3. After AcceptEx completes, update socket context
-    /// setsockopt(acceptSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, listenSocket);
-    ///
-    /// // 4. Register with RIO
-    /// var connId = ring.RegisterSocket(acceptSocket, out recvBuf, out sendBuf);
-    /// </code>
-    /// </para>
-    /// </remarks>
-    /// <returns>Socket handle, or -1 on failure</returns>
-    public static nint CreateAcceptSocket()
-    {
-        return Win_x64.ioring_rio_create_accept_socket();
-    }
-
-    /// <summary>
-    /// Gets the AcceptEx function pointer for use with manual async accept operations.
-    /// </summary>
-    /// <remarks>
-    /// <b>Note:</b> This is only needed for advanced scenarios. PrepareAccept handles
-    /// AcceptEx internally for normal use.
-    /// </remarks>
-    /// <param name="listenSocket">Optional listening socket (-1 to use temp socket)</param>
-    /// <returns>AcceptEx function pointer, or IntPtr.Zero on failure</returns>
-    public static nint GetAcceptEx(nint listenSocket = -1)
-    {
-        return Win_x64.ioring_get_acceptex(listenSocket);
     }
 
     /// <summary>
@@ -443,99 +392,44 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PreparePollAdd(nint fd, PollMask mask, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_poll_add(sqe, fd, (uint)mask, userData);
-    }
+    public void PreparePollAdd(nint fd, PollMask mask, ulong userData) =>
+        Win_x64.ioring_prep_poll_add(GetSqe(), fd, (uint)mask, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PreparePollRemove(ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_poll_remove(sqe, userData);
-    }
+    public void PreparePollRemove(ulong userData) => Win_x64.ioring_prep_poll_remove(GetSqe(), userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareAccept(nint listenFd, nint addr, nint addrLen, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_accept(sqe, listenFd, addr, addrLen, userData);
-    }
+    public void PrepareAccept(nint listenFd, nint addr, nint addrLen, ulong userData) =>
+        Win_x64.ioring_prep_accept(GetSqe(), listenFd, addr, addrLen, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareConnect(nint fd, nint addr, int addrLen, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_connect(sqe, fd, addr, addrLen, userData);
-    }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// <b>WARNING:</b> This method is NOT supported in RIO mode and will return -EINVAL.
-    /// RIO mode requires external buffers. Use <see cref="PrepareSendBuffer"/> instead.
-    /// </remarks>
-    [Obsolete("Use PrepareSendBuffer with external buffers. Legacy send is not supported in RIO mode.")]
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_send(sqe, fd, buf, (uint)len, (int)flags, userData);
-    }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// <b>WARNING:</b> This method is NOT supported in RIO mode and will return -EINVAL.
-    /// RIO mode requires external buffers. Use <see cref="PrepareRecvBuffer"/> instead.
-    /// </remarks>
-    [Obsolete("Use PrepareRecvBuffer with external buffers. Legacy recv is not supported in RIO mode.")]
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_recv(sqe, fd, buf, (uint)len, (int)flags, userData);
-    }
+    public void PrepareConnect(nint fd, nint addr, int addrLen, ulong userData) =>
+        Win_x64.ioring_prep_connect(GetSqe(), fd, addr, addrLen, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareClose(nint fd, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_close(sqe, fd, userData);
-    }
+    public void PrepareClose(nint fd, ulong userData) => Win_x64.ioring_prep_close(GetSqe(), fd, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareCancel(ulong targetUserData, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_cancel(sqe, targetUserData, userData);
-    }
+    public void PrepareCancel(ulong targetUserData, ulong userData) =>
+        Win_x64.ioring_prep_cancel(GetSqe(), targetUserData, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareShutdown(nint fd, int how, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_shutdown(sqe, fd, how, userData);
-    }
+    public void PrepareShutdown(nint fd, int how, ulong userData) =>
+        Win_x64.ioring_prep_shutdown(GetSqe(), fd, how, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int Submit()
-    {
-        return Win_x64.ioring_submit(_ring);
-    }
+    public int Submit() => Win_x64.ioring_submit(_ring);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int SubmitAndWait(int waitNr)
-    {
-        return Win_x64.ioring_submit_and_wait(_ring, (uint)waitNr);
-    }
+    public int SubmitAndWait(int waitNr) => Win_x64.ioring_submit_and_wait(_ring, (uint)waitNr);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -571,10 +465,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void AdvanceCompletionQueue(int count)
-    {
-        Win_x64.ioring_cq_advance(_ring, (uint)count);
-    }
+    public void AdvanceCompletionQueue(int count) => Win_x64.ioring_cq_advance(_ring, (uint)count);
 
     public void Dispose()
     {

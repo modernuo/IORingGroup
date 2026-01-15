@@ -1087,7 +1087,6 @@ public class Program
         {
             Console.WriteLine();
             Console.WriteLine("=== RIO Ring Info ===");
-            Console.WriteLine($"Active connections: {rioRing.ActiveConnections}");
             Console.WriteLine($"Max connections: {rioRing.MaxConnections}");
         }
 

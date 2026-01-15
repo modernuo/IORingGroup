@@ -6,7 +6,6 @@
 
 #include <stdint.h>
 #include <winsock2.h>
-#include <windows.h>
 
 #ifdef IORING_EXPORTS
 #define IORING_API __declspec(dllexport)
@@ -169,60 +168,17 @@ IORING_API int ioring_rio_register(
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
 
-// Get number of active (registered) connections
-IORING_API uint32_t ioring_rio_get_active_connections(ioring_t* ring);
-
 // Get the socket handle for a connection ID
 // Returns INVALID_SOCKET (-1) if the connection is not active or conn_id is invalid
 IORING_API SOCKET ioring_rio_get_socket(ioring_t* ring, int conn_id);
 
-// DEPRECATED: Creates a socket without WSA_FLAG_REGISTERED_IO.
-// Such sockets cannot use RIO operations.
-// Use ioring_rio_create_accept_socket() or let the ring's AcceptEx pool create sockets.
-// Kept for API compatibility only.
-IORING_API SOCKET ioring_create_accept_socket(void);
-
 // =============================================================================
-// RIO AcceptEx Support (for server-side RIO)
+// RIO Listener Support
 // =============================================================================
 
 /*
- * IMPORTANT: Sockets returned by accept() do NOT inherit WSA_FLAG_REGISTERED_IO.
- * For server-side RIO, you must:
- * 1. Create sockets with ioring_rio_create_accept_socket()
- * 2. Use AcceptEx (from Windows) to accept into these pre-created sockets
- * 3. Then register them with ioring_rio_register()
- *
- * Example pattern:
- *   // Create accept socket pool
- *   SOCKET acceptSock = ioring_rio_create_accept_socket();
- *
- *   // Use AcceptEx (get via WSAIoctl with WSAID_ACCEPTEX)
- *   AcceptEx(listenSock, acceptSock, buffer, 0, addrLen, addrLen, &bytes, &overlapped);
- *
- *   // After AcceptEx completes, update socket context
- *   setsockopt(acceptSock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
- *              (char*)&listenSock, sizeof(listenSock));
- *
- *   // Now register for RIO
- *   ioring_rio_register(ring, acceptSock, &recvBuf, &sendBuf);
- */
-
-// Create a socket suitable for AcceptEx that has WSA_FLAG_REGISTERED_IO
-// Returns INVALID_SOCKET on failure
-IORING_API SOCKET ioring_rio_create_accept_socket(void);
-
-// Get AcceptEx function pointer (convenience helper)
-// Returns NULL on failure
-IORING_API void* ioring_get_acceptex(SOCKET listen_socket);
-
-// =============================================================================
-// RIO Listener Support (library-owned sockets to avoid IOCP conflicts)
-// =============================================================================
-
-/*
- * For RIO mode, the library should own the listener socket to avoid IOCP
- * association conflicts with .NET's runtime. Use these APIs:
+ * For RIO mode, the library owns the listener socket and uses AcceptEx internally
+ * to create RIO-compatible accepted sockets. Usage:
  *
  *   // Create and start listening
  *   SOCKET listener = ioring_rio_create_listener(ring, "0.0.0.0", 5000, 128);
@@ -234,8 +190,8 @@ IORING_API void* ioring_get_acceptex(SOCKET listen_socket);
  *   ioring_rio_close_listener(ring, listener);
  */
 
-// Create a listener socket owned by the ring (automatically associated with ring's IOCP)
-// - ring: the RIO ring to associate with
+// Create a listener socket with WSA_FLAG_REGISTERED_IO
+// - ring: the RIO ring
 // - bind_addr: IP address to bind to (e.g., "0.0.0.0" or "127.0.0.1")
 // - port: port number to listen on
 // - backlog: listen queue size (e.g., SOMAXCONN or 128)

@@ -263,9 +263,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         sqe->user_data = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
         if (sqe == null) throw new InvalidOperationException("Submission queue full");
@@ -278,9 +277,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         sqe->user_data = userData;
     }
 
-    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
         if (sqe == null) throw new InvalidOperationException("Submission queue full");
