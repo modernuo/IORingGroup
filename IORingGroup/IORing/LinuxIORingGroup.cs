@@ -38,7 +38,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     private bool _disposed;
 
-    public LinuxIORingGroup(ILinuxArch arch, int queueSize)
+    public LinuxIORingGroup(ILinuxArch arch, int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
@@ -46,6 +46,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         _arch = arch;
+
+        // Initialize external buffer tracking (maxConnections * 3 to support recv + send + pipe per connection)
+        _maxExternalBuffers = maxConnections * 3;
+        _externalBufferPtrs = new nint[_maxExternalBuffers];
+        _externalBufferLengths = new int[_maxExternalBuffers];
 
         var p = new io_uring_params();
         _ringFd = arch.io_uring_setup((uint)queueSize, ref p);
@@ -461,9 +466,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // =============================================================================
 
     // External buffer tracking (similar to Windows RIO)
-    private const int MaxExternalBuffers = 16;
-    private readonly nint[] _externalBufferPtrs = new nint[MaxExternalBuffers];
-    private readonly int[] _externalBufferLengths = new int[MaxExternalBuffers];
+    // Size = maxConnections * 3 to support recv + send + pipe per connection
+    private readonly int _maxExternalBuffers;
+    private readonly nint[] _externalBufferPtrs;
+    private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
 
     /// <inheritdoc/>
@@ -479,11 +485,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         if (buffer == null)
             throw new ArgumentNullException(nameof(buffer));
 
-        if (_externalBufferCount >= MaxExternalBuffers)
+        if (_externalBufferCount >= _maxExternalBuffers)
             throw new InvalidOperationException("Maximum external buffer count reached");
 
         // Find free slot
-        for (var i = 0; i < MaxExternalBuffers; i++)
+        for (var i = 0; i < _maxExternalBuffers; i++)
         {
             if (_externalBufferPtrs[i] == 0)
             {
@@ -501,7 +507,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void UnregisterBuffer(int bufferId)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             throw new ArgumentOutOfRangeException(nameof(bufferId));
 
         if (_externalBufferPtrs[bufferId] != 0)
@@ -520,7 +526,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             throw new ArgumentOutOfRangeException(nameof(bufferId));
 
         var bufPtr = _externalBufferPtrs[bufferId];
@@ -542,7 +548,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             throw new ArgumentOutOfRangeException(nameof(bufferId));
 
         var bufPtr = _externalBufferPtrs[bufferId];

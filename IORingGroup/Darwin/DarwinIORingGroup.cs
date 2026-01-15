@@ -34,9 +34,10 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private bool _disposed;
 
     // External buffer tracking (for IORingBuffer/Pool support)
-    private const int MaxExternalBuffers = 16;
-    private readonly nint[] _externalBufferPtrs = new nint[MaxExternalBuffers];
-    private readonly int[] _externalBufferLengths = new int[MaxExternalBuffers];
+    // Size = maxConnections * 3 to support recv + send + pipe per connection
+    private readonly int _maxExternalBuffers;
+    private readonly nint[] _externalBufferPtrs;
+    private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
 
     private struct PendingOp
@@ -50,7 +51,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         public ulong UserData;
     }
 
-    public DarwinIORingGroup(int queueSize)
+    public DarwinIORingGroup(int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
@@ -65,6 +66,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         _cqEntries = new Completion[queueSize * 2];
         _kevents = new kevent[queueSize];
         _resultEvents = new kevent[queueSize];
+
+        // Initialize external buffer tracking (maxConnections * 3 to support recv + send + pipe per connection)
+        _maxExternalBuffers = maxConnections * 3;
+        _externalBufferPtrs = new nint[_maxExternalBuffers];
+        _externalBufferLengths = new int[_maxExternalBuffers];
 
         _kqueueFd = Darwin.kqueue();
         if (_kqueueFd < 0)
@@ -483,11 +489,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         if (buffer == null)
             throw new ArgumentNullException(nameof(buffer));
 
-        if (_externalBufferCount >= MaxExternalBuffers)
-            throw new InvalidOperationException($"Maximum of {MaxExternalBuffers} external buffers reached");
+        if (_externalBufferCount >= _maxExternalBuffers)
+            throw new InvalidOperationException($"Maximum of {_maxExternalBuffers} external buffers reached");
 
         // Find first free slot
-        for (var i = 0; i < MaxExternalBuffers; i++)
+        for (var i = 0; i < _maxExternalBuffers; i++)
         {
             if (_externalBufferPtrs[i] == 0)
             {
@@ -505,7 +511,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void UnregisterBuffer(int bufferId)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             return; // Silently ignore invalid IDs for consistency with other platforms
 
         if (_externalBufferPtrs[bufferId] != 0)
@@ -524,7 +530,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             throw new ArgumentOutOfRangeException(nameof(bufferId));
 
         var bufPtr = _externalBufferPtrs[bufferId];
@@ -543,7 +549,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= MaxExternalBuffers)
+        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
             throw new ArgumentOutOfRangeException(nameof(bufferId));
 
         var bufPtr = _externalBufferPtrs[bufferId];

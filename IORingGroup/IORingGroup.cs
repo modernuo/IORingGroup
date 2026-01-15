@@ -24,7 +24,7 @@ public static class IORingGroup
     /// Creates an IIORingGroup instance appropriate for the current platform.
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
-    /// <param name="maxConnections">Maximum concurrent connections (Windows RIO only, ignored on other platforms).</param>
+    /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 3).</param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
     public static IIORingGroup Create(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
@@ -36,13 +36,13 @@ public static class IORingGroup
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            return CreateLinuxRing(queueSize);
+            return CreateLinuxRing(queueSize, maxConnections);
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
             RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD))
         {
-            return CreateDarwinRing(queueSize);
+            return CreateDarwinRing(queueSize, maxConnections);
         }
 
         throw new PlatformNotSupportedException(
@@ -57,7 +57,7 @@ public static class IORingGroup
         return new Windows.WindowsRIOGroup(queueSize, maxConnections, unusedBufferSize, unusedBufferSize);
     }
 
-    private static IIORingGroup CreateLinuxRing(int queueSize)
+    private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
     {
         // Use architecture-specific implementation via singleton instances
         IORing.ILinuxArch arch = RuntimeInformation.ProcessArchitecture switch
@@ -66,12 +66,12 @@ public static class IORingGroup
                 => IORing.Architectures.Linux_arm64.Instance,
             _ => IORing.Architectures.Linux_x64.Instance,
         };
-        return new IORing.LinuxIORingGroup(arch, queueSize);
+        return new IORing.LinuxIORingGroup(arch, queueSize, maxConnections);
     }
 
-    private static IIORingGroup CreateDarwinRing(int queueSize)
+    private static IIORingGroup CreateDarwinRing(int queueSize, int maxConnections)
     {
-        return new Darwin.DarwinIORingGroup(queueSize);
+        return new Darwin.DarwinIORingGroup(queueSize, maxConnections);
     }
 
     /// <summary>
