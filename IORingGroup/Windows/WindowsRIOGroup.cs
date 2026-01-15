@@ -55,16 +55,6 @@ public sealed class WindowsRIOGroup : IIORingGroup
     public nint Handle => _ring;
 
     /// <summary>
-    /// Creates a new RIO ring.
-    /// </summary>
-    /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
-    /// <param name="maxConnections">Maximum concurrent connections</param>
-    public WindowsRIOGroup(int queueSize, int maxConnections)
-        : this(queueSize, maxConnections, DefaultOutstandingPerSocket)
-    {
-    }
-
-    /// <summary>
     /// Creates a new RIO ring with configurable outstanding operations.
     /// </summary>
     /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
@@ -75,7 +65,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// For simple request-response patterns (like echo), use 1-2.
     /// For pipelined protocols, use 4-8.
     /// </remarks>
-    public WindowsRIOGroup(int queueSize, int maxConnections, int outstandingPerSocket)
+    public WindowsRIOGroup(int queueSize, int maxConnections, int outstandingPerSocket = DefaultOutstandingPerSocket)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
