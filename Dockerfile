@@ -46,8 +46,8 @@ COPY --from=build /app/server .
 
 # Default to io_uring backend with benchmark mode
 ENV BACKEND="--iouring"
-ENV BENCHMARK_ARGS="-b -q"
-ENV DURATION="60"
+ENV BENCHMARK_ARGS="-b"
+ENV DURATION="10"
 
 EXPOSE 5000
 

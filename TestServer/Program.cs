@@ -67,6 +67,7 @@ public class Program
     private static bool _finalStatsPrinted;
     private static int _peakConnections;
     private static int _pendingAcceptCount;
+    private static ulong _acceptSequence;  // Salt for accept userData to track unique operations
 
     // Syscall timing stats
     private static long _pollCallCount;
@@ -114,7 +115,9 @@ public class Program
             else if (arg.Equals("--quiet", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-q", StringComparison.OrdinalIgnoreCase))
             {
-                _quietMode = true;
+                // DEBUG: Force quiet mode off for debugging io_uring issue
+                // _quietMode = true;
+                _quietMode = false;
             }
             else if ((arg.Equals("--affinity", StringComparison.OrdinalIgnoreCase) ||
                       arg.Equals("-a", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Length)
@@ -145,6 +148,8 @@ public class Program
 
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
+        Console.WriteLine($"io_uring available: {IORingGroup.IsIOUringAvailable}");
+        Console.WriteLine($"Epoll fallback: {IORingGroup.IsUsingEpollFallback}");
         Console.WriteLine($"Backend: {backend}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
@@ -193,9 +198,12 @@ public class Program
             }
             else
             {
-                // On Linux/macOS, use IORingGroup.Create() for native io_uring/kqueue
+                // On Linux/macOS, use IORingGroup.Create() for native io_uring/kqueue/epoll
                 ring = IORingGroup.Create(queueSize: MaxClients);
-                Console.WriteLine($"IORing created (native {(RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "io_uring" : "kqueue")})");
+                var backendName = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+                    ? (IORingGroup.IsIOUringAvailable ? "io_uring" : "epoll")
+                    : "kqueue";
+                Console.WriteLine($"IORing created (native {backendName})");
             }
 
             using var ringGroup = ring;
@@ -217,7 +225,7 @@ public class Program
                 throw new InvalidOperationException("Failed to create listener");
             }
 
-            Console.WriteLine($"Server listening on port {Port}");
+            Console.WriteLine($"Server listening on port {Port} (listener fd={listener})");
 
             try
             {
@@ -301,6 +309,9 @@ public class Program
 
             for (var i = 0; i < count; i++)
             {
+                var cqe = completions[i];
+                var op = (cqe.UserData & OpMask) >> 56;
+                Console.WriteLine($"[DEBUG] CQE: userData=0x{cqe.UserData:X}, result={cqe.Result}, op={op}");
                 ProcessCompletion(ring, rioRing, listener, ref completions[i], benchmarkMode);
             }
 
@@ -355,11 +366,21 @@ public class Program
     {
         _pendingAcceptCount--;
 
+        // EAGAIN (-11) means no connection pending - just re-queue accept
+        // This happens with epoll/kqueue sync implementations
+        if (result == -11) // -EAGAIN
+        {
+            goto ReplenishAccepts;
+        }
+
+        Console.WriteLine($"[DEBUG] Accept result: {result}");
+
         if (result >= 0)
         {
             // Result is socket handle
             var clientSocket = (nint)result;
             var clientIndex = FindFreeSlot();
+            Console.WriteLine($"[DEBUG] Accept: socket={clientSocket}, clientIndex={clientIndex}");
 
             if (clientIndex >= 0)
             {
@@ -386,7 +407,7 @@ public class Program
 
                 if (rioRing != null)
                 {
-                    // Register socket with RIO to create RQ
+                    // Windows: Register socket with RIO to create RQ
                     var connId = rioRing.RegisterSocket(clientSocket);
                     if (connId >= 0)
                     {
@@ -400,6 +421,11 @@ public class Program
                         client = default;
                         goto ReplenishAccepts;
                     }
+                }
+                else
+                {
+                    // Linux/Darwin: Use socket fd directly as connId
+                    client.ConnId = (int)clientSocket;
                 }
 
                 // Start timing on first connection
@@ -421,21 +447,20 @@ public class Program
                     Console.WriteLine($"Client {clientIndex} connected (socket={clientSocket}, connId={client.ConnId})");
 
                 // Post initial receive - recv into buffer at tail (write position)
-                if (rioRing != null)
+                client.Buffer.GetWriteSpan(out var writeOffset);
+                var availableSpace = client.Buffer.WritableBytes;
+                if (availableSpace > 0)
                 {
-                    client.Buffer.GetWriteSpan(out var writeOffset);
-                    var availableSpace = client.Buffer.WritableBytes;
-                    if (availableSpace > 0)
-                    {
-                        rioRing.PrepareRecvBuffer(
-                            client.ConnId,
-                            client.Buffer.BufferId,
-                            writeOffset,       // Offset = current write position (tail)
-                            availableSpace,    // Length = available space
-                            OpRecv | (uint)clientIndex
-                        );
-                        client.RecvPending = true;
-                    }
+                    if (!_quietMode)
+                        Console.WriteLine($"[DEBUG] Posting recv: fd={client.ConnId}, bufferId={client.Buffer.BufferId}, offset={writeOffset}, len={availableSpace}, bufPtr=0x{client.Buffer.Pointer:X}");
+                    ring.PrepareRecvBuffer(
+                        client.ConnId,
+                        client.Buffer.BufferId,
+                        writeOffset,       // Offset = current write position (tail)
+                        availableSpace,    // Length = available space
+                        OpRecv | (uint)clientIndex
+                    );
+                    client.RecvPending = true;
                 }
             }
             else
@@ -465,13 +490,15 @@ public class Program
 
         if (result <= 0)
         {
+            if (!_quietMode)
+                Console.WriteLine($"[DEBUG] Recv result on client {index}: {result} {(result < 0 ? $"(errno={-result})" : "(EOF)")}");
             CloseClient(ring, rioRing, index);
             return;
         }
 
         // Note: Don't count bytes here - count once on send completion to match PollGroup
 
-        if (rioRing == null || client.Buffer == null) return;
+        if (client.Buffer == null) return;
 
         // Commit the write - data is now available for sending
         client.Buffer.CommitWrite(result);
@@ -483,7 +510,7 @@ public class Program
             var dataToSend = client.Buffer.ReadableBytes;
             if (dataToSend > 0)
             {
-                rioRing.PrepareSendBuffer(
+                ring.PrepareSendBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
                     readOffset,     // Offset = current read position (head)
@@ -501,7 +528,7 @@ public class Program
             var spaceForRecv = client.Buffer.WritableBytes;
             if (spaceForRecv > 0)
             {
-                rioRing.PrepareRecvBuffer(
+                ring.PrepareRecvBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
                     writeOffset,    // Offset = current write position (tail)
@@ -527,7 +554,7 @@ public class Program
         _totalBytes += result;
         _totalMessages++;
 
-        if (rioRing == null || client.Buffer == null) return;
+        if (client.Buffer == null) return;
 
         // Commit the read - data has been sent, free up space
         client.Buffer.CommitRead(result);
@@ -539,7 +566,7 @@ public class Program
             var dataToSend = client.Buffer.ReadableBytes;
             if (dataToSend > 0)
             {
-                rioRing.PrepareSendBuffer(
+                ring.PrepareSendBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
                     readOffset,     // Offset = current read position (head)
@@ -557,7 +584,7 @@ public class Program
             var spaceForRecv = client.Buffer.WritableBytes;
             if (spaceForRecv > 0)
             {
-                rioRing.PrepareRecvBuffer(
+                ring.PrepareRecvBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
                     writeOffset,    // Offset = current write position (tail)

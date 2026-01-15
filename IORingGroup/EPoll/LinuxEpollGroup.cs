@@ -5,14 +5,17 @@ using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace System.Network.Darwin;
+namespace System.Network.EPoll;
 
 /// <summary>
-/// macOS/BSD implementation of IIORingGroup using dispatch_io and kqueue.
+/// Linux epoll implementation of IIORingGroup.
+/// Used as fallback when io_uring is not available (Docker, WSL2, old kernels).
+/// Follows the same pattern as DarwinIORingGroup with user-space ring buffers.
 /// </summary>
-public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
+public sealed unsafe class LinuxEpollGroup : IIORingGroup
 {
-    private readonly int _kqueueFd;
+    private readonly ILinuxEpollArch _arch;
+    private readonly int _epollFd;
     private readonly int _queueSize;
 
     // Submission queue (user-space ring buffer)
@@ -27,18 +30,20 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private int _cqTail;
     private readonly int _cqMask;
 
-    // kevent array for batch operations
-    private readonly kevent[] _kevents;
-    private readonly kevent[] _resultEvents;
+    // epoll_event buffer for batch operations
+    private readonly byte[] _epollEventsBuffer;
+    private readonly int _epollEventSize;
 
     private bool _disposed;
 
     // External buffer tracking (for IORingBuffer/Pool support)
-    // Size = maxConnections * 3 to support recv + send + pipe per connection
     private readonly int _maxExternalBuffers;
     private readonly nint[] _externalBufferPtrs;
     private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
+
+    // Pending poll operations - maps fd to userData for poll events
+    private readonly System.Collections.Generic.Dictionary<int, ulong> _pendingPolls = new();
 
     private struct PendingOp
     {
@@ -51,32 +56,34 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         public ulong UserData;
     }
 
-    public DarwinIORingGroup(int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
+    internal LinuxEpollGroup(ILinuxEpollArch arch, int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
+        _arch = arch;
         _queueSize = queueSize;
         _sqMask = queueSize - 1;
         _cqMask = queueSize * 2 - 1;
+        _epollEventSize = arch.EpollEventSize;
 
         _sqEntries = new PendingOp[queueSize];
         _cqEntries = new Completion[queueSize * 2];
-        _kevents = new kevent[queueSize];
-        _resultEvents = new kevent[queueSize];
+        _epollEventsBuffer = new byte[queueSize * _epollEventSize];
 
         // Initialize external buffer tracking (maxConnections * 3 to support recv + send + pipe per connection)
         _maxExternalBuffers = maxConnections * 3;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
-        _kqueueFd = Darwin.kqueue();
-        if (_kqueueFd < 0)
+        // Create epoll instance with CLOEXEC
+        _epollFd = arch.epoll_create1((int)epoll_flags.CLOEXEC);
+        if (_epollFd < 0)
         {
             var errno = Marshal.GetLastPInvokeError();
-            throw new InvalidOperationException($"kqueue() failed: errno {errno}");
+            throw new InvalidOperationException($"epoll_create1 failed: errno {errno}");
         }
     }
 
@@ -212,7 +219,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
             var result = ExecuteOp(ref sqe);
 
-            // Add completion
+            // Add completion for each operation (synchronous execution)
             var cqIndex = _cqTail & _cqMask;
             _cqEntries[cqIndex] = new Completion(sqe.UserData, result, CompletionFlags.None);
             _cqTail++;
@@ -232,19 +239,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Wait for completions if needed
         while (CompletionQueueCount < waitNr)
         {
-            // Use kevent to wait
-            var timeout = new timespec { tv_sec = 0, tv_nsec = 1_000_000 }; // 1ms
-            var result = Darwin.kevent(_kqueueFd, null, 0, _resultEvents, _resultEvents.Length, ref timeout);
-
-            if (result > 0)
+            fixed (byte* eventsPtr = _epollEventsBuffer)
             {
-                // Process kqueue events
-                for (var i = 0; i < result; i++)
+                var result = _arch.epoll_wait(_epollFd, (nint)eventsPtr, _queueSize, 1);
+
+                if (result > 0)
                 {
-                    ref var ev = ref _resultEvents[i];
-                    var cqIndex = _cqTail & _cqMask;
-                    _cqEntries[cqIndex] = new Completion((ulong)ev.udata, (int)ev.data, CompletionFlags.None);
-                    _cqTail++;
+                    ProcessEpollEvents(eventsPtr, result);
                 }
             }
         }
@@ -257,6 +258,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         return sqe.Opcode switch
         {
             (byte)IORingOp.PollAdd => ExecutePollAdd(ref sqe),
+            (byte)IORingOp.PollRemove => ExecutePollRemove(ref sqe),
             (byte)IORingOp.Accept => ExecuteAccept(ref sqe),
             (byte)IORingOp.Connect => ExecuteConnect(ref sqe),
             (byte)IORingOp.Send => ExecuteSend(ref sqe),
@@ -269,63 +271,157 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     private int ExecutePollAdd(ref PendingOp sqe)
     {
-        // Convert poll mask to kqueue filter
-        short filter = 0;
+        var fd = (int)sqe.Fd;
+
+        // Convert PollMask to epoll events
+        var events = epoll_events.EPOLLET | epoll_events.EPOLLONESHOT;
         if ((sqe.Flags & (int)PollMask.In) != 0)
-            filter = (short)kqueue_filter.READ;
-        else if ((sqe.Flags & (int)PollMask.Out) != 0)
-            filter = (short)kqueue_filter.WRITE;
+            events |= epoll_events.EPOLLIN;
+        if ((sqe.Flags & (int)PollMask.Out) != 0)
+            events |= epoll_events.EPOLLOUT;
+        if ((sqe.Flags & (int)PollMask.Err) != 0)
+            events |= epoll_events.EPOLLERR;
+        if ((sqe.Flags & (int)PollMask.Hup) != 0)
+            events |= epoll_events.EPOLLHUP;
+        if ((sqe.Flags & (int)PollMask.RdHup) != 0)
+            events |= epoll_events.EPOLLRDHUP;
 
-        var ev = new kevent
+        // Store userData for lookup when event fires
+        _pendingPolls[fd] = sqe.UserData;
+
+        // Create epoll_event structure on stack
+        // Store fd in data field so we can look up userData later
+        Span<byte> evBuffer = stackalloc byte[16]; // Max size
+        fixed (byte* evPtr = evBuffer)
         {
-            ident = sqe.Fd,
-            filter = filter,
-            flags = (ushort)(kqueue_flags.ADD | kqueue_flags.CLEAR | kqueue_flags.ONESHOT),
-            udata = (nint)sqe.UserData
-        };
+            // Write events (4 bytes)
+            *(uint*)evPtr = (uint)events;
+            // Write fd as data (so we can look up in _pendingPolls)
+            if (_epollEventSize == 12)
+                *(ulong*)(evPtr + 4) = (ulong)fd;
+            else
+                *(ulong*)(evPtr + 8) = (ulong)fd;
 
-        var result = Darwin.kevent(_kqueueFd, new[] { ev }, 1, null, 0, nint.Zero);
-        return result < 0 ? -Marshal.GetLastPInvokeError() : 0;
+            var result = _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_ADD, fd, (nint)evPtr);
+            if (result < 0)
+            {
+                var errno = Marshal.GetLastPInvokeError();
+                // Try MOD if ADD fails with EEXIST (17)
+                if (errno == 17)
+                {
+                    result = _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_MOD, fd, (nint)evPtr);
+                    if (result < 0)
+                    {
+                        _pendingPolls.Remove(fd);
+                        return -Marshal.GetLastPInvokeError();
+                    }
+                }
+                else
+                {
+                    _pendingPolls.Remove(fd);
+                    return -errno;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private int ExecutePollRemove(ref PendingOp sqe)
+    {
+        // For poll remove, we need to delete from epoll
+        // The userData contains info about what to remove, but epoll_ctl DEL ignores the event
+        var result = _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_DEL, (int)sqe.Addr, 0);
+        return result == 0 ? 0 : -Marshal.GetLastPInvokeError();
     }
 
     private int ExecuteAccept(ref PendingOp sqe)
     {
-        unsafe
-        {
-            var addrLen = (int*)sqe.Addr2;
-            var result = Darwin.accept((int)sqe.Fd, sqe.Addr, addrLen);
-            return result;
-        }
+        var result = _arch.accept((int)sqe.Fd, sqe.Addr, sqe.Addr2);
+        if (result < 0)
+            return -Marshal.GetLastPInvokeError();
+        return result;
     }
 
     private int ExecuteConnect(ref PendingOp sqe)
     {
-        var result = Darwin.connect((int)sqe.Fd, sqe.Addr, sqe.Len);
-        return result == 0 ? 0 : -Marshal.GetLastPInvokeError();
+        var result = _arch.connect((int)sqe.Fd, sqe.Addr, sqe.Len);
+        if (result < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            // EINPROGRESS (115) is expected for non-blocking connect
+            if (errno == 115)
+                return 0;
+            return -errno;
+        }
+        return 0;
     }
 
     private int ExecuteSend(ref PendingOp sqe)
     {
-        var result = Darwin.send((int)sqe.Fd, sqe.Addr, (nuint)sqe.Len, sqe.Flags);
+        var result = _arch.send((int)sqe.Fd, sqe.Addr, (nuint)sqe.Len, sqe.Flags);
+        if (result < 0)
+            return -Marshal.GetLastPInvokeError();
         return (int)result;
     }
 
     private int ExecuteRecv(ref PendingOp sqe)
     {
-        var result = Darwin.recv((int)sqe.Fd, sqe.Addr, (nuint)sqe.Len, sqe.Flags);
+        var result = _arch.recv((int)sqe.Fd, sqe.Addr, (nuint)sqe.Len, sqe.Flags);
+        if (result < 0)
+            return -Marshal.GetLastPInvokeError();
         return (int)result;
     }
 
     private int ExecuteClose(ref PendingOp sqe)
     {
-        var result = Darwin.close((int)sqe.Fd);
+        // Remove from epoll first (ignore errors)
+        _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_DEL, (int)sqe.Fd, 0);
+
+        var result = _arch.close((int)sqe.Fd);
         return result == 0 ? 0 : -Marshal.GetLastPInvokeError();
     }
 
     private int ExecuteShutdown(ref PendingOp sqe)
     {
-        var result = Darwin.shutdown((int)sqe.Fd, sqe.Flags);
+        var result = _arch.shutdown((int)sqe.Fd, sqe.Flags);
         return result == 0 ? 0 : -Marshal.GetLastPInvokeError();
+    }
+
+    private void ProcessEpollEvents(byte* eventsPtr, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var evPtr = eventsPtr + i * _epollEventSize;
+
+            // Read events (4 bytes at offset 0)
+            var events = (epoll_events)(*(uint*)evPtr);
+
+            // Read fd from data field (we store fd, not userData directly)
+            int fd;
+            if (_epollEventSize == 12)
+                fd = (int)(*(ulong*)(evPtr + 4));
+            else
+                fd = (int)(*(ulong*)(evPtr + 8));
+
+            // Check if this is a pending poll
+            if (_pendingPolls.TryGetValue(fd, out var userData))
+            {
+                _pendingPolls.Remove(fd);
+
+                // Convert epoll events to result
+                var result = 0;
+                if ((events & epoll_events.EPOLLERR) != 0)
+                    result = -1;
+                else if ((events & epoll_events.EPOLLHUP) != 0)
+                    result = 0; // EOF
+
+                // Add completion
+                var cqIndex = _cqTail & _cqMask;
+                _cqEntries[cqIndex] = new Completion(userData, result, CompletionFlags.None);
+                _cqTail++;
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -348,30 +444,21 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int WaitCompletions(Span<Completion> completions, int minComplete, int timeoutMs)
     {
-        // Wait for completions using kevent
+        // Wait for completions using epoll_wait
         while (CompletionQueueCount < minComplete)
         {
-            var timeout = new timespec
+            fixed (byte* eventsPtr = _epollEventsBuffer)
             {
-                tv_sec = timeoutMs / 1000,
-                tv_nsec = (timeoutMs % 1000) * 1_000_000
-            };
+                var result = _arch.epoll_wait(_epollFd, (nint)eventsPtr, _queueSize, timeoutMs);
 
-            var result = Darwin.kevent(_kqueueFd, null, 0, _resultEvents, _resultEvents.Length, ref timeout);
-
-            if (result > 0)
-            {
-                for (var i = 0; i < result; i++)
+                if (result > 0)
                 {
-                    ref var ev = ref _resultEvents[i];
-                    var cqIndex = _cqTail & _cqMask;
-                    _cqEntries[cqIndex] = new Completion((ulong)ev.udata, (int)ev.data, CompletionFlags.None);
-                    _cqTail++;
+                    ProcessEpollEvents(eventsPtr, result);
                 }
-            }
-            else if (result == 0)
-            {
-                break; // Timeout
+                else if (result == 0)
+                {
+                    break; // Timeout
+                }
             }
         }
 
@@ -392,45 +479,39 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public unsafe nint CreateListener(string bindAddress, ushort port, int backlog)
     {
-        // Create TCP socket
-        var fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        // Create non-blocking TCP socket
+        var fd = _arch.socket(_arch.AF_INET, _arch.SOCK_STREAM | _arch.SOCK_NONBLOCK, _arch.IPPROTO_TCP);
         if (fd < 0) return -1;
-
-        // Set non-blocking
-        var flags = Darwin.fcntl(fd, F_GETFL, 0);
-        if (flags >= 0)
-            Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
         // Disable SO_REUSEADDR (exclusive address use)
         var optval = 0;
-        Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (nint)(&optval), sizeof(int));
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_REUSEADDR, (nint)(&optval), sizeof(int));
 
         // TCP_NODELAY (disable Nagle)
         optval = 1;
-        Darwin.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (nint)(&optval), sizeof(int));
+        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
 
         // Disable SO_LINGER
         var linger = new linger { l_onoff = 0, l_linger = 0 };
-        Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(linger));
 
         // Parse and bind address
         var addr = new sockaddr_in
         {
-            sin_len = (byte)sizeof(sockaddr_in),
-            sin_family = AF_INET,
+            sin_family = (ushort)_arch.AF_INET,
             sin_port = BinaryPrimitives.ReverseEndianness(port),
             sin_addr = ParseIPv4(bindAddress)
         };
 
-        if (Darwin.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
+        if (_arch.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
         {
-            Darwin.close(fd);
+            _arch.close(fd);
             return -1;
         }
 
-        if (Darwin.listen(fd, backlog) < 0)
+        if (_arch.listen(fd, backlog) < 0)
         {
-            Darwin.close(fd);
+            _arch.close(fd);
             return -1;
         }
 
@@ -441,7 +522,10 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void CloseListener(nint listener)
     {
         if (listener >= 0)
-            Darwin.close((int)listener);
+        {
+            _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_DEL, (int)listener, 0);
+            _arch.close((int)listener);
+        }
     }
 
     /// <inheritdoc/>
@@ -450,39 +534,34 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         var fd = (int)socket;
 
         // Set non-blocking
-        var flags = Darwin.fcntl(fd, F_GETFL, 0);
+        var flags = _arch.fcntl(fd, _arch.F_GETFL, 0);
         if (flags >= 0)
-            Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            _arch.fcntl(fd, _arch.F_SETFL, flags | _arch.O_NONBLOCK);
 
         // TCP_NODELAY (disable Nagle)
         var optval = 1;
-        Darwin.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (nint)(&optval), sizeof(int));
+        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
 
         // Disable SO_LINGER
         var linger = new linger { l_onoff = 0, l_linger = 0 };
-        Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
+        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(linger));
     }
 
     /// <inheritdoc/>
     public void CloseSocket(nint socket)
     {
         if (socket >= 0)
-            Darwin.close((int)socket);
+        {
+            _arch.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_DEL, (int)socket, 0);
+            _arch.close((int)socket);
+        }
     }
 
     // =============================================================================
     // Registered Buffer Operations
     // =============================================================================
-    // macOS kqueue does not have kernel-level buffer registration like Windows RIO.
-    // However, we track buffers locally and use the pointers directly with send/recv,
-    // providing a consistent API across all platforms.
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// Registers a buffer for use with PrepareSendBuffer/PrepareRecvBuffer.
-    /// Unlike Windows RIO, macOS doesn't have kernel-level buffer registration -
-    /// the buffer pointer is tracked locally and used directly with send/recv operations.
-    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int RegisterBuffer(IORingBuffer buffer)
     {
@@ -512,7 +591,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void UnregisterBuffer(int bufferId)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
-            return; // Silently ignore invalid IDs for consistency with other platforms
+            return;
 
         if (_externalBufferPtrs[bufferId] != 0)
         {
@@ -523,10 +602,6 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// Queues a send operation using the registered buffer.
-    /// The connId parameter is the socket file descriptor on macOS.
-    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
@@ -537,15 +612,10 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         if (bufPtr == 0)
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
 
-        // Use regular send with calculated buffer address
         PrepareSend(connId, bufPtr + offset, length, MsgFlags.None, userData);
     }
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// Queues a receive operation using the registered buffer.
-    /// The connId parameter is the socket file descriptor on macOS.
-    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
@@ -556,7 +626,6 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         if (bufPtr == 0)
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
 
-        // Use regular recv with calculated buffer address
         PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
     }
 
@@ -580,23 +649,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         );
     }
 
-    // Socket constants for macOS/BSD
-    private const int AF_INET = 2;
-    private const int SOCK_STREAM = 1;
-    private const int IPPROTO_TCP = 6;
-    private const int SOL_SOCKET = 0xFFFF;
-    private const int SO_REUSEADDR = 0x0004;
-    private const int SO_LINGER = 0x0080;
-    private const int TCP_NODELAY = 0x01;
-    private const int F_GETFL = 3;
-    private const int F_SETFL = 4;
-    private const int O_NONBLOCK = 0x0004;
-
+    // Linux socket structures
     [StructLayout(LayoutKind.Sequential)]
     private struct sockaddr_in
     {
-        public byte sin_len;
-        public byte sin_family;
+        public ushort sin_family;
         public ushort sin_port;
         public uint sin_addr;
         public ulong sin_zero;
@@ -614,91 +671,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         if (_disposed) return;
         _disposed = true;
 
-        if (_kqueueFd >= 0)
-        {
-            Darwin.close(_kqueueFd);
-        }
-    }
-
-    // P/Invoke declarations
-    private static unsafe partial class Darwin
-    {
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int kqueue();
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int kevent(int kq, kevent[]? changelist, int nchanges, kevent[]? eventlist, int nevents, ref timespec timeout);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int kevent(int kq, kevent[]? changelist, int nchanges, kevent[]? eventlist, int nevents, nint timeout);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int accept(int sockfd, nint addr, int* addrlen);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int connect(int sockfd, nint addr, int addrlen);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial nint send(int sockfd, nint buf, nuint len, int flags);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial nint recv(int sockfd, nint buf, nuint len, int flags);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int close(int fd);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int shutdown(int sockfd, int how);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int socket(int domain, int type, int protocol);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int bind(int sockfd, nint addr, int addrlen);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int listen(int sockfd, int backlog);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int setsockopt(int sockfd, int level, int optname, nint optval, int optlen);
-
-        [LibraryImport("libSystem.dylib", SetLastError = true)]
-        public static partial int fcntl(int fd, int cmd, int arg);
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct kevent
-    {
-        public nint ident;
-        public short filter;
-        public ushort flags;
-        public uint fflags;
-        public nint data;
-        public nint udata;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct timespec
-    {
-        public long tv_sec;
-        public long tv_nsec;
-    }
-
-    private enum kqueue_filter : short
-    {
-        READ = -1,
-        WRITE = -2,
-    }
-
-    [Flags]
-    private enum kqueue_flags : ushort
-    {
-        ADD = 0x0001,
-        DELETE = 0x0002,
-        ENABLE = 0x0004,
-        DISABLE = 0x0008,
-        ONESHOT = 0x0010,
-        CLEAR = 0x0020,
-        EOF = 0x8000,
+        if (_epollFd >= 0)
+            _arch.close(_epollFd);
     }
 }

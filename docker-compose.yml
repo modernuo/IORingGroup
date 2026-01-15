@@ -62,7 +62,7 @@ services:
       - SERVER_HOST=server-iouring
       - SERVER_PORT=5000
       - CONNECTIONS=${CONNECTIONS:-100}
-      - MESSAGES=${MESSAGES:-100000}
+      - MESSAGES=${MESSAGES:-10000}
       - MAX_CONCURRENT=${MAX_CONCURRENT:-1000}
     depends_on:
       - server-iouring
@@ -81,7 +81,7 @@ services:
       - SERVER_HOST=server-epoll
       - SERVER_PORT=5000
       - CONNECTIONS=${CONNECTIONS:-100}
-      - MESSAGES=${MESSAGES:-100000}
+      - MESSAGES=${MESSAGES:-10000}
       - MAX_CONCURRENT=${MAX_CONCURRENT:-1000}
     depends_on:
       - server-epoll

@@ -12,7 +12,7 @@
 #
 # Environment variables (optional):
 #   $env:CONNECTIONS = 100       # Number of client connections
-#   $env:MESSAGES = 100000       # Messages per connection
+#   $env:MESSAGES = 10000       # Messages per connection
 #   $env:MAX_CONCURRENT = 1000   # Max concurrent connections
 
 param(
@@ -23,7 +23,7 @@ param(
 
     [int]$Connections = 100,
 
-    [int]$Messages = 100000,
+    [int]$Messages = 10000,
 
     [int]$MaxConcurrent = 1000
 )
@@ -79,7 +79,7 @@ function Run-Benchmark {
 
     # Build and start the benchmark
     try {
-        docker compose --profile $Profile up --build --abort-on-container-exit
+        docker compose --profile $Profile up --build --abort-on-container-exit --force-recreate
     } finally {
         # Clean up
         try {
