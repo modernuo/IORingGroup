@@ -198,49 +198,47 @@ public class Program
                 Console.WriteLine($"IORing created (native {(RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "io_uring" : "kqueue")})");
             }
 
-            using (ring)
+            using var ringGroup = ring;
+            // Create buffer pool for zero-copy I/O
+            // Each buffer is a double-mapped circular buffer
+            _bufferPool = new IORingBufferPool(
+                ring,
+                slabSize: 256,           // 256 buffers per slab
+                bufferSize: BufferSize,  // 4KB per buffer (page-aligned)
+                initialSlabs: 4,         // Start with 1024 buffers
+                maxSlabs: 64             // Max 16K buffers
+            );
+            Console.WriteLine($"Buffer pool created: {_bufferPool.TotalCapacity} buffers ({_bufferPool.BufferSize} bytes each)");
+
+            // Create listener using the ring's native method
+            var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
+            if (listener == -1)
             {
-                // Create buffer pool for zero-copy I/O
-                // Each buffer is a double-mapped circular buffer
-                _bufferPool = new IORingBufferPool(
-                    ring,
-                    slabSize: 256,           // 256 buffers per slab
-                    bufferSize: BufferSize,  // 4KB per buffer (page-aligned)
-                    initialSlabs: 4,         // Start with 1024 buffers
-                    maxSlabs: 64             // Max 16K buffers
-                );
-                Console.WriteLine($"Buffer pool created: {_bufferPool.TotalCapacity} buffers ({_bufferPool.BufferSize} bytes each)");
+                throw new InvalidOperationException("Failed to create listener");
+            }
 
-                // Create listener using the ring's native method
-                var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
-                if (listener == -1)
+            Console.WriteLine($"Server listening on port {Port}");
+
+            try
+            {
+                RunServerLoop(ring, rioRing, listener, benchmarkMode);
+            }
+            finally
+            {
+                ring.CloseListener(listener);
+
+                // Cleanup all clients
+                for (var i = 0; i < MaxClients; i++)
                 {
-                    throw new InvalidOperationException("Failed to create listener");
-                }
-
-                Console.WriteLine($"Server listening on port {Port}");
-
-                try
-                {
-                    RunServerLoop(ring, rioRing, listener, benchmarkMode);
-                }
-                finally
-                {
-                    ring.CloseListener(listener);
-
-                    // Cleanup all clients
-                    for (var i = 0; i < MaxClients; i++)
+                    if (_clients[i].Active)
                     {
-                        if (_clients[i].Active)
-                        {
-                            CloseClient(ring, rioRing, i);
-                        }
+                        CloseClient(ring, rioRing, i);
                     }
-
-                    // Dispose buffer pool
-                    _bufferPool?.Dispose();
-                    _bufferPool = null;
                 }
+
+                // Dispose buffer pool
+                _bufferPool?.Dispose();
+                _bufferPool = null;
             }
         }
         catch (Exception ex)
@@ -471,7 +469,7 @@ public class Program
             return;
         }
 
-        _totalBytes += result;
+        // Note: Don't count bytes here - count once on send completion to match PollGroup
 
         if (rioRing == null || client.Buffer == null) return;
 
@@ -624,28 +622,30 @@ public class Program
 
     #region PollGroup Server
 
-    private class PollClientState
+    private class PollClientState : IDisposable
     {
         public Socket? Socket;
-        public readonly byte[] RecvBuffer;
-        public readonly byte[] SendBuffer;
+        public readonly IORingBuffer Buffer;  // Circular buffer for zero-copy recv/send
         public GCHandle Handle;
-        public int PendingSendBytes;
-        public int PendingSendOffset;
 
         public PollClientState()
         {
-            // Allocate once, reuse across connections
-            RecvBuffer = new byte[BufferSize];
-            SendBuffer = new byte[BufferSize];
+            // Use IORingBuffer for circular buffer semantics
+            // This allows concurrent recv (write to tail) and send (read from head)
+            // without the deadlock from separate buffers
+            Buffer = IORingBuffer.Create(BufferSize);
         }
 
         public void Reset()
         {
             Socket = null;
-            PendingSendBytes = 0;
-            PendingSendOffset = 0;
+            Buffer.Reset();  // Reset head/tail to 0
             // Note: Don't free Handle here - it's managed by acquire/release
+        }
+
+        public void Dispose()
+        {
+            Buffer.Dispose();
         }
     }
 
@@ -654,6 +654,9 @@ public class Program
     // Pool of pre-allocated PollClientState objects to avoid per-connection allocations
     private static readonly Stack<PollClientState> _pollClientPool = new(MaxClients);
     private static bool _pollPoolInitialized;
+
+    // Cached LingerOption to avoid allocation per-accept
+    private static readonly LingerOption _lingerOption = new(true, 0);
 
     private static PollClientState? AcquirePollClientState()
     {
@@ -676,13 +679,14 @@ public class Program
     {
         if (_pollPoolInitialized) return;
 
-        Console.WriteLine($"Pre-allocating {size} PollClientState objects...");
+        Console.WriteLine($"Pre-allocating {size} PollClientState objects with IORingBuffer...");
         for (var i = 0; i < size; i++)
         {
             _pollClientPool.Push(new PollClientState());
         }
         _pollPoolInitialized = true;
-        Console.WriteLine($"PollClientState pool initialized: {_pollClientPool.Count} objects ({size * BufferSize * 2 / 1024 / 1024} MB)");
+        // IORingBuffer: PhysicalSize = BufferSize, VirtualSize = 2x (double-mapped)
+        Console.WriteLine($"PollClientState pool initialized: {_pollClientPool.Count} objects ({size * BufferSize / 1024 / 1024} MB physical)");
     }
 
     private static void RunPollGroupServer(bool benchmarkMode)
@@ -719,7 +723,6 @@ public class Program
 
         var handles = new GCHandle[1024];
         var lastStatsMs = 0L;
-        var pendingSendCount = 0;
 
         // Local function to close a poll client (captures pollGroup from enclosing scope)
         void ClosePollClient(PollClientState state)
@@ -754,67 +757,45 @@ public class Program
         }
 
         // Local function to handle poll client (captures pollGroup from enclosing scope)
+        // Uses circular buffer (IORingBuffer) to allow concurrent recv/send without deadlock
         void HandlePollClient(PollClientState state)
         {
+            var socket = state.Socket!;
+            var buffer = state.Buffer;
+
             try
             {
-                // Try to send pending data first
-                if (state.PendingSendBytes > 0)
+                // SEND: If there's data to send (ReadableBytes > 0) and socket is writable
+                // Reads from head of circular buffer
+                if (buffer.ReadableBytes > 0 && socket.Poll(0, SelectMode.SelectWrite))
                 {
-                    var sent = state.Socket.Send(state.SendBuffer, state.PendingSendOffset, state.PendingSendBytes, SocketFlags.None);
+                    var dataToSend = buffer.GetReadSpan(out _);
+                    var sent = socket.Send(dataToSend);
                     if (sent > 0)
                     {
+                        buffer.CommitRead(sent);
+                        _totalMessages++;
                         _totalBytes += sent;
-                        state.PendingSendOffset += sent;
-                        state.PendingSendBytes -= sent;
-
-                        if (state.PendingSendBytes == 0)
-                        {
-                            _totalMessages++;
-                            pendingSendCount--;
-                        }
                     }
                 }
 
-                // Try to receive if no pending send
-                if (state.PendingSendBytes == 0)
+                // RECV: If there's space to receive (WritableBytes > 0) and socket is readable
+                // Writes to tail of circular buffer - INDEPENDENT of send!
+                // This is the key fix: we can always receive as long as there's buffer space
+                if (buffer.WritableBytes > 0 && socket.Poll(0, SelectMode.SelectRead))
                 {
-                    var received = state.Socket.Receive(state.RecvBuffer, SocketFlags.None);
+                    var recvSpan = buffer.GetWriteSpan(out _);
+                    var received = socket.Receive(recvSpan);
                     if (received > 0)
                     {
-                        _totalBytes += received;
-
-                        // Echo: copy to send buffer and queue send
-                        Buffer.BlockCopy(state.RecvBuffer, 0, state.SendBuffer, 0, received);
-
-                        // Try immediate send
-                        var sent = state.Socket.Send(state.SendBuffer, 0, received, SocketFlags.None);
-                        if (sent > 0)
-                        {
-                            _totalBytes += sent;
-                        }
-
-                        if (sent < received)
-                        {
-                            // Partial send - queue remainder
-                            state.PendingSendOffset = sent;
-                            state.PendingSendBytes = received - sent;
-                            pendingSendCount++;
-                        }
-                        else
-                        {
-                            _totalMessages++;
-                        }
+                        buffer.CommitWrite(received);
+                        // Data is now in buffer, will be sent on next poll cycle
                     }
                     else if (received == 0)
                     {
                         ClosePollClient(state);
                     }
                 }
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
-            {
-                // Normal - no data available
             }
             catch (SocketException)
             {
@@ -864,7 +845,7 @@ public class Program
                         var client = listener.Accept();
                         client.Blocking = false;
                         client.NoDelay = true;
-                        client.LingerState = new LingerOption(true, 0);
+                        client.LingerState = _lingerOption;
 
                         var clientIndex = FindFreePollSlot();
                         if (clientIndex >= 0)
