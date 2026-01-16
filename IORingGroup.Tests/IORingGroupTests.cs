@@ -1173,4 +1173,601 @@ public class WindowsRIOGroupTests
             Skip.If(true, "Required functions not available - rebuild ioring.dll");
         }
     }
+
+    /// <summary>
+    /// Tests rapid reconnection - connect, disconnect, immediately reconnect.
+    /// This simulates the ModernUO login server scenario where a client
+    /// connects to the login server, then immediately reconnects to the game server.
+    /// </summary>
+    [SkippableFact]
+    public void RIO_RapidReconnect_AcceptsSecondConnection()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
+
+            // Use library-owned listener with WSA_FLAG_REGISTERED_IO
+            var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
+                ring.Handle, "127.0.0.1", 0, 128);
+
+            if (listenerHandle is -1 or 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                Skip.If(true, $"Failed to create library-owned listener: error {err}");
+            }
+
+            // Get the assigned port
+            var addrBytes = new byte[16];
+            var addrLen = addrBytes.Length;
+            int port;
+            unsafe
+            {
+                fixed (byte* pAddr = addrBytes)
+                {
+                    if (System.Network.Windows.Win_x64.getsockname(listenerHandle, (nint)pAddr, ref addrLen) == 0)
+                    {
+                        port = (addrBytes[2] << 8) | addrBytes[3];
+                    }
+                    else
+                    {
+                        port = 5555;
+                    }
+                }
+            }
+            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            // Queue multiple accept operations (like ModernUO does)
+            const int pendingAccepts = 32;
+            for (var i = 0; i < pendingAccepts; i++)
+            {
+                ring.PrepareAccept(listenerHandle, 0, 0, (ulong)(100 + i));
+            }
+            var submitted = ring.Submit();
+            Assert.Equal(pendingAccepts, submitted);
+
+            Span<Completion> completions = stackalloc Completion[64];
+
+            // ===== First connection =====
+            Console.WriteLine("Connecting client #1...");
+            using var client1 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client1.Connect(endpoint);
+
+            // Wait for accept completion
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
+            Assert.True(count > 0, "No accept completion for client #1");
+
+            var socket1 = (nint)completions[0].Result;
+            Assert.True(socket1 > 0, $"Invalid socket for client #1: {socket1}");
+            Console.WriteLine($"Client #1 accepted: socket={socket1}");
+
+            ring.AdvanceCompletionQueue(count);
+
+            // Replenish the accept (like ModernUO does)
+            ring.PrepareAccept(listenerHandle, 0, 0, 200);
+            submitted = ring.Submit();
+            Console.WriteLine($"Replenished accept: submitted={submitted}");
+
+            // ===== Disconnect client #1 =====
+            Console.WriteLine("Disconnecting client #1...");
+            client1.Close();
+            System.Network.Windows.Win_x64.closesocket(socket1);
+
+            // Small delay to simulate processing
+            Thread.Sleep(10);
+
+            // ===== Immediate reconnect (client #2) =====
+            Console.WriteLine("Connecting client #2 (immediate reconnect)...");
+            using var client2 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client2.Connect(endpoint);
+
+            // Wait for accept completion
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
+            Assert.True(count > 0, "No accept completion for client #2 - RECONNECT FAILED!");
+
+            var socket2 = (nint)completions[0].Result;
+            Assert.True(socket2 > 0, $"Invalid socket for client #2: {socket2}");
+            Console.WriteLine($"Client #2 accepted: socket={socket2}");
+
+            ring.AdvanceCompletionQueue(count);
+
+            // ===== Verify we can receive data on reconnected socket =====
+            var connId = ring.RegisterSocket(socket2);
+            if (connId >= 0)
+            {
+                Console.WriteLine($"Registered socket #2 with connId={connId}");
+
+                using var recvBuffer = IORingBuffer.Create(64 * 1024);
+                var recvBufId = ring.RegisterExternalBuffer(recvBuffer.Pointer, (uint)recvBuffer.VirtualSize);
+
+                if (recvBufId >= 0)
+                {
+                    // Post recv
+                    recvBuffer.GetWriteSpan(out var recvOffset);
+                    ring.PrepareRecvBuffer(connId, recvBufId, recvOffset, BufferSize, 300);
+                    ring.Submit();
+
+                    // Send data from client
+                    var testData = "Hello from reconnected client!"u8.ToArray();
+                    client2.Send(testData);
+
+                    count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
+                    Assert.True(count > 0, "No recv completion on reconnected socket");
+                    Assert.Equal(testData.Length, completions[0].Result);
+                    Console.WriteLine($"Received {completions[0].Result} bytes on reconnected socket");
+
+                    ring.AdvanceCompletionQueue(count);
+                    ring.UnregisterExternalBuffer(recvBufId);
+                }
+
+                ring.UnregisterSocket(connId);
+            }
+
+            // Cleanup
+            System.Network.Windows.Win_x64.closesocket(socket2);
+            System.Network.Windows.Win_x64.ioring_rio_close_listener(ring.Handle, listenerHandle);
+
+            Console.WriteLine("Rapid reconnect test PASSED!");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "New RIO functions not available - rebuild ioring.dll");
+        }
+    }
+
+    /// <summary>
+    /// Tests multiple rapid reconnections in succession.
+    /// </summary>
+    [SkippableFact]
+    public void RIO_MultipleRapidReconnects_AllSucceed()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
+
+            var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
+                ring.Handle, "127.0.0.1", 0, 128);
+
+            if (listenerHandle is -1 or 0)
+            {
+                Skip.If(true, "Failed to create listener");
+            }
+
+            var addrBytes = new byte[16];
+            var addrLen = addrBytes.Length;
+            int port;
+            unsafe
+            {
+                fixed (byte* pAddr = addrBytes)
+                {
+                    if (System.Network.Windows.Win_x64.getsockname(listenerHandle, (nint)pAddr, ref addrLen) == 0)
+                    {
+                        port = (addrBytes[2] << 8) | addrBytes[3];
+                    }
+                    else
+                    {
+                        port = 5555;
+                    }
+                }
+            }
+            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            // Queue initial accepts
+            const int pendingAccepts = 32;
+            for (var i = 0; i < pendingAccepts; i++)
+            {
+                ring.PrepareAccept(listenerHandle, 0, 0, (ulong)(100 + i));
+            }
+            ring.Submit();
+
+            Span<Completion> completions = stackalloc Completion[64];
+
+            // Do 5 rapid connect/disconnect cycles
+            for (var cycle = 0; cycle < 5; cycle++)
+            {
+                Console.WriteLine($"Cycle {cycle + 1}: Connecting...");
+
+                using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                client.Connect(endpoint);
+
+                var count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
+                Assert.True(count > 0, $"No accept completion for cycle {cycle + 1}");
+
+                var socket = (nint)completions[0].Result;
+                Assert.True(socket > 0, $"Invalid socket for cycle {cycle + 1}");
+                Console.WriteLine($"Cycle {cycle + 1}: Accepted socket={socket}");
+
+                ring.AdvanceCompletionQueue(count);
+
+                // Replenish accept
+                ring.PrepareAccept(listenerHandle, 0, 0, (ulong)(200 + cycle));
+                ring.Submit();
+
+                // Close and disconnect
+                client.Close();
+                System.Network.Windows.Win_x64.closesocket(socket);
+
+                // No delay - immediate reconnect
+                Console.WriteLine($"Cycle {cycle + 1}: Disconnected");
+            }
+
+            System.Network.Windows.Win_x64.ioring_rio_close_listener(ring.Handle, listenerHandle);
+            Console.WriteLine("Multiple rapid reconnects test PASSED!");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "New RIO functions not available - rebuild ioring.dll");
+        }
+    }
+
+    /// <summary>
+    /// Tests reconnection after full recv/send flow (mimics ModernUO login → game server flow).
+    /// This tests whether pending recv operations affect subsequent accepts.
+    /// </summary>
+    [SkippableFact]
+    public void RIO_ReconnectAfterRecvSendFlow_AcceptsSecondConnection()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
+
+            var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
+                ring.Handle, "127.0.0.1", 0, 128);
+
+            if (listenerHandle is -1 or 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                Skip.If(true, $"Failed to create library-owned listener: error {err}");
+            }
+
+            // Get the assigned port
+            var addrBytes = new byte[16];
+            var addrLen = addrBytes.Length;
+            int port;
+            unsafe
+            {
+                fixed (byte* pAddr = addrBytes)
+                {
+                    if (System.Network.Windows.Win_x64.getsockname(listenerHandle, (nint)pAddr, ref addrLen) == 0)
+                    {
+                        port = (addrBytes[2] << 8) | addrBytes[3];
+                    }
+                    else
+                    {
+                        port = 5556;
+                    }
+                }
+            }
+            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            // Queue multiple accept operations (like ModernUO does)
+            const int pendingAccepts = 32;
+            for (var i = 0; i < pendingAccepts; i++)
+            {
+                ring.PrepareAccept(listenerHandle, 0, 0, (ulong)(100 + i));
+            }
+            var submitted = ring.Submit();
+            Assert.Equal(pendingAccepts, submitted);
+
+            Span<Completion> completions = stackalloc Completion[64];
+
+            // ===== First connection (login flow) =====
+            Console.WriteLine("=== CLIENT #1 (Login Flow) ===");
+            using var client1 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client1.Connect(endpoint);
+            Console.WriteLine("Client #1 connected");
+
+            // Wait for accept completion
+            var count = TestHelpers.WaitForCompletions(ring, completions, 1, 5000);
+            Assert.True(count > 0, "No accept completion for client #1");
+            var socket1 = (nint)completions[0].Result;
+            Assert.True(socket1 > 0, $"Invalid socket for client #1: {socket1}");
+            Console.WriteLine($"Client #1 accepted: socket={socket1}");
+            ring.AdvanceCompletionQueue(count);
+
+            // Replenish accept (like ModernUO does after each accept)
+            ring.PrepareAccept(listenerHandle, 0, 0, 200);
+
+            // Register socket with RIO (like ModernUO does)
+            var connId1 = ring.RegisterSocket(socket1);
+            Assert.True(connId1 >= 0, $"Failed to register socket #1: {connId1}");
+            Console.WriteLine($"Registered socket #1 with connId={connId1}");
+
+            // Create buffer for recv/send
+            using var buffer = IORingBuffer.Create(64 * 1024);
+            var bufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
+            Assert.True(bufId >= 0, $"Failed to register buffer: {bufId}");
+
+            // Post recv (like ModernUO does after accepting)
+            buffer.GetWriteSpan(out var recvOffset);
+            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1000);  // userData = 1000 for recv
+            submitted = ring.Submit();
+            Console.WriteLine($"Submitted: {submitted} (replenish + recv)");
+
+            // Client sends data (like UO client sending packets)
+            var loginPacket = "SEED\x00\x80LOGIN_DATA_HERE"u8.ToArray();
+            client1.Send(loginPacket);
+            Console.WriteLine($"Client #1 sent {loginPacket.Length} bytes");
+
+            // Get recv completion
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
+            Assert.True(count > 0, "No recv completion for client #1");
+            Console.WriteLine($"Recv completed: {completions[0].Result} bytes, userData={completions[0].UserData}");
+            ring.AdvanceCompletionQueue(count);
+            buffer.CommitWrite(completions[0].Result);
+
+            // Post another recv (ModernUO keeps a pending recv)
+            buffer.GetWriteSpan(out recvOffset);
+            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1001);
+            ring.Submit();
+
+            // Simulate sending server response (server list)
+            var writeSpan = buffer.GetWriteSpan(out var sendOffset);
+            var serverList = "SERVER_LIST_RESPONSE"u8.ToArray();
+            serverList.CopyTo(writeSpan);
+            buffer.CommitWrite(serverList.Length);
+            buffer.GetReadSpan(out var readOffset);
+            ring.PrepareSendBuffer(connId1, bufId, readOffset, serverList.Length, 2000);  // userData = 2000 for send
+            submitted = ring.Submit();
+            Console.WriteLine($"Submitted send: {submitted}");
+
+            // Get send completion
+            count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
+            Assert.True(count > 0, "No send completion for client #1");
+            Console.WriteLine($"Send completed: {completions[0].Result} bytes, userData={completions[0].UserData}");
+            ring.AdvanceCompletionQueue(count);
+            buffer.CommitRead(completions[0].Result);
+
+            // Client receives (just drain it)
+            var recvBuf = new byte[1024];
+            client1.Receive(recvBuf);
+
+            // ===== Disconnect client #1 (like server does after server select) =====
+            Console.WriteLine("=== DISCONNECTING CLIENT #1 ===");
+
+            // NOTE: There's still a pending recv on connId1!
+            // This mimics ModernUO where we disconnect mid-recv
+
+            // Unregister and close (like ModernUO Dispose)
+            ring.UnregisterSocket(connId1);
+            Console.WriteLine("Unregistered socket #1");
+            System.Network.Windows.Win_x64.closesocket(socket1);
+            Console.WriteLine("Closed server-side socket #1");
+
+            // Client disconnects
+            client1.Close();
+            Console.WriteLine("Client #1 closed");
+
+            // Small delay (simulates game loop iteration)
+            Thread.Sleep(10);
+
+            // ===== Second connection (game server reconnect) =====
+            Console.WriteLine("=== CLIENT #2 (Game Server Reconnect) ===");
+            using var client2 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            Console.WriteLine("Connecting client #2...");
+            client2.Connect(endpoint);
+            Console.WriteLine("Client #2 connected (client-side)");
+
+            // Poll for accept completion (rapid polling like ModernUO Slice)
+            var maxPolls = 1000;
+            var acceptReceived = false;
+            nint socket2 = 0;
+
+            for (var poll = 0; poll < maxPolls; poll++)
+            {
+                count = ring.PeekCompletions(completions);
+                if (count > 0)
+                {
+                    Console.WriteLine($"Poll {poll}: Got {count} completions");
+                    for (var i = 0; i < count; i++)
+                    {
+                        var userData = completions[i].UserData;
+                        var result = completions[i].Result;
+                        Console.WriteLine($"  Completion: userData={userData}, result={result}");
+
+                        // Check if this is an accept completion (userData >= 100 && < 300)
+                        if (userData >= 100 && userData < 300)
+                        {
+                            socket2 = (nint)result;
+                            acceptReceived = true;
+                            Console.WriteLine($"  -> Accept completion! socket={socket2}");
+                        }
+                    }
+                    ring.AdvanceCompletionQueue(count);
+
+                    if (acceptReceived) break;
+                }
+
+                Thread.Sleep(1);  // Small delay between polls
+            }
+
+            Assert.True(acceptReceived, $"No accept completion for client #2 after {maxPolls} polls - RECONNECT FAILED!");
+            Assert.True(socket2 > 0, $"Invalid socket for client #2: {socket2}");
+
+            // Verify we can use the reconnected socket
+            var connId2 = ring.RegisterSocket(socket2);
+            Assert.True(connId2 >= 0, $"Failed to register socket #2: {connId2}");
+            Console.WriteLine($"Registered reconnected socket #2 with connId={connId2}");
+
+            // Clean up
+            ring.UnregisterSocket(connId2);
+            ring.UnregisterExternalBuffer(bufId);
+            System.Network.Windows.Win_x64.closesocket(socket2);
+            System.Network.Windows.Win_x64.ioring_rio_close_listener(ring.Handle, listenerHandle);
+
+            Console.WriteLine("=== RECONNECT AFTER RECV/SEND FLOW TEST PASSED! ===");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "New RIO functions not available - rebuild ioring.dll");
+        }
+    }
+
+    /// <summary>
+    /// Tests reconnection with ZERO delay - exactly like ModernUO's rapid Slice loop.
+    /// </summary>
+    [SkippableFact]
+    public void RIO_ZeroDelayReconnect_Succeeds()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        try
+        {
+            using var ring = new System.Network.Windows.WindowsRIOGroup(256, MaxConnections);
+
+            var listenerHandle = System.Network.Windows.Win_x64.ioring_rio_create_listener(
+                ring.Handle, "127.0.0.1", 0, 128);
+
+            if (listenerHandle is -1 or 0)
+            {
+                var err = System.Network.Windows.Win_x64.ioring_get_last_error();
+                Skip.If(true, $"Failed to create library-owned listener: error {err}");
+            }
+
+            // Get the assigned port
+            var addrBytes = new byte[16];
+            var addrLen = addrBytes.Length;
+            int port;
+            unsafe
+            {
+                fixed (byte* pAddr = addrBytes)
+                {
+                    if (System.Network.Windows.Win_x64.getsockname(listenerHandle, (nint)pAddr, ref addrLen) == 0)
+                    {
+                        port = (addrBytes[2] << 8) | addrBytes[3];
+                    }
+                    else
+                    {
+                        port = 5557;
+                    }
+                }
+            }
+            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            // Queue 32 accept operations
+            const int pendingAccepts = 32;
+            for (var i = 0; i < pendingAccepts; i++)
+            {
+                ring.PrepareAccept(listenerHandle, 0, 0, (ulong)(100 + i));
+            }
+            ring.Submit();
+
+            Span<Completion> completions = stackalloc Completion[64];
+
+            // Connect client #1
+            Console.WriteLine("Connecting client #1...");
+            using var client1 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client1.Connect(endpoint);
+
+            // Poll for accept (no delay)
+            var count = 0;
+            for (var poll = 0; poll < 100000 && count == 0; poll++)
+            {
+                count = ring.PeekCompletions(completions);
+            }
+            Assert.True(count > 0, "No accept completion for client #1");
+            var socket1 = (nint)completions[0].Result;
+            ring.AdvanceCompletionQueue(count);
+
+            // Replenish and register
+            ring.PrepareAccept(listenerHandle, 0, 0, 200);
+            var connId1 = ring.RegisterSocket(socket1);
+
+            // Post recv
+            using var buffer = IORingBuffer.Create(64 * 1024);
+            var bufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
+            buffer.GetWriteSpan(out var recvOffset);
+            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1000);
+            ring.Submit();
+
+            // Send data from client
+            client1.Send("TEST"u8.ToArray());
+
+            // Poll for recv (no delay)
+            count = 0;
+            for (var poll = 0; poll < 100000 && count == 0; poll++)
+            {
+                count = ring.PeekCompletions(completions);
+            }
+            Assert.True(count > 0, "No recv completion");
+            ring.AdvanceCompletionQueue(count);
+
+            // === IMMEDIATE DISCONNECT AND RECONNECT ===
+            Console.WriteLine("Immediate disconnect...");
+            ring.UnregisterSocket(connId1);
+            System.Network.Windows.Win_x64.closesocket(socket1);
+            client1.Close();
+
+            // NO DELAY - immediately connect client #2
+            Console.WriteLine("Immediate reconnect (client #2)...");
+            using var client2 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client2.Connect(endpoint);
+
+            // Poll for accept (no delay, tight loop)
+            Console.WriteLine("Polling for accept...");
+            count = 0;
+            var acceptReceived = false;
+            nint socket2 = 0;
+            var startTime = DateTime.UtcNow;
+
+            // Poll rapidly for up to 5 seconds
+            while ((DateTime.UtcNow - startTime).TotalSeconds < 5)
+            {
+                count = ring.PeekCompletions(completions);
+                if (count > 0)
+                {
+                    for (var i = 0; i < count; i++)
+                    {
+                        var userData = completions[i].UserData;
+                        var result = completions[i].Result;
+                        Console.WriteLine($"Completion: userData={userData}, result={result}");
+
+                        if (userData >= 100 && userData < 300 && result > 0)
+                        {
+                            socket2 = (nint)result;
+                            acceptReceived = true;
+                        }
+                    }
+                    ring.AdvanceCompletionQueue(count);
+                    if (acceptReceived) break;
+                }
+            }
+
+            Console.WriteLine($"Accept received: {acceptReceived}, socket2={socket2}");
+            Assert.True(acceptReceived, "No accept completion for client #2 after zero-delay reconnect!");
+            Assert.True(socket2 > 0, $"Invalid socket for client #2: {socket2}");
+
+            // Cleanup
+            ring.UnregisterExternalBuffer(bufId);
+            System.Network.Windows.Win_x64.closesocket(socket2);
+            System.Network.Windows.Win_x64.ioring_rio_close_listener(ring.Handle, listenerHandle);
+
+            Console.WriteLine("=== ZERO DELAY RECONNECT TEST PASSED! ===");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Skip.If(true, $"RIO not available: {ex.Message}");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Skip.If(true, "New RIO functions not available - rebuild ioring.dll");
+        }
+    }
 }

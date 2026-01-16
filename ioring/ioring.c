@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>  // For _mm_pause()
+#include <stdio.h>
 
 /*
  * Windows IORing Implementation with RIO (Registered I/O)

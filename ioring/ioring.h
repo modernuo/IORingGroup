@@ -118,10 +118,6 @@ IORING_API void ioring_cq_advance(ioring_t* ring, uint32_t count);
 // Error handling
 IORING_API int ioring_get_last_error(void);
 
-// =============================================================================
-// HIGH-PERFORMANCE RIO API (true async with external buffers)
-// =============================================================================
-
 /*
  * RIO (Registered I/O) provides high-performance async socket I/O with:
  * - Externally registered buffers (zero-copy between user/kernel)
@@ -163,10 +159,6 @@ IORING_API int ioring_rio_register(
 // This frees the connection slot for reuse
 IORING_API void ioring_rio_unregister(ioring_t* ring, int conn_id);
 
-// =============================================================================
-// RIO Listener Support
-// =============================================================================
-
 /*
  * For RIO mode, the library owns the listener socket and uses AcceptEx internally
  * to create RIO-compatible accepted sockets. Usage:
@@ -201,10 +193,6 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
 // Configure an accepted socket with optimal settings (TCP_NODELAY, non-blocking, etc.)
 // Call this on sockets from accept completions if not using PrepareAccept
 IORING_API void ioring_rio_configure_socket(SOCKET socket);
-
-// =============================================================================
-// RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
-// =============================================================================
 
 /*
  * External buffers allow zero-copy I/O from user-owned memory (e.g., ModernUO's
