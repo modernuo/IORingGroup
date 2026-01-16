@@ -20,7 +20,10 @@ public enum RingSocketEventType : byte
     DataSent = 2,
 
     /// <summary>Socket was disconnected (graceful close or error).</summary>
-    Disconnected = 3
+    Disconnected = 3,
+
+    /// <summary>A new connection was accepted. Application should call CreateSocket.</summary>
+    Accept = 4
 }
 
 /// <summary>
@@ -31,7 +34,7 @@ public readonly struct RingSocketEvent
     /// <summary>The type of event.</summary>
     public RingSocketEventType Type { get; init; }
 
-    /// <summary>The socket this event relates to.</summary>
+    /// <summary>The socket this event relates to (null for Accept events).</summary>
     public RingSocket Socket { get; init; }
 
     /// <summary>Number of bytes transferred (for DataReceived/DataSent).</summary>
@@ -39,6 +42,9 @@ public readonly struct RingSocketEvent
 
     /// <summary>Error code if disconnect was due to error (0 for graceful close).</summary>
     public int Error { get; init; }
+
+    /// <summary>The accepted socket handle (for Accept events).</summary>
+    public nint AcceptedSocketHandle { get; init; }
 
     /// <summary>
     /// Creates a data received event.
@@ -68,6 +74,16 @@ public readonly struct RingSocketEvent
         Type = RingSocketEventType.Disconnected,
         Socket = socket,
         Error = error
+    };
+
+    /// <summary>
+    /// Creates an accept event.
+    /// </summary>
+    /// <param name="socketHandle">The accepted socket handle, or negative for error.</param>
+    public static RingSocketEvent Accepted(nint socketHandle) => new()
+    {
+        Type = RingSocketEventType.Accept,
+        AcceptedSocketHandle = socketHandle
     };
 }
 
@@ -219,6 +235,7 @@ public sealed class RingSocketManager : IDisposable
     {
         // Find free slot
         var slotId = FindFreeSlot();
+        Console.WriteLine($"[DEBUG] CreateSocket: FindFreeSlot returned {slotId}");
         if (slotId < 0)
         {
             return null;
@@ -323,9 +340,13 @@ public sealed class RingSocketManager : IDisposable
             ref var cqe = ref _completions[i];
             var (opType, socketId, generation) = IORingUserData.Decode(cqe.UserData);
 
-            // Skip accept completions (handled separately by the application)
+            // Return accept completions as events for the application to handle
             if (opType == IORingUserData.OpAccept)
             {
+                if (eventCount < events.Length)
+                {
+                    events[eventCount++] = RingSocketEvent.Accepted((nint)cqe.Result);
+                }
                 continue;
             }
 
@@ -490,26 +511,42 @@ public sealed class RingSocketManager : IDisposable
     {
         socket.RecvPending = false;
 
+        Console.WriteLine($"[DEBUG] HandleRecvCompletion: socketId={socket.Id}, gen={socket.Generation}, result={result}, DisconnectPending={socket.DisconnectPending}");
+
         if (result <= 0)
         {
             // Error or disconnect
-            socket.Disconnect();
+            Console.WriteLine($"[DEBUG] HandleRecvCompletion: recv returned {result}");
 
+            // If disconnect was already pending (we initiated close), check if ready to cleanup
             if (socket.CheckDisconnect())
             {
-                DisconnectImmediate(socket);
+                Console.WriteLine($"[DEBUG] HandleRecvCompletion: CheckDisconnect returned true, queuing for disconnect");
+                _disconnectQueue.Enqueue(socket);
             }
-
+            else if (!socket.DisconnectPending)
+            {
+                // Not already disconnecting - initiate disconnect
+                Console.WriteLine($"[DEBUG] HandleRecvCompletion: calling Disconnect()");
+                socket.Disconnect();
+            }
             return 0;
         }
 
         // Commit received data
         socket.RecvBuffer.CommitWrite(result);
 
-        // Post next recv if space available
-        if (socket.Connected && socket.RecvBuffer.WritableBytes > 0)
+        // Post next recv if space available and not disconnecting
+        if (socket.Connected && !socket.DisconnectPending && socket.RecvBuffer.WritableBytes > 0)
         {
             PostRecv(socket);
+        }
+
+        // Check if disconnect was pending and we're now done with all I/O
+        if (socket.CheckDisconnect())
+        {
+            Console.WriteLine($"[DEBUG] HandleRecvCompletion: all I/O done, queuing for disconnect");
+            _disconnectQueue.Enqueue(socket);
         }
 
         // Return event to application
@@ -526,31 +563,42 @@ public sealed class RingSocketManager : IDisposable
     {
         socket.SendPending = false;
 
+        Console.WriteLine($"[DEBUG] HandleSendCompletion: socketId={socket.Id}, gen={socket.Generation}, result={result}, DisconnectPending={socket.DisconnectPending}");
+
         if (result <= 0)
         {
             // Error
-            socket.Disconnect();
+            Console.WriteLine($"[DEBUG] HandleSendCompletion: send returned {result}");
 
+            // If disconnect was already pending, check if ready to cleanup
             if (socket.CheckDisconnect())
             {
-                DisconnectImmediate(socket);
+                Console.WriteLine($"[DEBUG] HandleSendCompletion: CheckDisconnect returned true, queuing for disconnect");
+                _disconnectQueue.Enqueue(socket);
             }
-
+            else if (!socket.DisconnectPending)
+            {
+                // Not already disconnecting - initiate disconnect
+                Console.WriteLine($"[DEBUG] HandleSendCompletion: calling Disconnect()");
+                socket.Disconnect();
+            }
             return 0;
         }
 
         // Commit sent data
         socket.SendBuffer.CommitRead(result);
 
-        // Post next send if more data
-        if (socket.Connected && socket.SendBuffer.ReadableBytes > 0)
+        // Post next send if more data and not disconnecting
+        if (socket.Connected && !socket.DisconnectPending && socket.SendBuffer.ReadableBytes > 0)
         {
             PostSend(socket);
         }
-        else if (socket.CheckDisconnect())
+
+        // Check if disconnect was pending and we're now done with all I/O
+        if (socket.CheckDisconnect())
         {
-            // All data sent, disconnect was pending
-            DisconnectImmediate(socket);
+            Console.WriteLine($"[DEBUG] HandleSendCompletion: all I/O done, queuing for disconnect");
+            _disconnectQueue.Enqueue(socket);
         }
 
         // Return event to application
@@ -567,6 +615,8 @@ public sealed class RingSocketManager : IDisposable
     {
         while (_disconnectQueue.TryDequeue(out var socket))
         {
+            Console.WriteLine($"[DEBUG] ProcessDisconnectQueue: socketId={socket.Id}, gen={socket.Generation}");
+
             // Unregister from ring
             _ring.UnregisterSocket(socket.ConnectionId);
 
@@ -582,6 +632,8 @@ public sealed class RingSocketManager : IDisposable
 
             _sockets[socket.Id] = null;
             ConnectedCount--;
+
+            Console.WriteLine($"[DEBUG] ProcessDisconnectQueue: slot {socket.Id} cleared, returning Disconnected event");
 
             // Return event to application
             if (eventCount < events.Length)

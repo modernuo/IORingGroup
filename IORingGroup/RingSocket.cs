@@ -147,36 +147,29 @@ public sealed class RingSocket
     /// </remarks>
     public void Disconnect()
     {
+        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: id={Id}, Connected={Connected}, DisconnectPending={DisconnectPending}, RecvPending={RecvPending}, SendPending={SendPending}");
+
         if (!Connected || DisconnectPending)
         {
+            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: early return");
             return;
         }
 
-        // Check if there's pending send data we need to flush first
-        if (SendBuffer.ReadableBytes > 0)
-        {
-            // Queue disconnect - will complete after sends finish
-            DisconnectPending = true;
+        DisconnectPending = true;
 
-            // Make sure pending send data gets sent
-            if (!SendQueued)
-            {
-                _manager.QueueSend(this);
-            }
-            return;
+        // If no I/O is pending, disconnect immediately
+        if (!RecvPending && !SendPending)
+        {
+            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: no pending I/O, calling DisconnectImmediate");
+            _manager.DisconnectImmediate(this);
         }
-
-        // No pending send data
-        if (RecvPending || SendPending)
+        else
         {
-            // Have in-flight I/O - close socket to cancel, then wait for completions
-            DisconnectPending = true;
+            // I/O is pending - close socket to cancel operations
+            // Completions will come back with errors, then we can safely release buffers
+            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: I/O pending, calling InitiateClose");
             _manager.InitiateClose(this);
-            return;
         }
-
-        // No in-flight operations, disconnect immediately
-        _manager.DisconnectImmediate(this);
     }
 
     /// <summary>
@@ -191,8 +184,11 @@ public sealed class RingSocket
             return false;
         }
 
-        // Wait for all in-flight operations and pending send data
-        return !RecvPending && !SendPending && SendBuffer.ReadableBytes <= 0;
+        // Wait for all in-flight operations
+        // If socket is closed, ignore remaining send data (can't be sent anyway)
+        var canDisconnect = !RecvPending && !SendPending && (SocketClosed || SendBuffer.ReadableBytes <= 0);
+        Console.WriteLine($"[DEBUG] CheckDisconnect: id={Id}, RecvPending={RecvPending}, SendPending={SendPending}, SocketClosed={SocketClosed}, SendBufferReadable={SendBuffer.ReadableBytes}, result={canDisconnect}");
+        return canDisconnect;
     }
 
     /// <summary>

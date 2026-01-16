@@ -8,8 +8,8 @@
         <WarningLevel>5</WarningLevel>
         <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
         <LangVersion>Preview</LangVersion>
-        <AssemblyVersion>1.0.1</AssemblyVersion>
-        <PackageVersion>1.0.1</PackageVersion>
+        <AssemblyVersion>1.0.0</AssemblyVersion>
+        <PackageVersion>1.0.0</PackageVersion>
         <RootNamespace>System.Network</RootNamespace>
         <AssemblyName>IORingGroup</AssemblyName>
         <IsPackable>true</IsPackable>
@@ -38,11 +38,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <Content Include="runtimes\win-x64\native\ioring.dll">
-            <Pack>true</Pack>
-            <PackagePath>runtimes/win-x64/native</PackagePath>
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
+      <Folder Include="runtimes\win-x64\native\" />
     </ItemGroup>
 
     <PropertyGroup Condition="'$(Configuration)' == 'Debug'">

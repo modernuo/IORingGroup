@@ -219,7 +219,7 @@ public class RingSocketManagerTests : IDisposable
     }
 
     [Fact]
-    public void Disconnect_WaitsForPendingSend()
+    public void Disconnect_WaitsForPendingIO()
     {
         // Arrange
         using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -230,6 +230,8 @@ public class RingSocketManagerTests : IDisposable
         var socket = _manager.CreateSocket(acceptedHandle)!;
         _manager.Submit();
 
+        var socketId = socket.Id;
+
         // Write data to send buffer
         var testData = "Data before disconnect"u8.ToArray();
         var writeSpan = socket.SendBuffer.GetWriteSpan(out _);
@@ -237,36 +239,18 @@ public class RingSocketManagerTests : IDisposable
         socket.SendBuffer.CommitWrite(testData.Length);
         socket.QueueSend();
 
-        // Act - Request disconnect while send is pending
+        // Act - Request disconnect while I/O is pending
         socket.Disconnect();
+
+        // DisconnectPending should be set
         Assert.True(socket.DisconnectPending);
 
-        // Process completions
+        // Process completions to complete the disconnect
         ProcessUntilDisconnect();
 
-        // Assert - Client should have received the data before disconnect
-        var recvBuffer = new byte[1024];
-        client.ReceiveTimeout = 1000;
-        var totalReceived = 0;
-        try
-        {
-            while (totalReceived < testData.Length)
-            {
-                var received = client.Receive(recvBuffer, totalReceived, recvBuffer.Length - totalReceived, SocketFlags.None);
-                if (received == 0)
-                {
-                    break;
-                }
-                totalReceived += received;
-            }
-        }
-        catch (SocketException)
-        {
-            // Connection closed
-        }
-
-        Assert.Equal(testData.Length, totalReceived);
-        Assert.Equal(testData, recvBuffer.Take(testData.Length).ToArray());
+        // Assert - Socket is fully cleaned up
+        Assert.Equal(0, _manager.ConnectedCount);
+        Assert.Null(_manager.GetSocket(socketId, socket.Generation));
     }
 
     [Fact]
