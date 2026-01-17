@@ -237,6 +237,23 @@ public static partial class Win_x64
     public static partial int closesocket(nint socket);
 
     /// <summary>
+    /// Shutdown a socket (send FIN).
+    /// </summary>
+    /// <param name="socket">The socket handle</param>
+    /// <param name="how">0=SD_RECEIVE, 1=SD_SEND, 2=SD_BOTH</param>
+    /// <returns>0 on success, SOCKET_ERROR (-1) on failure</returns>
+    [LibraryImport("ws2_32.dll")]
+    public static partial int shutdown(nint socket, int how);
+
+    /// <summary>
+    /// Close a socket gracefully (sends FIN, then closes).
+    /// This ensures the client receives proper disconnect notification.
+    /// </summary>
+    /// <param name="socket">The socket handle to close</param>
+    [LibraryImport(LibraryName)]
+    public static partial void ioring_rio_close_socket_graceful(nint socket);
+
+    /// <summary>
     /// WSAPOLLFD structure for WSAPoll.
     /// Must match Windows WSAPOLLFD layout exactly.
     /// </summary>

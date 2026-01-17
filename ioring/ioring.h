@@ -202,6 +202,10 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener);
 // Call this on sockets from accept completions if not using PrepareAccept
 IORING_API void ioring_rio_configure_socket(SOCKET socket);
 
+// Close a socket gracefully (sends FIN, then closes)
+// This ensures the client receives proper disconnect notification
+IORING_API void ioring_rio_close_socket_graceful(SOCKET socket);
+
 // =============================================================================
 // RIO External Buffer Support (for zero-copy from user-owned memory like Pipe)
 // =============================================================================

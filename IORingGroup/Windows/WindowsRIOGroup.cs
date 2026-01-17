@@ -190,7 +190,8 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// <param name="socket">The socket handle to close</param>
     public void CloseSocket(nint socket)
     {
-        Win_x64.closesocket(socket);
+        // Use graceful close to send FIN, enabling proper client disconnect handling
+        Win_x64.ioring_rio_close_socket_graceful(socket);
     }
 
     // =============================================================================

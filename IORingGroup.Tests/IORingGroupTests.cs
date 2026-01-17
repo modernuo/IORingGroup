@@ -231,7 +231,7 @@ public class WindowsRIOGroupTests
                 };
 
                 // Skip instead of fail if it's the known RIO issue (needs DLL rebuild)
-                Skip.If(error == 10045, $"RegisterSocket failed with WSAEOPNOTSUPP - rebuild ioring.dll with latest changes");
+                Skip.If(error == 10045, "RegisterSocket failed with WSAEOPNOTSUPP - rebuild ioring.dll with latest changes");
 
                 Assert.Fail($"RegisterSocket failed: {errorMsg}\n" +
                     $"Socket handle: {server.Handle}");
@@ -490,7 +490,7 @@ public class WindowsRIOGroupTests
                     "For server-side RIO, create accept sockets manually with WSASocketW with WSA_FLAG_REGISTERED_IO.");
                 Assert.Fail($"RegisterSocket failed with unexpected error {error}");
             }
-            Assert.True(connId >= 0, $"RegisterSocket failed");
+            Assert.True(connId >= 0, "RegisterSocket failed");
 
             // RIO requires pre-registered buffers - use external buffer API with IORingBuffer
             using var recvBuffer = IORingBuffer.Create(64 * 1024);
@@ -1581,7 +1581,7 @@ public class WindowsRIOGroupTests
                         // Check if this is an accept completion (userData >= 100 && < 300)
                         if (userData >= 100 && userData < 300)
                         {
-                            socket2 = (nint)result;
+                            socket2 = result;
                             acceptReceived = true;
                             Console.WriteLine($"  -> Accept completion! socket={socket2}");
                         }
@@ -1741,7 +1741,7 @@ public class WindowsRIOGroupTests
 
                         if (userData >= 100 && userData < 300 && result > 0)
                         {
-                            socket2 = (nint)result;
+                            socket2 = result;
                             acceptReceived = true;
                         }
                     }

@@ -172,7 +172,7 @@ public enum SubmissionFlags : byte
 /// Message flags for send/recv operations.
 /// </summary>
 [Flags]
-public enum MsgFlags : int
+public enum MsgFlags
 {
     None = 0,
     /// <summary>

@@ -78,16 +78,16 @@ public sealed class RingSocket
     public bool DisconnectPending { get; internal set; }
 
     /// <summary>
-    /// Gets whether the underlying socket handle has been closed.
-    /// Used to prevent double-close in cleanup.
-    /// </summary>
-    internal bool SocketClosed { get; set; }
-
-    /// <summary>
     /// Gets whether this socket has been queued for sending.
     /// Used to prevent duplicate queueing.
     /// </summary>
     internal bool SendQueued { get; set; }
+
+    /// <summary>
+    /// Gets whether the socket handle has been closed.
+    /// Used to prevent double-close.
+    /// </summary>
+    internal bool HandleClosed { get; set; }
 
     /// <summary>
     /// Creates a new RingSocket.
@@ -147,34 +147,46 @@ public sealed class RingSocket
     /// </remarks>
     public void Disconnect()
     {
-        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: id={Id}, Connected={Connected}, DisconnectPending={DisconnectPending}, RecvPending={RecvPending}, SendPending={SendPending}");
+        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: slot={Id}, gen={Generation}, Connected={Connected}, DisconnectPending={DisconnectPending}");
 
         if (!Connected || DisconnectPending)
         {
-            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: early return");
+            Console.WriteLine("[DEBUG] RingSocket.Disconnect: EARLY RETURN (already disconnected/pending)");
             return;
         }
 
-        DisconnectPending = true;
+        // Check if there's pending I/O or unsent data
+        // With zero-copy I/O, we MUST wait for all operations to complete before releasing buffers
+        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: RecvPending={RecvPending}, SendPending={SendPending}, SendBytes={SendBuffer.ReadableBytes}");
 
-        // If no I/O is pending, disconnect immediately
-        if (!RecvPending && !SendPending)
+        // If we have pending sends or unsent data, wait for them to complete first
+        if (SendPending || SendBuffer.ReadableBytes > 0)
         {
-            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: no pending I/O, calling DisconnectImmediate");
-            _manager.DisconnectImmediate(this);
+            Console.WriteLine("[DEBUG] RingSocket.Disconnect: DEFERRING (pending sends)");
+            DisconnectPending = true;
+            return;
         }
-        else
+
+        // If recv is pending, just mark as disconnecting and wait for CLIENT to close
+        // The working implementation shows that the CLIENT sends FIN after receiving
+        // a disconnect packet from the server. We should NOT send FIN from server side.
+        // When recv returns 0 (client closed), we'll complete the disconnect.
+        if (RecvPending)
         {
-            // I/O is pending - close socket to cancel operations
-            // Completions will come back with errors, then we can safely release buffers
-            Console.WriteLine($"[DEBUG] RingSocket.Disconnect: I/O pending, calling InitiateClose");
-            _manager.InitiateClose(this);
+            Console.WriteLine("[DEBUG] RingSocket.Disconnect: WAITING for client to close (recv pending)");
+            DisconnectPending = true;
+            RingSocketManager.CloseSocketHandle(this);
+            return;
         }
+
+        // No pending I/O and no unsent data - disconnect immediately
+        Console.WriteLine("[DEBUG] RingSocket.Disconnect: IMMEDIATE");
+        _manager.DisconnectImmediate(this);
     }
 
     /// <summary>
     /// Checks if disconnect can proceed after I/O completion.
-    /// Called internally by the manager.
+    /// Called internally by the manager after recv/send completions.
     /// </summary>
     /// <returns>True if disconnect should proceed now.</returns>
     internal bool CheckDisconnect()
@@ -184,11 +196,9 @@ public sealed class RingSocket
             return false;
         }
 
-        // Wait for all in-flight operations
-        // If socket is closed, ignore remaining send data (can't be sent anyway)
-        var canDisconnect = !RecvPending && !SendPending && (SocketClosed || SendBuffer.ReadableBytes <= 0);
-        Console.WriteLine($"[DEBUG] CheckDisconnect: id={Id}, RecvPending={RecvPending}, SendPending={SendPending}, SocketClosed={SocketClosed}, SendBufferReadable={SendBuffer.ReadableBytes}, result={canDisconnect}");
-        return canDisconnect;
+        // Wait for ALL in-flight operations AND send buffer to drain
+        // This is critical for zero-copy I/O safety
+        return !RecvPending && !SendPending && SendBuffer.ReadableBytes <= 0;
     }
 
     /// <summary>

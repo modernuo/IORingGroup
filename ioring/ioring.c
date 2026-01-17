@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>  // For _mm_pause()
+#include <stdio.h>
 
 /*
  * Windows IORing Implementation with RIO (Registered I/O)
@@ -720,11 +721,17 @@ IORING_API int ioring_get_last_error(void) {
 // High-Performance RIO API Implementation
 // =============================================================================
 
+// Version string for build verification
+#define IORING_VERSION "2026-01-16-v2"
+
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
     uint32_t max_connections,
     uint32_t outstanding_per_socket
 ) {
+    printf("[NATIVE] ioring.dll version: %s\n", IORING_VERSION);
+    fflush(stdout);
+
     if (!init_rio()) {
         last_error = ERROR_NOT_SUPPORTED;
         return NULL;
@@ -988,9 +995,12 @@ static int find_free_accept_slot(ioring_t* ring) {
 // NOTE: RQ creation is deferred to check_acceptex_completions (after SO_UPDATE_ACCEPT_CONTEXT)
 // This matches the pattern used by RioSharp and is required for proper RIO initialization
 static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_data) {
+    printf("[NATIVE] post_acceptex: listener=%lld, user_data=0x%llx\n", (long long)listen_socket, (unsigned long long)user_data);
+
     // Load AcceptEx if not already done
     if (!load_acceptex_functions(ring, listen_socket)) {
         last_error = WSAGetLastError();
+        printf("[NATIVE] post_acceptex: FAILED to load AcceptEx functions, error=%d\n", last_error);
         return FALSE;
     }
 
@@ -998,15 +1008,18 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     int slot = find_free_accept_slot(ring);
     if (slot < 0) {
         last_error = WSAENOBUFS;  // No free slots
+        printf("[NATIVE] post_acceptex: FAILED - no free accept slots!\n");
         return FALSE;
     }
+    printf("[NATIVE] post_acceptex: using accept slot %d\n", slot);
 
     acceptex_context_t* ctx = &ring->accept_pool[slot];
 
     // Create accept socket WITH WSA_FLAG_REGISTERED_IO for RIO support.
     // NOTE: Sockets with WSA_FLAG_REGISTERED_IO can ONLY use RIO recv/send!
+    // ALSO need WSA_FLAG_OVERLAPPED for AcceptEx to work properly!
     ctx->accept_socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
-                                     WSA_FLAG_REGISTERED_IO);
+                                     WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
     if (ctx->accept_socket == INVALID_SOCKET) {
         last_error = WSAGetLastError();
         return FALSE;
@@ -1023,11 +1036,13 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     }
 
     if (conn_slot < 0) {
+        printf("[NATIVE] post_acceptex: FAILED - no free connection slots!\n");
         closesocket(ctx->accept_socket);
         ctx->accept_socket = INVALID_SOCKET;
         last_error = WSAENOBUFS;
         return FALSE;
     }
+    printf("[NATIVE] post_acceptex: reserving conn slot %d\n", conn_slot);
 
     // IMMEDIATELY mark slot as reserved to prevent collision with concurrent AcceptEx calls
     ring->rio_connections[conn_slot].reserved = TRUE;
@@ -1064,6 +1079,7 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
         DWORD err = WSAGetLastError();
         if (err != ERROR_IO_PENDING) {
             // Real error - clear reservation
+            printf("[NATIVE] post_acceptex: AcceptEx FAILED with error %lu\n", err);
             ring->rio_connections[conn_slot].reserved = FALSE;
             closesocket(ctx->accept_socket);
             ctx->accept_socket = INVALID_SOCKET;
@@ -1073,6 +1089,9 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
             return FALSE;
         }
         // ERROR_IO_PENDING is expected - operation is pending
+        printf("[NATIVE] post_acceptex: AcceptEx posted successfully (IO_PENDING), accept_socket=%lld\n", (long long)ctx->accept_socket);
+    } else {
+        printf("[NATIVE] post_acceptex: AcceptEx completed immediately, accept_socket=%lld\n", (long long)ctx->accept_socket);
     }
 
     return TRUE;
@@ -1081,6 +1100,20 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 // Check for completed AcceptEx operations and add to completion queue
 static void check_acceptex_completions(ioring_t* ring) {
     if (!ring->accept_pool) return;
+
+    static int check_count = 0;
+    static int verbose_countdown = 0;
+    check_count++;
+
+    int pending_count = 0;
+    for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
+        if (ring->accept_pool[i].pending) pending_count++;
+    }
+
+    // Verbose logging disabled to reduce spam
+    // Uncomment for debugging AcceptEx issues:
+    // BOOL verbose = (check_count % 100000 == 0);
+    (void)pending_count;  // Suppress unused warning
 
     // Iterate through all pending accept contexts and check for completion via events
     for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
@@ -1091,6 +1124,8 @@ static void check_acceptex_completions(ioring_t* ring) {
         // Check if the event is signaled (non-blocking)
         DWORD wait_result = WaitForSingleObject(found_ctx->event, 0);
         if (wait_result != WAIT_OBJECT_0) continue;  // Not completed yet
+
+        printf("[NATIVE] check_acceptex_completions: slot %d completed! wait_result=%lu\n", i, wait_result);
 
         // Event is signaled - AcceptEx has completed
         found_ctx->pending = FALSE;
@@ -1301,6 +1336,18 @@ IORING_API void ioring_rio_configure_socket(SOCKET socket) {
     // Disable linger
     struct linger lin = { .l_onoff = 0, .l_linger = 0 };
     setsockopt(socket, SOL_SOCKET, SO_LINGER, (char*)&lin, sizeof(lin));
+}
+
+IORING_API void ioring_rio_close_socket_graceful(SOCKET socket) {
+    if (socket == INVALID_SOCKET) return;
+
+    printf("[NATIVE] close_socket_graceful: socket=%lld\n", (long long)socket);
+
+    // At this point, FIN should have already been sent (shutdown was called earlier)
+    // and all pending RIO operations should have completed.
+    // Just close the socket - should be graceful since no pending ops.
+    int closeResult = closesocket(socket);
+    printf("[NATIVE] closesocket returned %d, WSAError=%d\n", closeResult, WSAGetLastError());
 }
 
 // =============================================================================

@@ -46,12 +46,10 @@ public static class IORingUserData
     /// <param name="generation">The generation counter for stale detection.</param>
     /// <returns>Encoded userData value for use with ring operations.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong Encode(int opType, int socketId, ushort generation)
-    {
-        return ((ulong)opType << OpTypeShift) |
-               ((ulong)generation << GenerationShift) |
-               ((uint)socketId & SocketIdMask);
-    }
+    public static ulong Encode(int opType, int socketId, ushort generation) =>
+        ((ulong)opType << OpTypeShift) |
+        ((ulong)generation << GenerationShift) |
+        ((uint)socketId & SocketIdMask);
 
     /// <summary>
     /// Encodes an accept operation userData (no socket ID or generation needed).
@@ -59,10 +57,8 @@ public static class IORingUserData
     /// <param name="listenerIndex">Optional listener index for multi-listener setups.</param>
     /// <returns>Encoded userData value for accept operations.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong EncodeAccept(int listenerIndex = 0)
-    {
-        return ((ulong)OpAccept << OpTypeShift) | ((uint)listenerIndex & SocketIdMask);
-    }
+    public static ulong EncodeAccept(int listenerIndex = 0) =>
+        ((ulong)OpAccept << OpTypeShift) | ((uint)listenerIndex & SocketIdMask);
 
     /// <summary>
     /// Decodes a userData value into its components.
@@ -70,41 +66,30 @@ public static class IORingUserData
     /// <param name="userData">The userData from a completion.</param>
     /// <returns>Tuple of (opType, socketId, generation).</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static (int opType, int socketId, ushort generation) Decode(ulong userData)
-    {
-        return (
-            (int)((userData & OpTypeMask) >> OpTypeShift),
-            (int)(userData & SocketIdMask),
-            (ushort)((userData & GenerationMask) >> GenerationShift)
-        );
-    }
+    public static (int opType, int socketId, ushort generation) Decode(ulong userData) =>
+    (
+        (int)((userData & OpTypeMask) >> OpTypeShift),
+        (int)(userData & SocketIdMask),
+        (ushort)((userData & GenerationMask) >> GenerationShift)
+    );
 
     /// <summary>
     /// Gets just the operation type from userData.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int GetOpType(ulong userData)
-    {
-        return (int)((userData & OpTypeMask) >> OpTypeShift);
-    }
+    public static int GetOpType(ulong userData) => (int)((userData & OpTypeMask) >> OpTypeShift);
 
     /// <summary>
     /// Gets just the socket ID from userData.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int GetSocketId(ulong userData)
-    {
-        return (int)(userData & SocketIdMask);
-    }
+    public static int GetSocketId(ulong userData) => (int)(userData & SocketIdMask);
 
     /// <summary>
     /// Gets just the generation from userData.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ushort GetGeneration(ulong userData)
-    {
-        return (ushort)((userData & GenerationMask) >> GenerationShift);
-    }
+    public static ushort GetGeneration(ulong userData) => (ushort)((userData & GenerationMask) >> GenerationShift);
 
     /// <summary>
     /// Checks if the given generation matches the expected generation.
@@ -113,8 +98,6 @@ public static class IORingUserData
     /// <param name="expectedGeneration">The expected generation for the socket.</param>
     /// <returns>True if generations match, false if this is a stale completion.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool IsCurrentGeneration(ulong userData, ushort expectedGeneration)
-    {
-        return GetGeneration(userData) == expectedGeneration;
-    }
+    public static bool IsCurrentGeneration(ulong userData, ushort expectedGeneration) =>
+        GetGeneration(userData) == expectedGeneration;
 }

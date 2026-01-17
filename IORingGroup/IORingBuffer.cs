@@ -220,12 +220,11 @@ public sealed partial class IORingBuffer : IDisposable
 
         _head = (_head + count) % _physicalSize;
 
-        // Optimization: reset to beginning when empty
-        if (_head == _tail)
-        {
-            _head = 0;
-            _tail = 0;
-        }
+        // NOTE: We intentionally do NOT reset head/tail to 0 when empty.
+        // With zero-copy I/O, a recv may already be posted at the current _tail offset.
+        // If we reset to 0, the kernel will write data at the old offset, but we'll
+        // read from offset 0 (which contains stale data).
+        // The double-mapping handles wrap-around, so no reset is needed.
     }
 
     /// <summary>

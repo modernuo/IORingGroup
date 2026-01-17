@@ -410,7 +410,7 @@ public class RingSocketManagerTests : IDisposable
                 _ring.AdvanceCompletionQueue(count);
                 if (completions[0].Result > 0)
                 {
-                    return (nint)completions[0].Result;
+                    return completions[0].Result;
                 }
             }
             Thread.Sleep(10);

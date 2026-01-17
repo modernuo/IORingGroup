@@ -350,14 +350,20 @@ public class Program
         switch (op)
         {
             case OpAccept:
+            {
                 HandleAccept(ring, listener, cqe.Result, benchmarkMode);
                 break;
+            }
             case OpRecv:
+            {
                 HandleRecv(ring, index, cqe.Result, benchmarkMode);
                 break;
+            }
             case OpSend:
+            {
                 HandleSend(ring, index, cqe.Result, benchmarkMode);
                 break;
+            }
         }
     }
 
@@ -1038,7 +1044,7 @@ public class Program
 
         // Syscall timing stats
         Console.WriteLine();
-        Console.WriteLine($"=== I/O Syscall Statistics ===");
+        Console.WriteLine("=== I/O Syscall Statistics ===");
         Console.WriteLine($"Total calls: {_pollCallCount:N0}");
         Console.WriteLine($"Total completions: {_pollTotalCompletions:N0}");
         if (_pollCallCount > 0)
