@@ -385,7 +385,6 @@ IORING_API void ioring_prep_shutdown(ioring_sqe_t* sqe, SOCKET fd, int how, uint
 // Execute a single operation (legacy mode - synchronous)
 static int legacy_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
     SOCKET fd = (SOCKET)sqe->fd;
-    int err;
 
     switch (sqe->opcode) {
         case IORING_OP_POLL_ADD: {
@@ -406,7 +405,7 @@ static int legacy_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
                 complete_op(ring, sqe->user_data, (int32_t)client, 0);
                 return 1;
             }
-            err = WSAGetLastError();
+            int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) {
                 if (!add_pending_op(ring, sqe->user_data, sqe->opcode, fd, NULL, 0, 0, addr, addrlen ? *addrlen : 0)) {
                     complete_op(ring, sqe->user_data, -WSAENOBUFS, 0);
@@ -417,7 +416,6 @@ static int legacy_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
             complete_op(ring, sqe->user_data, -err, 0);
             return 1;
         }
-        // RECV/SEND removed - RIO mode requires external buffers
         case IORING_OP_SEND:
         case IORING_OP_RECV:
             complete_op(ring, sqe->user_data, -EINVAL, 0);
@@ -580,7 +578,6 @@ static void process_pending_polls(ioring_t* ring) {
                 }
                 break;
             }
-            // RECV/SEND removed - RIO mode requires external buffers
             case IORING_OP_RECV:
             case IORING_OP_SEND:
                 // These should never be pending in RIO mode
@@ -729,7 +726,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t max_connections,
     uint32_t outstanding_per_socket
 ) {
-    printf("[NATIVE] ioring.dll version: %s\n", IORING_VERSION);
     fflush(stdout);
 
     if (!init_rio()) {
@@ -995,12 +991,9 @@ static int find_free_accept_slot(ioring_t* ring) {
 // NOTE: RQ creation is deferred to check_acceptex_completions (after SO_UPDATE_ACCEPT_CONTEXT)
 // This matches the pattern used by RioSharp and is required for proper RIO initialization
 static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_data) {
-    printf("[NATIVE] post_acceptex: listener=%lld, user_data=0x%llx\n", (long long)listen_socket, (unsigned long long)user_data);
-
     // Load AcceptEx if not already done
     if (!load_acceptex_functions(ring, listen_socket)) {
         last_error = WSAGetLastError();
-        printf("[NATIVE] post_acceptex: FAILED to load AcceptEx functions, error=%d\n", last_error);
         return FALSE;
     }
 
@@ -1008,10 +1001,8 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     int slot = find_free_accept_slot(ring);
     if (slot < 0) {
         last_error = WSAENOBUFS;  // No free slots
-        printf("[NATIVE] post_acceptex: FAILED - no free accept slots!\n");
         return FALSE;
     }
-    printf("[NATIVE] post_acceptex: using accept slot %d\n", slot);
 
     acceptex_context_t* ctx = &ring->accept_pool[slot];
 
@@ -1036,13 +1027,11 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     }
 
     if (conn_slot < 0) {
-        printf("[NATIVE] post_acceptex: FAILED - no free connection slots!\n");
         closesocket(ctx->accept_socket);
         ctx->accept_socket = INVALID_SOCKET;
         last_error = WSAENOBUFS;
         return FALSE;
     }
-    printf("[NATIVE] post_acceptex: reserving conn slot %d\n", conn_slot);
 
     // IMMEDIATELY mark slot as reserved to prevent collision with concurrent AcceptEx calls
     ring->rio_connections[conn_slot].reserved = TRUE;
@@ -1075,11 +1064,11 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
         &ctx->overlapped
     );
 
-    if (!result) {
+    if (!result)
+    {
         DWORD err = WSAGetLastError();
         if (err != ERROR_IO_PENDING) {
             // Real error - clear reservation
-            printf("[NATIVE] post_acceptex: AcceptEx FAILED with error %lu\n", err);
             ring->rio_connections[conn_slot].reserved = FALSE;
             closesocket(ctx->accept_socket);
             ctx->accept_socket = INVALID_SOCKET;
@@ -1088,10 +1077,6 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
             last_error = err;
             return FALSE;
         }
-        // ERROR_IO_PENDING is expected - operation is pending
-        printf("[NATIVE] post_acceptex: AcceptEx posted successfully (IO_PENDING), accept_socket=%lld\n", (long long)ctx->accept_socket);
-    } else {
-        printf("[NATIVE] post_acceptex: AcceptEx completed immediately, accept_socket=%lld\n", (long long)ctx->accept_socket);
     }
 
     return TRUE;
@@ -1102,7 +1087,6 @@ static void check_acceptex_completions(ioring_t* ring) {
     if (!ring->accept_pool) return;
 
     static int check_count = 0;
-    static int verbose_countdown = 0;
     check_count++;
 
     int pending_count = 0;
@@ -1124,8 +1108,6 @@ static void check_acceptex_completions(ioring_t* ring) {
         // Check if the event is signaled (non-blocking)
         DWORD wait_result = WaitForSingleObject(found_ctx->event, 0);
         if (wait_result != WAIT_OBJECT_0) continue;  // Not completed yet
-
-        printf("[NATIVE] check_acceptex_completions: slot %d completed! wait_result=%lu\n", i, wait_result);
 
         // Event is signaled - AcceptEx has completed
         found_ctx->pending = FALSE;
@@ -1341,13 +1323,10 @@ IORING_API void ioring_rio_configure_socket(SOCKET socket) {
 IORING_API void ioring_rio_close_socket_graceful(SOCKET socket) {
     if (socket == INVALID_SOCKET) return;
 
-    printf("[NATIVE] close_socket_graceful: socket=%lld\n", (long long)socket);
-
     // At this point, FIN should have already been sent (shutdown was called earlier)
     // and all pending RIO operations should have completed.
     // Just close the socket - should be graceful since no pending ops.
-    int closeResult = closesocket(socket);
-    printf("[NATIVE] closesocket returned %d, WSAError=%d\n", closeResult, WSAGetLastError());
+    closesocket(socket);
 }
 
 // =============================================================================

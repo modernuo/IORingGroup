@@ -411,8 +411,9 @@ public sealed class RingSocketManager : IDisposable
 
     /// <summary>
     /// Disconnects a socket immediately and queues for resource release.
+    /// Use this when you need to force-close a socket without waiting for graceful disconnect.
     /// </summary>
-    internal void DisconnectImmediate(RingSocket socket)
+    public void DisconnectImmediate(RingSocket socket)
     {
         socket.Connected = false;
         _disconnectQueue.Enqueue(socket);
