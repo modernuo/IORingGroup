@@ -19,6 +19,7 @@ public interface ILinuxArch
 
     // File/socket operations
     int close(int fd);
+    int shutdown(int sockfd, int how);
 
     // Socket syscalls
     int socket(int domain, int type, int protocol);

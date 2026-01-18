@@ -449,15 +449,15 @@ public sealed class RingSocketManager : IDisposable
     /// Does NOT unregister from RIO - the pending recv should complete naturally
     /// when the client responds to our FIN with its own FIN (recv returns 0).
     /// </summary>
-    internal static void CloseSocketHandle(RingSocket socket)
+    internal void CloseSocketHandle(RingSocket socket)
     {
         Console.WriteLine($"[DEBUG] CloseSocketHandle: slot={socket.Id}, handle={socket.Handle}, connId={socket.ConnectionId}");
 
         // Send FIN to notify client we're done sending
-        // SD_SEND = 1
-        // DON'T unregister from RIO yet - let pending recv complete naturally
+        // SHUT_WR = 1 (same value on Windows and POSIX)
+        // DON'T unregister yet - let pending recv complete naturally
         // When client receives our FIN, it should send FIN back, and our recv returns 0
-        Windows.Win_x64.shutdown(socket.Handle, 1);
+        _ring.Shutdown(socket.Handle, 1);
 
         // DON'T set Connected=false yet - socket is still valid for receiving
         // The recv should complete with 0 when client sends FIN

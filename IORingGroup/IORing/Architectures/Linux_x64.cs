@@ -83,6 +83,9 @@ public sealed partial class Linux_x64 : ILinuxArch
     [LibraryImport("libc", SetLastError = true)]
     private static partial int close(int fd);
 
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int shutdown(int sockfd, int how);
+
     // libc bindings - sockets
     [LibraryImport("libc", SetLastError = true)]
     private static partial int socket(int domain, int type, int protocol);
@@ -128,6 +131,7 @@ public sealed partial class Linux_x64 : ILinuxArch
     int ILinuxArch.munmap(nint addr, nuint length) => munmap(addr, length);
 
     int ILinuxArch.close(int fd) => close(fd);
+    int ILinuxArch.shutdown(int sockfd, int how) => shutdown(sockfd, how);
 
     int ILinuxArch.socket(int domain, int type, int protocol) => socket(domain, type, protocol);
     int ILinuxArch.bind(int sockfd, nint addr, int addrlen) => bind(sockfd, addr, addrlen);

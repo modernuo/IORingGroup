@@ -168,6 +168,18 @@ public interface IIORingGroup : IDisposable
     /// <param name="socket">The socket handle to close.</param>
     void CloseSocket(nint socket);
 
+    /// <summary>
+    /// Shuts down a socket synchronously (sends FIN without waiting for completion).
+    /// </summary>
+    /// <param name="socket">The socket handle.</param>
+    /// <param name="how">Shutdown mode: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR.</param>
+    /// <remarks>
+    /// This is a synchronous call that initiates the TCP shutdown handshake.
+    /// Use SHUT_WR (1) to send FIN while still being able to receive data.
+    /// Unlike <see cref="PrepareShutdown"/>, this does not go through the ring queue.
+    /// </remarks>
+    void Shutdown(nint socket, int how);
+
     // =============================================================================
     // Registered Buffer Operations (Zero-Copy I/O)
     // =============================================================================

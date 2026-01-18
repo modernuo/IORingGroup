@@ -175,7 +175,7 @@ public sealed class RingSocket
         {
             Console.WriteLine("[DEBUG] RingSocket.Disconnect: WAITING for client to close (recv pending)");
             DisconnectPending = true;
-            RingSocketManager.CloseSocketHandle(this);
+            _manager.CloseSocketHandle(this);
             return;
         }
 

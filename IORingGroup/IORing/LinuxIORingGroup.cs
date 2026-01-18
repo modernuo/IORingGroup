@@ -483,6 +483,13 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             _arch.close((int)socket);
     }
 
+    /// <inheritdoc/>
+    public void Shutdown(nint socket, int how)
+    {
+        if (socket >= 0)
+            _arch.shutdown((int)socket, how);
+    }
+
     // =============================================================================
     // Registered Buffer Operations (Zero-Copy I/O)
     // =============================================================================

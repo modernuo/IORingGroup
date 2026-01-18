@@ -194,6 +194,12 @@ public sealed class WindowsRIOGroup : IIORingGroup
         Win_x64.ioring_rio_close_socket_graceful(socket);
     }
 
+    /// <inheritdoc/>
+    public void Shutdown(nint socket, int how)
+    {
+        Win_x64.shutdown(socket, how);
+    }
+
     // =============================================================================
     // External Buffer Support (for zero-copy from user-owned memory like Pipe)
     // =============================================================================

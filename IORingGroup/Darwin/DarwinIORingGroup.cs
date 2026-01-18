@@ -444,6 +444,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             Darwin.close((int)socket);
     }
 
+    /// <inheritdoc/>
+    public void Shutdown(nint socket, int how)
+    {
+        if (socket >= 0)
+            Darwin.shutdown((int)socket, how);
+    }
+
     // =============================================================================
     // Registered Buffer Operations
     // =============================================================================
