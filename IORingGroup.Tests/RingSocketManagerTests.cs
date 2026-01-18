@@ -61,6 +61,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket.Disconnect();
+        _manager.Submit();
+        client.Close();
         ProcessUntilDisconnect();
     }
 
@@ -135,6 +137,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket.Disconnect();
+        _manager.Submit();
+        client.Close();
         ProcessUntilDisconnect();
     }
 
@@ -191,6 +195,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket.Disconnect();
+        _manager.Submit();
+        client.Close();
         ProcessUntilDisconnect();
     }
 
@@ -210,6 +216,11 @@ public class RingSocketManagerTests : IDisposable
 
         // Act
         socket.Disconnect();
+        _manager.Submit(); // Submit the shutdown operation
+
+        // Close client to complete the TCP handshake (client sends FIN in response)
+        client.Close();
+
         var disconnectEventReceived = ProcessUntilDisconnect();
 
         // Assert
@@ -242,8 +253,38 @@ public class RingSocketManagerTests : IDisposable
         // Act - Request disconnect while I/O is pending
         socket.Disconnect();
 
-        // DisconnectPending should be set
+        // DisconnectPending should be set (waiting for send to complete)
         Assert.True(socket.DisconnectPending);
+
+        // Submit to start processing send
+        _manager.Submit();
+
+        // Wait for send to complete first
+        var sendCompleted = false;
+        for (var i = 0; i < 50 && !sendCompleted; i++)
+        {
+            var eventCount = _manager.ProcessCompletions(_events);
+            _manager.Submit();
+
+            for (var j = 0; j < eventCount; j++)
+            {
+                if (_events[j].Type == RingSocketEventType.DataSent)
+                {
+                    sendCompleted = true;
+                    break;
+                }
+            }
+
+            if (!sendCompleted)
+            {
+                Thread.Sleep(10);
+            }
+        }
+
+        Assert.True(sendCompleted, "Send should complete before disconnect");
+
+        // Now close client to complete the TCP handshake
+        client.Close();
 
         // Process completions to complete the disconnect
         ProcessUntilDisconnect();
@@ -272,6 +313,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket.Disconnect();
+        _manager.Submit();
+        client.Close();
         ProcessUntilDisconnect();
     }
 
@@ -289,8 +332,9 @@ public class RingSocketManagerTests : IDisposable
         var oldGeneration = socket1.Generation;
 
         socket1.Disconnect();
-        ProcessUntilDisconnect();
+        _manager.Submit();
         client1.Close();
+        ProcessUntilDisconnect();
 
         // Create a new socket that might reuse the same slot
         using var client2 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -314,6 +358,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket2.Disconnect();
+        _manager.Submit();
+        client2.Close();
         ProcessUntilDisconnect();
     }
 
@@ -363,6 +409,8 @@ public class RingSocketManagerTests : IDisposable
 
         // Cleanup
         socket.Disconnect();
+        _manager.Submit();
+        client.Close();
         ProcessUntilDisconnect();
     }
 
@@ -386,6 +434,11 @@ public class RingSocketManagerTests : IDisposable
 
             // Disconnect quickly
             socket.Disconnect();
+            _manager.Submit(); // Submit the shutdown operation
+
+            // Close client to complete the TCP handshake
+            client.Close();
+
             ProcessUntilDisconnect();
 
             // Verify generation incremented (if slot is reused)

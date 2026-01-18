@@ -504,7 +504,8 @@ public sealed class RingSocketManager : IDisposable
         {
             socket.SendQueued = false;
 
-            if (socket.Connected && !socket.DisconnectPending)
+            // Post send even if DisconnectPending - we need to drain the buffer before disconnecting
+            if (socket.Connected)
             {
                 PostSend(socket);
             }
