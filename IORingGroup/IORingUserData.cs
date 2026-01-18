@@ -32,6 +32,9 @@ public static class IORingUserData
     /// <summary>Operation type: Send data.</summary>
     public const int OpSend = 3;
 
+    /// <summary>Operation type: Shutdown socket (send FIN). Completion is ignored.</summary>
+    public const int OpShutdown = 4;
+
     private const ulong OpTypeMask = 0xFF00_0000_0000_0000UL;
     private const ulong GenerationMask = 0x00FF_FF00_0000_0000UL;
     private const ulong SocketIdMask = 0x0000_0000_FFFF_FFFFUL;

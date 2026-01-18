@@ -386,6 +386,13 @@ public sealed class RingSocketManager : IDisposable
                     eventCount += HandleSendCompletion(socket, cqe.Result, events, eventCount);
                     break;
                 }
+
+                case IORingUserData.OpShutdown:
+                {
+                    // Shutdown completion - nothing to do, FIN was sent
+                    // The recv will complete with 0 when client responds with FIN
+                    break;
+                }
             }
         }
 
@@ -445,7 +452,7 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Initiates socket shutdown by sending FIN.
+    /// Initiates socket shutdown by sending FIN asynchronously.
     /// Does NOT unregister from RIO - the pending recv should complete naturally
     /// when the client responds to our FIN with its own FIN (recv returns 0).
     /// </summary>
@@ -453,11 +460,16 @@ public sealed class RingSocketManager : IDisposable
     {
         Console.WriteLine($"[DEBUG] CloseSocketHandle: slot={socket.Id}, handle={socket.Handle}, connId={socket.ConnectionId}");
 
-        // Send FIN to notify client we're done sending
+        // Queue async shutdown - FIN will be sent on next Submit()
         // SHUT_WR = 1 (same value on Windows and POSIX)
         // DON'T unregister yet - let pending recv complete naturally
         // When client receives our FIN, it should send FIN back, and our recv returns 0
-        _ring.Shutdown(socket.Handle, 1);
+        // The completion is ignored (handled in ProcessCompletions)
+        _ring.PrepareShutdown(
+            socket.Handle,
+            1, // SHUT_WR
+            IORingUserData.Encode(IORingUserData.OpShutdown, socket.Id, socket.Generation)
+        );
 
         // DON'T set Connected=false yet - socket is still valid for receiving
         // The recv should complete with 0 when client sends FIN
