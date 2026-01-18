@@ -147,40 +147,27 @@ public sealed class RingSocket
     /// </remarks>
     public void Disconnect()
     {
-        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: slot={Id}, gen={Generation}, Connected={Connected}, DisconnectPending={DisconnectPending}");
-
         if (!Connected || DisconnectPending)
         {
-            Console.WriteLine("[DEBUG] RingSocket.Disconnect: EARLY RETURN (already disconnected/pending)");
             return;
         }
-
-        // Check if there's pending I/O or unsent data
-        // With zero-copy I/O, we MUST wait for all operations to complete before releasing buffers
-        Console.WriteLine($"[DEBUG] RingSocket.Disconnect: RecvPending={RecvPending}, SendPending={SendPending}, SendBytes={SendBuffer.ReadableBytes}");
 
         // If we have pending sends or unsent data, wait for them to complete first
         if (SendPending || SendBuffer.ReadableBytes > 0)
         {
-            Console.WriteLine("[DEBUG] RingSocket.Disconnect: DEFERRING (pending sends)");
             DisconnectPending = true;
             return;
         }
 
-        // If recv is pending, just mark as disconnecting and wait for CLIENT to close
-        // The working implementation shows that the CLIENT sends FIN after receiving
-        // a disconnect packet from the server. We should NOT send FIN from server side.
-        // When recv returns 0 (client closed), we'll complete the disconnect.
+        // If recv is pending, send FIN to notify client and wait for their FIN
         if (RecvPending)
         {
-            Console.WriteLine("[DEBUG] RingSocket.Disconnect: WAITING for client to close (recv pending)");
             DisconnectPending = true;
             _manager.CloseSocketHandle(this);
             return;
         }
 
         // No pending I/O and no unsent data - disconnect immediately
-        Console.WriteLine("[DEBUG] RingSocket.Disconnect: IMMEDIATE");
         _manager.DisconnectImmediate(this);
     }
 
