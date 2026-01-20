@@ -438,15 +438,14 @@ public class Program
                     Console.WriteLine($"Client {clientIndex} connected (socket={clientSocket}, connId={client.ConnId})");
 
                 // Post initial receive - recv into buffer at tail (write position)
-                client.Buffer.GetWriteSpan(out var writeOffset);
                 var availableSpace = client.Buffer.WritableBytes;
                 if (availableSpace > 0)
                 {
                     ring.PrepareRecvBuffer(
                         client.ConnId,
                         client.Buffer.BufferId,
-                        writeOffset,       // Offset = current write position (tail)
-                        availableSpace,    // Length = available space
+                        client.Buffer.WriteOffset,  // Offset = current write position (tail)
+                        availableSpace,             // Length = available space
                         OpRecv | (uint)clientIndex
                     );
                     client.RecvPending = true;
@@ -493,15 +492,14 @@ public class Program
         // If we have data to send and no send is pending, start sending
         if (!client.SendPending)
         {
-            client.Buffer.GetReadSpan(out var readOffset);
             var dataToSend = client.Buffer.ReadableBytes;
             if (dataToSend > 0)
             {
                 ring.PrepareSendBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
-                    readOffset,     // Offset = current read position (head)
-                    dataToSend,     // Length = data available
+                    client.Buffer.ReadOffset,   // Offset = current read position (head)
+                    dataToSend,                 // Length = data available
                     OpSend | (uint)index
                 );
                 client.SendPending = true;
@@ -511,15 +509,14 @@ public class Program
         // If we have space for more recv and no recv is pending, start receiving
         if (!client.RecvPending)
         {
-            client.Buffer.GetWriteSpan(out var writeOffset);
             var spaceForRecv = client.Buffer.WritableBytes;
             if (spaceForRecv > 0)
             {
                 ring.PrepareRecvBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
-                    writeOffset,    // Offset = current write position (tail)
-                    spaceForRecv,   // Length = space available
+                    client.Buffer.WriteOffset,  // Offset = current write position (tail)
+                    spaceForRecv,               // Length = space available
                     OpRecv | (uint)index
                 );
                 client.RecvPending = true;
@@ -549,15 +546,14 @@ public class Program
         // If we have more data to send, keep sending
         if (!client.SendPending)
         {
-            client.Buffer.GetReadSpan(out var readOffset);
             var dataToSend = client.Buffer.ReadableBytes;
             if (dataToSend > 0)
             {
                 ring.PrepareSendBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
-                    readOffset,     // Offset = current read position (head)
-                    dataToSend,     // Length = data available
+                    client.Buffer.ReadOffset,   // Offset = current read position (head)
+                    dataToSend,                 // Length = data available
                     OpSend | (uint)index
                 );
                 client.SendPending = true;
@@ -567,15 +563,14 @@ public class Program
         // If we have space for recv and no recv is pending, start receiving
         if (!client.RecvPending)
         {
-            client.Buffer.GetWriteSpan(out var writeOffset);
             var spaceForRecv = client.Buffer.WritableBytes;
             if (spaceForRecv > 0)
             {
                 ring.PrepareRecvBuffer(
                     client.ConnId,
                     client.Buffer.BufferId,
-                    writeOffset,    // Offset = current write position (tail)
-                    spaceForRecv,   // Length = space available
+                    client.Buffer.WriteOffset,  // Offset = current write position (tail)
+                    spaceForRecv,               // Length = space available
                     OpRecv | (uint)index
                 );
                 client.RecvPending = true;
@@ -783,7 +778,7 @@ public class Program
                 // Reads from head of circular buffer
                 if (buffer.ReadableBytes > 0 && socket.Poll(0, SelectMode.SelectWrite))
                 {
-                    var dataToSend = buffer.GetReadSpan(out _);
+                    var dataToSend = buffer.GetReadSpan();
                     var sent = socket.Send(dataToSend);
                     if (sent > 0)
                     {
@@ -798,7 +793,7 @@ public class Program
                 // This is the key fix: we can always receive as long as there's buffer space
                 if (buffer.WritableBytes > 0 && socket.Poll(0, SelectMode.SelectRead))
                 {
-                    var recvSpan = buffer.GetWriteSpan(out _);
+                    var recvSpan = buffer.GetWriteSpan();
                     var received = socket.Receive(recvSpan);
                     if (received > 0)
                     {
@@ -919,7 +914,7 @@ public class Program
                     {
                         if (state.Socket.Poll(0, SelectMode.SelectWrite))
                         {
-                            var dataToSend = state.Buffer.GetReadSpan(out _);
+                            var dataToSend = state.Buffer.GetReadSpan();
                             var sent = state.Socket.Send(dataToSend);
                             if (sent > 0)
                             {

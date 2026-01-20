@@ -90,6 +90,18 @@ public sealed class RingSocket
     internal bool HandleClosed { get; set; }
 
     /// <summary>
+    /// Gets whether the socket has been unregistered from RIO.
+    /// Used to prevent double-unregistration.
+    /// </summary>
+    internal bool RioUnregistered { get; set; }
+
+    /// <summary>
+    /// Gets whether the socket has been queued for disconnection.
+    /// Used to prevent double-queueing which would cause double buffer release.
+    /// </summary>
+    internal bool DisconnectQueued { get; set; }
+
+    /// <summary>
     /// Creates a new RingSocket.
     /// </summary>
     internal RingSocket(

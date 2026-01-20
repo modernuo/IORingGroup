@@ -132,7 +132,7 @@ public class RingSocketManagerTests : IDisposable
         Assert.Equal(testData.Length, recvEvent.BytesTransferred);
 
         // Verify data in buffer
-        var recvSpan = socket.RecvBuffer.GetReadSpan(out _);
+        var recvSpan = socket.RecvBuffer.GetReadSpan();
         Assert.Equal(testData, recvSpan.Slice(0, testData.Length).ToArray());
 
         // Cleanup
@@ -156,7 +156,7 @@ public class RingSocketManagerTests : IDisposable
 
         // Act - Write data to send buffer and queue send
         var testData = "Hello from server!"u8.ToArray();
-        var writeSpan = socket.SendBuffer.GetWriteSpan(out _);
+        var writeSpan = socket.SendBuffer.GetWriteSpan();
         testData.CopyTo(writeSpan);
         socket.SendBuffer.CommitWrite(testData.Length);
         socket.QueueSend();
@@ -245,7 +245,7 @@ public class RingSocketManagerTests : IDisposable
 
         // Write data to send buffer
         var testData = "Data before disconnect"u8.ToArray();
-        var writeSpan = socket.SendBuffer.GetWriteSpan(out _);
+        var writeSpan = socket.SendBuffer.GetWriteSpan();
         testData.CopyTo(writeSpan);
         socket.SendBuffer.CommitWrite(testData.Length);
         socket.QueueSend();
@@ -376,7 +376,7 @@ public class RingSocketManagerTests : IDisposable
 
         // Write data
         var testData = "Test data"u8.ToArray();
-        var writeSpan = socket.SendBuffer.GetWriteSpan(out _);
+        var writeSpan = socket.SendBuffer.GetWriteSpan();
         testData.CopyTo(writeSpan);
         socket.SendBuffer.CommitWrite(testData.Length);
 
@@ -445,6 +445,127 @@ public class RingSocketManagerTests : IDisposable
             // The next socket on the same slot should have generation + 1
         }
 
+        Assert.Equal(0, _manager.ConnectedCount);
+    }
+
+    /// <summary>
+    /// Mimics the ModernUO test harness pattern:
+    /// 1. Process completions first (cleans up previous socket)
+    /// 2. Accept a new connection
+    /// 3. Write data to send buffer
+    /// 4. Call DisconnectImmediate (force close, not graceful)
+    /// 5. Repeat rapidly
+    ///
+    /// This tests the pattern that's causing crashes in ModernUO's test suite.
+    /// </summary>
+    [Fact]
+    public void RapidCreateWriteDisconnect_MimicsModernUOTestHarness()
+    {
+        var clients = new List<Socket>();
+
+        for (var iteration = 0; iteration < 100; iteration++)
+        {
+            // Step 1: Process completions first (like ModernUO's Slice() does)
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+
+            // Step 2: Accept a new connection
+            var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client.Connect(IPAddress.Loopback, _listenerPort);
+            clients.Add(client);
+
+            var acceptedHandle = AcceptConnection();
+            Assert.True(acceptedHandle > 0, $"Failed to accept connection on iteration {iteration}");
+
+            _ring.ConfigureSocket(acceptedHandle);
+            var socket = _manager.CreateSocket(acceptedHandle);
+            Assert.NotNull(socket);
+            _manager.Submit(); // Submit the initial recv
+
+            // Step 3: Write data to send buffer (like packet tests do)
+            var testData = Encoding.UTF8.GetBytes($"Test data for iteration {iteration}");
+            var writeSpan = socket.SendBuffer.GetWriteSpan();
+            testData.CopyTo(writeSpan);
+            socket.SendBuffer.CommitWrite(testData.Length);
+            socket.QueueSend();
+
+            // Step 4: Call DisconnectImmediate (force close without waiting)
+            // This is what ModernUO's NetState.Dispose does
+            _manager.DisconnectImmediate(socket);
+        }
+
+        // Final cleanup
+        _manager.ProcessCompletions(_events);
+        _manager.Submit();
+
+        // Clean up client sockets
+        foreach (var client in clients)
+        {
+            try { client.Close(); } catch { }
+            try { client.Dispose(); } catch { }
+        }
+
+        // Process until all disconnected
+        ProcessUntilAllDisconnected();
+
+        Assert.Equal(0, _manager.ConnectedCount);
+    }
+
+    /// <summary>
+    /// Tests an even more aggressive pattern - no sleep, rapid fire.
+    /// </summary>
+    [Fact]
+    public void StressTest_RapidCreateDispose_NoSleep()
+    {
+        var clients = new List<Socket>();
+
+        for (var iteration = 0; iteration < 50; iteration++)
+        {
+            // Process any pending completions
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+
+            // Accept
+            var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client.Connect(IPAddress.Loopback, _listenerPort);
+            clients.Add(client);
+
+            var acceptedHandle = AcceptConnection();
+            if (acceptedHandle <= 0)
+            {
+                // Try processing completions and retry once
+                _manager.ProcessCompletions(_events);
+                _manager.Submit();
+                acceptedHandle = AcceptConnection();
+            }
+            Assert.True(acceptedHandle > 0, $"Failed on iteration {iteration}");
+
+            _ring.ConfigureSocket(acceptedHandle);
+            var socket = _manager.CreateSocket(acceptedHandle);
+            Assert.NotNull(socket);
+
+            // Write some data
+            var data = "PING"u8.ToArray();
+            var span = socket.SendBuffer.GetWriteSpan();
+            data.CopyTo(span);
+            socket.SendBuffer.CommitWrite(data.Length);
+            socket.QueueSend();
+
+            // Immediately disconnect
+            _manager.DisconnectImmediate(socket);
+
+            // Process completions right away
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+        }
+
+        // Cleanup
+        foreach (var client in clients)
+        {
+            try { client.Dispose(); } catch { }
+        }
+
+        ProcessUntilAllDisconnected();
         Assert.Equal(0, _manager.ConnectedCount);
     }
 

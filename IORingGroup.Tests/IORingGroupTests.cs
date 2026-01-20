@@ -502,8 +502,7 @@ public class WindowsRIOGroupTests
 
             // IMPORTANT: Post recv BEFORE client sends data
             // RIO may require the receive to be pending before data arrives
-            recvBuffer.GetWriteSpan(out var recvOffset);
-            ring.PrepareRecvExternal(connId, recvBufId, recvOffset, BufferSize, 1);
+            ring.PrepareRecvExternal(connId, recvBufId, recvBuffer.WriteOffset, BufferSize, 1);
             ring.Submit();
 
             // Give a moment for recv to be fully posted
@@ -522,17 +521,16 @@ public class WindowsRIOGroupTests
             recvBuffer.CommitWrite(testData.Length);
 
             // Verify data
-            var receivedData = recvBuffer.GetReadSpan(out _);
+            var receivedData = recvBuffer.GetReadSpan();
             Assert.True(receivedData.Slice(0, testData.Length).SequenceEqual(testData), "Received data doesn't match");
 
             // Echo back - copy to send buffer
-            var writeSpan = sendBuffer.GetWriteSpan(out _);
+            var writeSpan = sendBuffer.GetWriteSpan();
             receivedData.Slice(0, testData.Length).CopyTo(writeSpan);
             sendBuffer.CommitWrite(testData.Length);
             recvBuffer.CommitRead(testData.Length);
 
-            sendBuffer.GetReadSpan(out var sendOffset);
-            ring.PrepareSendExternal(connId, sendBufId, sendOffset, testData.Length, 2);
+            ring.PrepareSendExternal(connId, sendBufId, sendBuffer.ReadOffset, testData.Length, 2);
             ring.Submit();
 
             count = TestHelpers.WaitForCompletions(ring, completions, 1, 1000);
@@ -701,8 +699,7 @@ public class WindowsRIOGroupTests
             }
 
             // Post recv FIRST
-            recvBuffer.GetWriteSpan(out var recvOffset);
-            ring.PrepareRecvExternal(connId, recvBufId, recvOffset, BufferSize, 1);
+            ring.PrepareRecvExternal(connId, recvBufId, recvBuffer.WriteOffset, BufferSize, 1);
             ring.Submit();
 
             // Send data FROM server TO our RIO client
@@ -917,17 +914,16 @@ public class WindowsRIOGroupTests
 
             // Write test data to the buffer
             var testData = "Hello from IORingBuffer zero-copy!"u8.ToArray();
-            var writeSpan = buffer.GetWriteSpan(out _);
+            var writeSpan = buffer.GetWriteSpan();
             testData.CopyTo(writeSpan);
             buffer.CommitWrite(testData.Length);
 
-            // Get the read offset for the send
-            var readSpan = buffer.GetReadSpan(out var readOffset);
-            var readLength = readSpan.Length;
+            // Get the readable data length for the send
+            var readLength = buffer.ReadableBytes;
 
             // Send using external buffer (zero-copy from IORingBuffer memory!)
             const ulong sendUserData = 42;
-            ring.PrepareSendExternal(connId, extBufId, readOffset, readLength, sendUserData);
+            ring.PrepareSendExternal(connId, extBufId, buffer.ReadOffset, readLength, sendUserData);
             ring.Submit();
 
             // Wait for send completion
@@ -1020,12 +1016,11 @@ public class WindowsRIOGroupTests
                 var chunkData = new byte[100];
                 Array.Fill(chunkData, (byte)(i + 0x41)); // 'A', 'B', 'C', etc.
 
-                var writeSpan = buffer.GetWriteSpan(out _);
+                var writeSpan = buffer.GetWriteSpan();
                 chunkData.CopyTo(writeSpan);
                 buffer.CommitWrite(100);
 
-                buffer.GetReadSpan(out var readOffset);
-                ring.PrepareSendExternal(connId, extBufId, readOffset, 100, (ulong)i);
+                ring.PrepareSendExternal(connId, extBufId, buffer.ReadOffset, 100, (ulong)i);
                 ring.Submit();
 
                 var count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
@@ -1112,13 +1107,12 @@ public class WindowsRIOGroupTests
             var fillData = new byte[fillSize];
             new Random(42).NextBytes(fillData);
 
-            var writeSpan = buffer.GetWriteSpan(out _);
+            var writeSpan = buffer.GetWriteSpan();
             fillData.CopyTo(writeSpan);
             buffer.CommitWrite(fillSize);
 
             // Send and consume
-            buffer.GetReadSpan(out var fillReadOffset);
-            ring.PrepareSendExternal(connId, extBufId, fillReadOffset, fillSize, 1);
+            ring.PrepareSendExternal(connId, extBufId, buffer.ReadOffset, fillSize, 1);
             ring.Submit();
 
             Span<Completion> completions = stackalloc Completion[16];
@@ -1140,13 +1134,12 @@ public class WindowsRIOGroupTests
 
             // Now write data that wraps around the ring buffer
             var wrapData = "Wrapped data test!"u8.ToArray();
-            writeSpan = buffer.GetWriteSpan(out _);
+            writeSpan = buffer.GetWriteSpan();
             wrapData.CopyTo(writeSpan);
             buffer.CommitWrite(wrapData.Length);
 
             // The double-mapping magic allows us to read contiguously even across the wrap
-            buffer.GetReadSpan(out var readOffset);
-            ring.PrepareSendExternal(connId, extBufId, readOffset, wrapData.Length, 2);
+            ring.PrepareSendExternal(connId, extBufId, buffer.ReadOffset, wrapData.Length, 2);
             ring.Submit();
 
             count = TestHelpers.WaitForCompletions(ring, completions, 1, 2000);
@@ -1284,8 +1277,7 @@ public class WindowsRIOGroupTests
                 if (recvBufId >= 0)
                 {
                     // Post recv
-                    recvBuffer.GetWriteSpan(out var recvOffset);
-                    ring.PrepareRecvBuffer(connId, recvBufId, recvOffset, BufferSize, 300);
+                    ring.PrepareRecvBuffer(connId, recvBufId, recvBuffer.WriteOffset, BufferSize, 300);
                     ring.Submit();
 
                     // Send data from client
@@ -1492,8 +1484,7 @@ public class WindowsRIOGroupTests
             Assert.True(bufId >= 0, $"Failed to register buffer: {bufId}");
 
             // Post recv (like ModernUO does after accepting)
-            buffer.GetWriteSpan(out var recvOffset);
-            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1000);  // userData = 1000 for recv
+            ring.PrepareRecvBuffer(connId1, bufId, buffer.WriteOffset, BufferSize, 1000);  // userData = 1000 for recv
             submitted = ring.Submit();
             Console.WriteLine($"Submitted: {submitted} (replenish + recv)");
 
@@ -1510,17 +1501,15 @@ public class WindowsRIOGroupTests
             buffer.CommitWrite(completions[0].Result);
 
             // Post another recv (ModernUO keeps a pending recv)
-            buffer.GetWriteSpan(out recvOffset);
-            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1001);
+            ring.PrepareRecvBuffer(connId1, bufId, buffer.WriteOffset, BufferSize, 1001);
             ring.Submit();
 
             // Simulate sending server response (server list)
-            var writeSpan = buffer.GetWriteSpan(out var sendOffset);
+            var writeSpan = buffer.GetWriteSpan();
             var serverList = "SERVER_LIST_RESPONSE"u8.ToArray();
             serverList.CopyTo(writeSpan);
             buffer.CommitWrite(serverList.Length);
-            buffer.GetReadSpan(out var readOffset);
-            ring.PrepareSendBuffer(connId1, bufId, readOffset, serverList.Length, 2000);  // userData = 2000 for send
+            ring.PrepareSendBuffer(connId1, bufId, buffer.ReadOffset, serverList.Length, 2000);  // userData = 2000 for send
             submitted = ring.Submit();
             Console.WriteLine($"Submitted send: {submitted}");
 
@@ -1693,8 +1682,7 @@ public class WindowsRIOGroupTests
             // Post recv
             using var buffer = IORingBuffer.Create(64 * 1024);
             var bufId = ring.RegisterExternalBuffer(buffer.Pointer, (uint)buffer.VirtualSize);
-            buffer.GetWriteSpan(out var recvOffset);
-            ring.PrepareRecvBuffer(connId1, bufId, recvOffset, BufferSize, 1000);
+            ring.PrepareRecvBuffer(connId1, bufId, buffer.WriteOffset, BufferSize, 1000);
             ring.Submit();
 
             // Send data from client

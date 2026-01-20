@@ -378,6 +378,12 @@ public sealed class RingSocketManager : IDisposable
 
         _ring.AdvanceCompletionQueue(completionCount);
 
+        // CRITICAL: Submit all prepared operations BEFORE processing disconnects.
+        // Operations prepared by ProcessSendQueue() and completion handlers (PostRecv/PostSend)
+        // reference socket registrations and buffers that ProcessDisconnectQueue will release.
+        // Submitting now ensures those operations are sent to RIO before resources are freed.
+        _ring.Submit();
+
         // Process disconnect queue
         ProcessDisconnectQueue(events, ref eventCount);
 
@@ -416,6 +422,21 @@ public sealed class RingSocketManager : IDisposable
     public void DisconnectImmediate(RingSocket socket)
     {
         socket.Connected = false;
+        QueueForDisconnect(socket);
+    }
+
+    /// <summary>
+    /// Queues a socket for disconnection, preventing double-queueing.
+    /// </summary>
+    private void QueueForDisconnect(RingSocket socket)
+    {
+        // Prevent double-queueing which would cause double buffer release
+        if (socket.DisconnectQueued)
+        {
+            return;
+        }
+
+        socket.DisconnectQueued = true;
         _disconnectQueue.Enqueue(socket);
     }
 
@@ -455,17 +476,18 @@ public sealed class RingSocketManager : IDisposable
             return;
         }
 
-        var writeSpan = socket.RecvBuffer.GetWriteSpan(out var offset);
-        if (writeSpan.Length == 0)
+        var recvBuffer = socket.RecvBuffer;
+        var writeLength = recvBuffer.WritableBytes;
+        if (writeLength == 0)
         {
             return;
         }
 
         _ring.PrepareRecvBuffer(
             socket.ConnectionId,
-            socket.RecvBuffer.BufferId,
-            offset,
-            writeSpan.Length,
+            recvBuffer.BufferId,
+            recvBuffer.WriteOffset,
+            writeLength,
             IORingUserData.Encode(IORingUserData.OpRecv, socket.Id, socket.Generation)
         );
         socket.RecvPending = true;
@@ -478,17 +500,18 @@ public sealed class RingSocketManager : IDisposable
             return;
         }
 
-        var readSpan = socket.SendBuffer.GetReadSpan(out var offset);
-        if (readSpan.Length == 0)
+        var sendBuffer = socket.SendBuffer;
+        var readLength = sendBuffer.ReadableBytes;
+        if (readLength == 0)
         {
             return;
         }
 
         _ring.PrepareSendBuffer(
             socket.ConnectionId,
-            socket.SendBuffer.BufferId,
-            offset,
-            readSpan.Length,
+            sendBuffer.BufferId,
+            sendBuffer.ReadOffset,
+            readLength,
             IORingUserData.Encode(IORingUserData.OpSend, socket.Id, socket.Generation)
         );
         socket.SendPending = true;
@@ -526,7 +549,7 @@ public sealed class RingSocketManager : IDisposable
 
             if (socket.CheckDisconnect())
             {
-                _disconnectQueue.Enqueue(socket);
+                QueueForDisconnect(socket);
             }
             return 0;
         }
@@ -535,7 +558,7 @@ public sealed class RingSocketManager : IDisposable
         {
             if (socket.CheckDisconnect())
             {
-                _disconnectQueue.Enqueue(socket);
+                QueueForDisconnect(socket);
             }
             return 0;
         }
@@ -549,7 +572,7 @@ public sealed class RingSocketManager : IDisposable
 
         if (socket.CheckDisconnect())
         {
-            _disconnectQueue.Enqueue(socket);
+            QueueForDisconnect(socket);
         }
 
         if (eventIndex < events.Length)
@@ -574,7 +597,7 @@ public sealed class RingSocketManager : IDisposable
 
             if (socket.CheckDisconnect())
             {
-                _disconnectQueue.Enqueue(socket);
+                QueueForDisconnect(socket);
             }
             return 0;
         }
@@ -589,7 +612,7 @@ public sealed class RingSocketManager : IDisposable
 
         if (socket.CheckDisconnect())
         {
-            _disconnectQueue.Enqueue(socket);
+            QueueForDisconnect(socket);
         }
 
         if (eventIndex < events.Length)
@@ -605,9 +628,12 @@ public sealed class RingSocketManager : IDisposable
     {
         while (_disconnectQueue.TryDequeue(out var socket))
         {
-            if (socket.Connected)
+            // Always unregister from RIO if registered (ConnectionId >= 0) and not already unregistered
+            // This is critical for DisconnectImmediate() which sets Connected=false before queueing
+            if (socket.ConnectionId >= 0 && !socket.RioUnregistered)
             {
                 _ring.UnregisterSocket(socket.ConnectionId);
+                socket.RioUnregistered = true;
             }
 
             if (!socket.HandleClosed)

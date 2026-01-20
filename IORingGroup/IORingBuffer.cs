@@ -80,6 +80,26 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     /// <summary>
+    /// Gets the current read offset (head position) in the buffer.
+    /// Use this when preparing RIO/io_uring operations.
+    /// </summary>
+    public int ReadOffset
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _head;
+    }
+
+    /// <summary>
+    /// Gets the current write offset (tail position) in the buffer.
+    /// Use this when preparing RIO/io_uring operations.
+    /// </summary>
+    public int WriteOffset
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _tail;
+    }
+
+    /// <summary>
     /// Creates a new double-mapped circular buffer.
     /// </summary>
     /// <param name="physicalSize">Physical size in bytes (must be power of 2 and page-aligned).</param>
@@ -136,31 +156,15 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     /// <summary>
-    /// Gets a contiguous span for writing and the offset into the buffer.
+    /// Gets a contiguous span for writing.
     /// Due to double-mapping, the span is always contiguous regardless of wrap-around.
+    /// Use <see cref="WriteOffset"/> when preparing RIO/io_uring operations.
     /// </summary>
-    /// <param name="offset">The offset from the buffer base where writing will occur.</param>
     /// <returns>A span representing the writable region.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public unsafe Span<byte> GetWriteSpan(out int offset)
+    public unsafe Span<byte> GetWriteSpan()
     {
-        offset = _tail;
-        var available = WritableBytes;
-        return new Span<byte>((byte*)_buffer + _tail, available);
-    }
-
-    /// <summary>
-    /// Gets a span for writing with a maximum length.
-    /// </summary>
-    /// <param name="maxLength">Maximum number of bytes to write.</param>
-    /// <param name="offset">The offset from the buffer base where writing will occur.</param>
-    /// <returns>A span up to maxLength bytes.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public unsafe Span<byte> GetWriteSpan(int maxLength, out int offset)
-    {
-        offset = _tail;
-        var available = Math.Min(WritableBytes, maxLength);
-        return new Span<byte>((byte*)_buffer + _tail, available);
+        return new Span<byte>((byte*)_buffer + _tail, WritableBytes);
     }
 
     /// <summary>
@@ -179,31 +183,15 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     /// <summary>
-    /// Gets a contiguous span for reading and the offset into the buffer.
+    /// Gets a contiguous span for reading.
     /// Due to double-mapping, the span is always contiguous regardless of wrap-around.
+    /// Use <see cref="ReadOffset"/> when preparing RIO/io_uring operations.
     /// </summary>
-    /// <param name="offset">The offset from the buffer base where reading will occur.</param>
     /// <returns>A span representing the readable region.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public unsafe Span<byte> GetReadSpan(out int offset)
+    public unsafe Span<byte> GetReadSpan()
     {
-        offset = _head;
-        var available = ReadableBytes;
-        return new Span<byte>((byte*)_buffer + _head, available);
-    }
-
-    /// <summary>
-    /// Gets a span for reading with a maximum length.
-    /// </summary>
-    /// <param name="maxLength">Maximum number of bytes to read.</param>
-    /// <param name="offset">The offset from the buffer base where reading will occur.</param>
-    /// <returns>A span up to maxLength bytes.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public unsafe Span<byte> GetReadSpan(int maxLength, out int offset)
-    {
-        offset = _head;
-        var available = Math.Min(ReadableBytes, maxLength);
-        return new Span<byte>((byte*)_buffer + _head, available);
+        return new Span<byte>((byte*)_buffer + _head, ReadableBytes);
     }
 
     /// <summary>
