@@ -122,20 +122,14 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// After registration, use PrepareSendBuffer/PrepareRecvBuffer with external buffer IDs.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int RegisterSocket(nint socket)
-    {
-        return Win_x64.ioring_rio_register(_ring, socket);
-    }
+    public int RegisterSocket(nint socket) => Win_x64.ioring_rio_register(_ring, socket);
 
     /// <summary>
     /// Unregisters a connection. Call this BEFORE closing the socket.
     /// </summary>
     /// <param name="connId">The connection ID returned from RegisterSocket</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void UnregisterSocket(int connId)
-    {
-        Win_x64.ioring_rio_unregister(_ring, connId);
-    }
+    public void UnregisterSocket(int connId) => Win_x64.ioring_rio_unregister(_ring, connId);
 
     /// <summary>
     /// Creates a listener socket owned by the ring with WSA_FLAG_REGISTERED_IO.
@@ -154,19 +148,17 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// Close the listener with <see cref="CloseListener"/> when done.
     /// </para>
     /// </remarks>
-    public nint CreateListener(string bindAddress, ushort port, int backlog)
-    {
-        return Win_x64.ioring_rio_create_listener(_ring, bindAddress, port, backlog);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public nint CreateListener(string bindAddress, ushort port, int backlog) =>
+        Win_x64.ioring_rio_create_listener(_ring, bindAddress, port, backlog);
 
     /// <summary>
     /// Closes a listener socket created by <see cref="CreateListener"/>.
     /// </summary>
     /// <param name="listener">The listener socket handle</param>
-    public void CloseListener(nint listener)
-    {
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CloseListener(nint listener) =>
         Win_x64.ioring_rio_close_listener(_ring, listener);
-    }
 
     /// <summary>
     /// Configures an accepted socket with optimal settings.
@@ -177,28 +169,19 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// This method is provided for API consistency but may be a no-op if the socket
     /// was created via PrepareAccept.
     /// </remarks>
-    public void ConfigureSocket(nint socket)
-    {
-        // AcceptEx sockets from PrepareAccept are already configured by ioring.dll
-        // For manually created sockets, call setsockopt for TCP_NODELAY etc.
-        Win_x64.ioring_rio_configure_socket(socket);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ConfigureSocket(nint socket) => Win_x64.ioring_rio_configure_socket(socket);
 
     /// <summary>
     /// Closes a socket.
     /// </summary>
     /// <param name="socket">The socket handle to close</param>
-    public void CloseSocket(nint socket)
-    {
-        // Use graceful close to send FIN, enabling proper client disconnect handling
-        Win_x64.ioring_rio_close_socket_graceful(socket);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CloseSocket(nint socket) => Win_x64.ioring_rio_close_socket_graceful(socket);
 
     /// <inheritdoc/>
-    public void Shutdown(nint socket, int how)
-    {
-        Win_x64.shutdown(socket, how);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Shutdown(nint socket, int how) => Win_x64.shutdown(socket, how);
 
     // =============================================================================
     // External Buffer Support (for zero-copy from user-owned memory like Pipe)
@@ -238,10 +221,8 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// </para>
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int RegisterExternalBuffer(nint buffer, uint length)
-    {
-        return Win_x64.ioring_rio_register_external_buffer(_ring, buffer, length);
-    }
+    public int RegisterExternalBuffer(nint buffer, uint length) =>
+        Win_x64.ioring_rio_register_external_buffer(_ring, buffer, length);
 
     /// <summary>
     /// Unregisters an external buffer.
@@ -251,10 +232,8 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// The caller is responsible for freeing the buffer memory after unregistering.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void UnregisterExternalBuffer(int bufferId)
-    {
+    public void UnregisterExternalBuffer(int bufferId) =>
         Win_x64.ioring_rio_unregister_external_buffer(_ring, bufferId);
-    }
 
     /// <summary>
     /// Prepares a send operation from an external registered buffer.
@@ -269,11 +248,8 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// The data must already be written at the specified offset in the external buffer.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSendExternal(int connId, int bufferId, int offset, int len, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_send_external(sqe, connId, bufferId, (uint)offset, (uint)len, userData);
-    }
+    public void PrepareSendExternal(int connId, int bufferId, int offset, int len, ulong userData) =>
+        Win_x64.ioring_prep_send_external(GetSqe(), connId, bufferId, (uint)offset, (uint)len, userData);
 
     /// <summary>
     /// Gets the number of registered external buffers.
@@ -298,11 +274,8 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// After the completion, read the received data at the specified offset.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecvExternal(int connId, int bufferId, int offset, int len, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_recv_external(sqe, connId, bufferId, (uint)offset, (uint)len, userData);
-    }
+    public void PrepareRecvExternal(int connId, int bufferId, int offset, int len, ulong userData) =>
+        Win_x64.ioring_prep_recv_external(GetSqe(), connId, bufferId, (uint)offset, (uint)len, userData);
 
     // =============================================================================
     // IIORingGroup Registered Buffer Operations
@@ -312,36 +285,24 @@ public sealed class WindowsRIOGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int RegisterBuffer(IORingBuffer buffer)
     {
-        if (buffer == null)
-        {
-            throw new ArgumentNullException(nameof(buffer));
-        }
-
+        ArgumentNullException.ThrowIfNull(buffer);
         return Win_x64.ioring_rio_register_external_buffer(_ring, buffer.Pointer, (uint)buffer.VirtualSize);
     }
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void UnregisterBuffer(int bufferId)
-    {
+    public void UnregisterBuffer(int bufferId) =>
         Win_x64.ioring_rio_unregister_external_buffer(_ring, bufferId);
-    }
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_send_external(sqe, connId, bufferId, (uint)offset, (uint)length, userData);
-    }
+    public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData) =>
+        Win_x64.ioring_prep_send_external(GetSqe(), connId, bufferId, (uint)offset, (uint)length, userData);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
-    {
-        var sqe = GetSqe();
-        Win_x64.ioring_prep_recv_external(sqe, connId, bufferId, (uint)offset, (uint)length, userData);
-    }
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData) =>
+        Win_x64.ioring_prep_recv_external(GetSqe(), connId, bufferId, (uint)offset, (uint)length, userData);
 
     // =============================================================================
     // IIORingGroup implementation (for accept and non-registered operations)
@@ -410,7 +371,11 @@ public sealed class WindowsRIOGroup : IIORingGroup
 
     public void Dispose()
     {
-        if (_disposed) return;
+        if (_disposed)
+        {
+            return;
+        }
+
         _disposed = true;
 
         if (_cqeBufferHandle.IsAllocated)

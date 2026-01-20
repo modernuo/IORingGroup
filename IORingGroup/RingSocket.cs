@@ -190,14 +190,9 @@ public sealed class RingSocket
     /// <returns>True if disconnect should proceed now.</returns>
     internal bool CheckDisconnect()
     {
-        if (!DisconnectPending)
-        {
-            return false;
-        }
-
         // Wait for ALL in-flight operations AND send buffer to drain
         // This is critical for zero-copy I/O safety
-        return !RecvPending && !SendPending && SendBuffer.ReadableBytes <= 0;
+        return DisconnectPending && !RecvPending && !SendPending && SendBuffer.ReadableBytes <= 0;
     }
 
     /// <summary>

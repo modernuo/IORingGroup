@@ -215,7 +215,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PreparePollAdd(nint fd, PollMask mask, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.POLL_ADD;
         sqe->fd = (int)fd;
@@ -228,7 +231,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PreparePollRemove(ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.POLL_REMOVE;
         sqe->addr = userData;
@@ -240,7 +246,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareAccept(nint listenFd, nint addr, nint addrLen, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.ACCEPT;
         sqe->fd = (int)listenFd;
@@ -254,7 +263,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareConnect(nint fd, nint addr, int addrLen, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.CONNECT;
         sqe->fd = (int)fd;
@@ -267,7 +279,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.SEND;
         sqe->fd = (int)fd;
@@ -281,7 +296,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.RECV;
         sqe->fd = (int)fd;
@@ -296,7 +314,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareClose(nint fd, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.CLOSE;
         sqe->fd = (int)fd;
@@ -308,7 +329,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareCancel(ulong targetUserData, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.ASYNC_CANCEL;
         sqe->addr = targetUserData;
@@ -320,7 +344,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareShutdown(nint fd, int how, ulong userData)
     {
         var sqe = GetSqe();
-        if (sqe == null) throw new InvalidOperationException("Submission queue full");
+        if (sqe == null)
+        {
+            throw new InvalidOperationException("Submission queue full");
+        }
 
         sqe->opcode = (byte)IORING_OP.SHUTDOWN;
         sqe->fd = (int)fd;
@@ -336,7 +363,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         var tail = _sqTailLocal;
         var toSubmit = tail - head;
 
-        if (toSubmit == 0) return 0;
+        if (toSubmit == 0)
+        {
+            return 0;
+        }
 
         // Release store: ensures all SQE writes are visible before kernel sees new tail
         Volatile.Write(ref *_sqTail, tail);
@@ -381,10 +411,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void AdvanceCompletionQueue(int count)
-    {
-        Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
-    }
+    public void AdvanceCompletionQueue(int count) => Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
 
     // =============================================================================
     // Listener and Socket Management
@@ -400,7 +427,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             _arch.IPPROTO_TCP
         );
 
-        if (fd < 0) return -1;
+        if (fd < 0)
+        {
+            return -1;
+        }
 
         // Disable SO_REUSEADDR (exclusive address use)
         var optval = 0;
@@ -441,18 +471,22 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void CloseListener(nint listener)
     {
         if (listener >= 0)
+        {
             _arch.close((int)listener);
+        }
     }
 
     /// <inheritdoc/>
-    public unsafe void ConfigureSocket(nint socket)
+    public void ConfigureSocket(nint socket)
     {
         var fd = (int)socket;
 
         // Set non-blocking
         var flags = _arch.fcntl(fd, _arch.F_GETFL, 0);
         if (flags >= 0)
+        {
             _arch.fcntl(fd, _arch.F_SETFL, flags | _arch.O_NONBLOCK);
+        }
 
         // TCP_NODELAY (disable Nagle)
         var optval = 1;
@@ -464,11 +498,9 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    public int RegisterSocket(nint socket)
-    {
-        // On Linux, the socket fd is used directly as the connection ID
-        return (int)socket;
-    }
+    /// On Linux, the socket fd is used directly as the connection ID
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int RegisterSocket(nint socket) => (int)socket;
 
     /// <inheritdoc/>
     public void UnregisterSocket(int connId)
@@ -480,14 +512,18 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void CloseSocket(nint socket)
     {
         if (socket >= 0)
+        {
             _arch.close((int)socket);
+        }
     }
 
     /// <inheritdoc/>
     public void Shutdown(nint socket, int how)
     {
         if (socket >= 0)
+        {
             _arch.shutdown((int)socket, how);
+        }
     }
 
     // =============================================================================
@@ -511,11 +547,12 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int RegisterBuffer(IORingBuffer buffer)
     {
-        if (buffer == null)
-            throw new ArgumentNullException(nameof(buffer));
+        ArgumentNullException.ThrowIfNull(buffer);
 
         if (_externalBufferCount >= _maxExternalBuffers)
+        {
             throw new InvalidOperationException("Maximum external buffer count reached");
+        }
 
         // Find free slot
         for (var i = 0; i < _maxExternalBuffers; i++)
@@ -537,7 +574,9 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void UnregisterBuffer(int bufferId)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
+        {
             throw new ArgumentOutOfRangeException(nameof(bufferId));
+        }
 
         if (_externalBufferPtrs[bufferId] != 0)
         {
@@ -556,14 +595,20 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
+        {
             throw new ArgumentOutOfRangeException(nameof(bufferId));
+        }
 
         var bufPtr = _externalBufferPtrs[bufferId];
         if (bufPtr == 0)
+        {
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+        }
 
         if (offset + length > _externalBufferLengths[bufferId])
+        {
             throw new ArgumentOutOfRangeException(nameof(offset), "Offset + length exceeds buffer size");
+        }
 
         // Use regular SEND with calculated buffer address
         PrepareSend(connId, bufPtr + offset, length, MsgFlags.None, userData);
@@ -577,15 +622,19 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
-            throw new ArgumentOutOfRangeException(nameof(bufferId));
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferId);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(bufferId, _maxExternalBuffers);
 
         var bufPtr = _externalBufferPtrs[bufferId];
         if (bufPtr == 0)
+        {
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+        }
 
         if (offset + length > _externalBufferLengths[bufferId])
+        {
             throw new ArgumentOutOfRangeException(nameof(offset), "Offset + length exceeds buffer size");
+        }
 
         // Use regular RECV with calculated buffer address
         PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
@@ -598,10 +647,16 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     private static uint ParseIPv4(string address)
     {
-        if (address == "0.0.0.0") return 0; // INADDR_ANY
+        if (address == "0.0.0.0")
+        {
+            return 0; // INADDR_ANY
+        }
 
         var parts = address.Split('.');
-        if (parts.Length != 4) return 0;
+        if (parts.Length != 4)
+        {
+            return 0;
+        }
 
         return (uint)(
             byte.Parse(parts[0]) |
@@ -629,20 +684,32 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     public void Dispose()
     {
-        if (_disposed) return;
+        if (_disposed)
+        {
+            return;
+        }
+
         _disposed = true;
 
         if (_sqesPtr != 0 && _sqesPtr != -1)
+        {
             _arch.munmap(_sqesPtr, _sqesSize);
+        }
 
         if (_cqRingPtr != 0 && _cqRingPtr != -1)
+        {
             _arch.munmap(_cqRingPtr, _cqRingSize);
+        }
 
         if (_sqRingPtr != 0 && _sqRingPtr != -1)
+        {
             _arch.munmap(_sqRingPtr, _sqRingSize);
+        }
 
         if (_ringFd >= 0)
+        {
             _arch.close(_ringFd);
+        }
     }
 }
 

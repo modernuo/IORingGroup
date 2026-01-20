@@ -47,9 +47,13 @@ public class Program
             {
                 var affinityStr = args[++i];
                 if (affinityStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
                     cpuAffinity = (nint)Convert.ToInt64(affinityStr[2..], 16);
+                }
                 else
+                {
                     cpuAffinity = (nint)long.Parse(affinityStr);
+                }
             }
         }
 
@@ -102,7 +106,9 @@ public class Program
                 var input = Console.ReadLine();
 
                 if (string.IsNullOrEmpty(input))
+                {
                     continue;
+                }
 
                 if (input.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
                     input.Equals("exit", StringComparison.OrdinalIgnoreCase))
@@ -280,7 +286,11 @@ public class Program
                     while (totalReceived < totalExpected)
                     {
                         var bytesRead = await stream.ReadAsync(buffer);
-                        if (bytesRead == 0) break;  // Connection closed
+                        if (bytesRead == 0)
+                        {
+                            break;  // Connection closed
+                        }
+
                         totalReceived += bytesRead;
                         Interlocked.Add(ref bytesReceived, bytesRead);
                         // Count complete messages (approximate - assumes no partial messages)

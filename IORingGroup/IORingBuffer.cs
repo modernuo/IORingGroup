@@ -49,12 +49,12 @@ public sealed partial class IORingBuffer : IDisposable
     /// <summary>
     /// Indicates whether this buffer belongs to a pool (vs fallback allocation).
     /// </summary>
-    internal bool IsPooled { get; init; }
+    internal bool IsPooled { get; }
 
     /// <summary>
     /// Index within the pool's buffer array (-1 for fallback buffers).
     /// </summary>
-    internal int PoolIndex { get; init; }
+    internal int PoolIndex { get; }
 
     /// <summary>
     /// Gets the number of bytes available for reading.
@@ -519,8 +519,5 @@ public sealed partial class IORingBuffer : IDisposable
 
 internal static class ThrowHelper
 {
-    public static void ThrowArgumentOutOfRange(string paramName)
-    {
-        throw new ArgumentOutOfRangeException(paramName);
-    }
+    public static void ThrowArgumentOutOfRange(string paramName) => throw new ArgumentOutOfRangeException(paramName);
 }

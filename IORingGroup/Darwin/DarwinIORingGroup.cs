@@ -270,9 +270,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Convert poll mask to kqueue filter
         short filter = 0;
         if ((sqe.Flags & (int)PollMask.In) != 0)
+        {
             filter = (short)kqueue_filter.READ;
+        }
         else if ((sqe.Flags & (int)PollMask.Out) != 0)
+        {
             filter = (short)kqueue_filter.WRITE;
+        }
 
         var ev = new kevent
         {
@@ -355,12 +359,17 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         // Create TCP socket
         var fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd < 0) return -1;
+        if (fd < 0)
+        {
+            return -1;
+        }
 
         // Set non-blocking
         var flags = Darwin.fcntl(fd, F_GETFL, 0);
         if (flags >= 0)
+        {
             Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
 
         // Disable SO_REUSEADDR (exclusive address use)
         var optval = 0;
@@ -402,7 +411,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void CloseListener(nint listener)
     {
         if (listener >= 0)
+        {
             Darwin.close((int)listener);
+        }
     }
 
     /// <inheritdoc/>
@@ -413,7 +424,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Set non-blocking
         var flags = Darwin.fcntl(fd, F_GETFL, 0);
         if (flags >= 0)
+        {
             Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
 
         // TCP_NODELAY (disable Nagle)
         var optval = 1;
@@ -441,14 +454,18 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void CloseSocket(nint socket)
     {
         if (socket >= 0)
+        {
             Darwin.close((int)socket);
+        }
     }
 
     /// <inheritdoc/>
     public void Shutdown(nint socket, int how)
     {
         if (socket >= 0)
+        {
             Darwin.shutdown((int)socket, how);
+        }
     }
 
     // =============================================================================
@@ -467,11 +484,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int RegisterBuffer(IORingBuffer buffer)
     {
-        if (buffer == null)
-            throw new ArgumentNullException(nameof(buffer));
+        ArgumentNullException.ThrowIfNull(buffer);
 
         if (_externalBufferCount >= _maxExternalBuffers)
+        {
             throw new InvalidOperationException($"Maximum of {_maxExternalBuffers} external buffers reached");
+        }
 
         // Find first free slot
         for (var i = 0; i < _maxExternalBuffers; i++)
@@ -493,7 +511,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void UnregisterBuffer(int bufferId)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
+        {
             return; // Silently ignore invalid IDs for consistency with other platforms
+        }
 
         if (_externalBufferPtrs[bufferId] != 0)
         {
@@ -512,11 +532,15 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
+        {
             throw new ArgumentOutOfRangeException(nameof(bufferId));
+        }
 
         var bufPtr = _externalBufferPtrs[bufferId];
         if (bufPtr == 0)
+        {
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+        }
 
         // Use regular send with calculated buffer address
         PrepareSend(connId, bufPtr + offset, length, MsgFlags.None, userData);
@@ -531,11 +555,15 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
         if (bufferId < 0 || bufferId >= _maxExternalBuffers)
+        {
             throw new ArgumentOutOfRangeException(nameof(bufferId));
+        }
 
         var bufPtr = _externalBufferPtrs[bufferId];
         if (bufPtr == 0)
+        {
             throw new InvalidOperationException($"Buffer {bufferId} is not registered");
+        }
 
         // Use regular recv with calculated buffer address
         PrepareRecv(connId, bufPtr + offset, length, MsgFlags.None, userData);
@@ -548,10 +576,16 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     private static uint ParseIPv4(string address)
     {
-        if (address == "0.0.0.0") return 0; // INADDR_ANY
+        if (address == "0.0.0.0")
+        {
+            return 0; // INADDR_ANY
+        }
 
         var parts = address.Split('.');
-        if (parts.Length != 4) return 0;
+        if (parts.Length != 4)
+        {
+            return 0;
+        }
 
         return (uint)(
             byte.Parse(parts[0]) |
@@ -592,7 +626,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
     public void Dispose()
     {
-        if (_disposed) return;
+        if (_disposed)
+        {
+            return;
+        }
+
         _disposed = true;
 
         if (_kqueueFd >= 0)

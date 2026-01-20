@@ -28,9 +28,6 @@ public sealed class IORingBufferPool : IDisposable
 {
     private readonly IIORingGroup _ring;
     private readonly List<PoolSlab> _slabs;
-    private readonly int _slabSize;
-    private readonly int _bufferSize;
-    private readonly int _maxSlabs;
     private int _firstNonFullSlab;
     private bool _disposed;
 
@@ -59,17 +56,17 @@ public sealed class IORingBufferPool : IDisposable
     /// <summary>
     /// Gets the number of buffers per slab.
     /// </summary>
-    public int SlabSize => _slabSize;
+    public int SlabSize { get; }
 
     /// <summary>
     /// Gets the physical size of each buffer in bytes.
     /// </summary>
-    public int BufferSize => _bufferSize;
+    public int BufferSize { get; }
 
     /// <summary>
     /// Gets the maximum number of slabs allowed.
     /// </summary>
-    public int MaxSlabs => _maxSlabs;
+    public int MaxSlabs { get; }
 
     /// <summary>
     /// Gets the current number of allocated slabs.
@@ -79,7 +76,7 @@ public sealed class IORingBufferPool : IDisposable
     /// <summary>
     /// Gets the total capacity (current slabs × slab size).
     /// </summary>
-    public int TotalCapacity => CurrentSlabs * _slabSize;
+    public int TotalCapacity => CurrentSlabs * SlabSize;
 
     /// <summary>
     /// Creates a buffer pool with on-demand slab allocation.
@@ -101,19 +98,33 @@ public sealed class IORingBufferPool : IDisposable
         _ring = ring ?? throw new ArgumentNullException(nameof(ring));
 
         if (slabSize <= 0)
+        {
             throw new ArgumentOutOfRangeException(nameof(slabSize), "Slab size must be positive");
-        if (bufferSize <= 0)
-            throw new ArgumentOutOfRangeException(nameof(bufferSize), "Buffer size must be positive");
-        if (initialSlabs < 0)
-            throw new ArgumentOutOfRangeException(nameof(initialSlabs), "Initial slabs cannot be negative");
-        if (maxSlabs < 1)
-            throw new ArgumentOutOfRangeException(nameof(maxSlabs), "Max slabs must be at least 1");
-        if (initialSlabs > maxSlabs)
-            throw new ArgumentOutOfRangeException(nameof(initialSlabs), "Initial slabs cannot exceed max slabs");
+        }
 
-        _slabSize = slabSize;
-        _bufferSize = bufferSize;
-        _maxSlabs = maxSlabs;
+        if (bufferSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bufferSize), "Buffer size must be positive");
+        }
+
+        if (initialSlabs < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(initialSlabs), "Initial slabs cannot be negative");
+        }
+
+        if (maxSlabs < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxSlabs), "Max slabs must be at least 1");
+        }
+
+        if (initialSlabs > maxSlabs)
+        {
+            throw new ArgumentOutOfRangeException(nameof(initialSlabs), "Initial slabs cannot exceed max slabs");
+        }
+
+        SlabSize = slabSize;
+        BufferSize = bufferSize;
+        MaxSlabs = maxSlabs;
         _slabs = new List<PoolSlab>(maxSlabs);
         _firstNonFullSlab = 0;
 
@@ -129,13 +140,13 @@ public sealed class IORingBufferPool : IDisposable
     /// </summary>
     private PoolSlab CreateSlab(int slabId)
     {
-        var slab = new PoolSlab(_slabSize);
-        var basePoolIndex = slabId * _slabSize;
+        var slab = new PoolSlab(SlabSize);
+        var basePoolIndex = slabId * SlabSize;
 
-        for (var i = 0; i < _slabSize; i++)
+        for (var i = 0; i < SlabSize; i++)
         {
             var poolIndex = basePoolIndex + i;
-            var buffer = IORingBuffer.Create(_bufferSize, isPooled: true, poolIndex: poolIndex);
+            var buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
 
             // Register with ring
             var bufferId = _ring.RegisterBuffer(buffer);
@@ -145,7 +156,7 @@ public sealed class IORingBufferPool : IDisposable
             slab.FreeStack[i] = i;
         }
 
-        slab.FreeCount = _slabSize;
+        slab.FreeCount = SlabSize;
         return slab;
     }
 
@@ -169,17 +180,16 @@ public sealed class IORingBufferPool : IDisposable
             }
         }
 
-        // All existing slabs are full - can we create a new one?
-        if (_slabs.Count < _maxSlabs)
+        // At max slabs - create fallback buffer
+        if (_slabs.Count >= MaxSlabs)
         {
-            var newSlab = CreateSlab(_slabs.Count);
-            _slabs.Add(newSlab);
-            _firstNonFullSlab = _slabs.Count - 1;
-            return AcquireFromSlab(newSlab);
+            return CreateFallbackBuffer();
         }
 
-        // At max slabs - create fallback buffer
-        return CreateFallbackBuffer();
+        var newSlab = CreateSlab(_slabs.Count);
+        _slabs.Add(newSlab);
+        _firstNonFullSlab = _slabs.Count - 1;
+        return AcquireFromSlab(newSlab);
     }
 
     /// <summary>
@@ -214,7 +224,7 @@ public sealed class IORingBufferPool : IDisposable
         }
 
         // Try to create new slab
-        if (_slabs.Count < _maxSlabs)
+        if (_slabs.Count < MaxSlabs)
         {
             var newSlab = CreateSlab(_slabs.Count);
             _slabs.Add(newSlab);
@@ -233,14 +243,13 @@ public sealed class IORingBufferPool : IDisposable
     /// <param name="buffer">The buffer to release.</param>
     public void Release(IORingBuffer buffer)
     {
-        if (buffer == null)
-            throw new ArgumentNullException(nameof(buffer));
+        ArgumentNullException.ThrowIfNull(buffer);
 
         if (buffer.IsPooled)
         {
             // Decode slab and slot from PoolIndex
-            var slabId = buffer.PoolIndex / _slabSize;
-            var slotIndex = buffer.PoolIndex % _slabSize;
+            var slabId = buffer.PoolIndex / SlabSize;
+            var slotIndex = buffer.PoolIndex % SlabSize;
 
             if (slabId < _slabs.Count)
             {
@@ -249,7 +258,9 @@ public sealed class IORingBufferPool : IDisposable
 
                 // Update hint if releasing to earlier slab
                 if (slabId < _firstNonFullSlab)
+                {
                     _firstNonFullSlab = slabId;
+                }
             }
         }
         else
@@ -275,9 +286,11 @@ public sealed class IORingBufferPool : IDisposable
 
         // Track peak fallback usage
         if (_currentFallbackCount > _peakFallbackCount)
+        {
             _peakFallbackCount = _currentFallbackCount;
+        }
 
-        var buffer = IORingBuffer.Create(_bufferSize, isPooled: false, poolIndex: -1);
+        var buffer = IORingBuffer.Create(BufferSize, isPooled: false, poolIndex: -1);
 
         // Register with ring
         var bufferId = _ring.RegisterBuffer(buffer);
@@ -291,7 +304,7 @@ public sealed class IORingBufferPool : IDisposable
     /// </summary>
     public SlabPoolStats GetStats()
     {
-        var totalCapacity = _slabs.Count * _slabSize;
+        var totalCapacity = _slabs.Count * SlabSize;
         var freeCount = 0;
         for (var i = 0; i < _slabs.Count; i++)
         {
@@ -301,17 +314,17 @@ public sealed class IORingBufferPool : IDisposable
 
         return new SlabPoolStats
         {
-            SlabSize = _slabSize,
-            BufferSize = _bufferSize,
+            SlabSize = SlabSize,
+            BufferSize = BufferSize,
             CurrentSlabs = _slabs.Count,
-            MaxSlabs = _maxSlabs,
+            MaxSlabs = MaxSlabs,
             TotalCapacity = totalCapacity,
             InUseCount = totalCapacity - freeCount,
             FreeCount = freeCount,
             TotalFallbackAllocations = _fallbackAllocations,
             CurrentFallbackCount = _currentFallbackCount,
             PeakFallbackCount = _peakFallbackCount,
-            CommittedBytes = (long)_slabs.Count * _slabSize * _bufferSize * 2, // ×2 for double-mapping
+            CommittedBytes = (long)_slabs.Count * SlabSize * BufferSize * 2, // ×2 for double-mapping
         };
     }
 
@@ -327,7 +340,9 @@ public sealed class IORingBufferPool : IDisposable
     public void Dispose()
     {
         if (_disposed)
+        {
             return;
+        }
 
         _disposed = true;
 
@@ -335,8 +350,9 @@ public sealed class IORingBufferPool : IDisposable
         for (var i = 0; i < _slabs.Count; i++)
         {
             var slab = _slabs[i];
-            foreach (var buffer in slab.Buffers)
+            for (var j = 0; j < slab.Buffers.Length; j++)
             {
+                var buffer = slab.Buffers[j];
                 if (buffer.BufferId >= 0)
                 {
                     _ring.UnregisterBuffer(buffer.BufferId);

@@ -17,7 +17,9 @@ internal static class TestHelpers
             ring.Submit();
             count = ring.PeekCompletions(completions);
             if (count < minComplete)
+            {
                 Thread.Sleep(1);
+            }
         }
         return count;
     }
@@ -1126,7 +1128,11 @@ public class WindowsRIOGroupTests
             while (totalReceived < fillSize)
             {
                 var received = serverSide.Receive(recvBuffer, totalReceived, fillSize - totalReceived, SocketFlags.None);
-                if (received == 0) break;
+                if (received == 0)
+                {
+                    break;
+                }
+
                 totalReceived += received;
             }
             Assert.Equal(fillSize, totalReceived);
@@ -1577,7 +1583,10 @@ public class WindowsRIOGroupTests
                     }
                     ring.AdvanceCompletionQueue(count);
 
-                    if (acceptReceived) break;
+                    if (acceptReceived)
+                    {
+                        break;
+                    }
                 }
 
                 Thread.Sleep(1);  // Small delay between polls
@@ -1734,7 +1743,10 @@ public class WindowsRIOGroupTests
                         }
                     }
                     ring.AdvanceCompletionQueue(count);
-                    if (acceptReceived) break;
+                    if (acceptReceived)
+                    {
+                        break;
+                    }
                 }
             }
 

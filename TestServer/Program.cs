@@ -124,9 +124,13 @@ public class Program
             {
                 var affinityStr = args[++i];
                 if (affinityStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
                     cpuAffinity = (nint)Convert.ToInt64(affinityStr[2..], 16);
+                }
                 else
+                {
                     cpuAffinity = (nint)long.Parse(affinityStr);
+                }
             }
         }
 
@@ -426,16 +430,22 @@ public class Program
                     CaptureStartMemoryStats();
                     _benchmarkStopwatch.Start();
                     if (benchmarkMode)
+                    {
                         Console.WriteLine("First client connected - benchmark started!");
+                    }
                 }
 
                 // Track peak connections
                 var activeCount = CountActiveClients();
                 if (activeCount > _peakConnections)
+                {
                     _peakConnections = activeCount;
+                }
 
                 if (!benchmarkMode && !_quietMode)
+                {
                     Console.WriteLine($"Client {clientIndex} connected (socket={clientSocket}, connId={client.ConnId})");
+                }
 
                 // Post initial receive - recv into buffer at tail (write position)
                 var availableSpace = client.Buffer.WritableBytes;
@@ -484,7 +494,10 @@ public class Program
 
         // Note: Don't count bytes here - count once on send completion to match PollGroup
 
-        if (client.Buffer == null) return;
+        if (client.Buffer == null)
+        {
+            return;
+        }
 
         // Commit the write - data is now available for sending
         client.Buffer.CommitWrite(result);
@@ -538,7 +551,10 @@ public class Program
         _totalBytes += result;
         _totalMessages++;
 
-        if (client.Buffer == null) return;
+        if (client.Buffer == null)
+        {
+            return;
+        }
 
         // Commit the read - data has been sent, free up space
         client.Buffer.CommitRead(result);
@@ -581,14 +597,21 @@ public class Program
     private static void CloseClient(IIORingGroup ring, int index)
     {
         ref var client = ref _clients[index];
-        if (!client.Active) return;
+        if (!client.Active)
+        {
+            return;
+        }
 
         if (!_quietMode)
+        {
             Console.WriteLine($"Client {index} disconnected");
+        }
 
         // Unregister socket
         if (client.ConnId >= 0)
+        {
             ring.UnregisterSocket(client.ConnId);
+        }
 
         // Release buffer back to pool (buffer stays registered with ring)
         if (client.Buffer != null && _bufferPool != null)
@@ -614,7 +637,10 @@ public class Program
     {
         for (var i = 0; i < MaxClients; i++)
             if (!_clients[i].Active)
+            {
                 return i;
+            }
+
         return -1;
     }
 
@@ -623,7 +649,10 @@ public class Program
         var count = 0;
         for (var i = 0; i < MaxClients; i++)
             if (_clients[i].Active)
+            {
                 count++;
+            }
+
         return count;
     }
 
@@ -686,7 +715,10 @@ public class Program
 
     private static void InitializePollPool(int size)
     {
-        if (_pollPoolInitialized) return;
+        if (_pollPoolInitialized)
+        {
+            return;
+        }
 
         Console.WriteLine($"Pre-allocating {size} PollClientState objects with IORingBuffer...");
         for (var i = 0; i < size; i++)
@@ -741,7 +773,9 @@ public class Program
                 if (_pollClients[i] == state)
                 {
                     if (!benchmarkMode && !_quietMode)
+                    {
                         Console.WriteLine($"[PollGroup] Client {i} disconnected");
+                    }
 
                     pollGroup.Remove(state.Socket!, state.Handle);
                     state.Handle.Free();
@@ -881,15 +915,21 @@ public class Program
                                 CaptureStartMemoryStats();
                                 _benchmarkStopwatch.Start();
                                 if (benchmarkMode)
+                                {
                                     Console.WriteLine("[PollGroup] First client connected - benchmark started!");
+                                }
                             }
 
                             var activeCount = CountActivePollClients();
                             if (activeCount > _peakConnections)
+                            {
                                 _peakConnections = activeCount;
+                            }
 
                             if (!benchmarkMode && !_quietMode)
+                            {
                                 Console.WriteLine($"[PollGroup] Client {clientIndex} connected");
+                            }
                         }
                         else
                         {
@@ -969,7 +1009,10 @@ public class Program
     {
         for (var i = 0; i < MaxClients; i++)
             if (_pollClients[i] == null)
+            {
                 return i;
+            }
+
         return -1;
     }
 
@@ -978,7 +1021,10 @@ public class Program
         var count = 0;
         for (var i = 0; i < MaxClients; i++)
             if (_pollClients[i] != null)
+            {
                 count++;
+            }
+
         return count;
     }
 
