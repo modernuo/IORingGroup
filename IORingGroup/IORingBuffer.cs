@@ -3,6 +3,7 @@
 
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace System.Network;
 
@@ -141,7 +142,12 @@ public sealed partial class IORingBuffer : IDisposable
             return CreateLinux(physicalSize, isPooled, poolIndex);
         }
 
-        throw new PlatformNotSupportedException("IORingBuffer requires Windows or Linux");
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD))
+        {
+            return CreateBsd(physicalSize, isPooled, poolIndex);
+        }
+
+        throw new PlatformNotSupportedException("IORingBuffer requires Windows, Linux, macOS, or FreeBSD");
     }
 
     private IORingBuffer(nint handle, nint buffer, int physicalSize, bool isPooled, int poolIndex)
@@ -462,6 +468,122 @@ public sealed partial class IORingBuffer : IDisposable
 
     #endregion
 
+    #region BSD/macOS Implementation
+
+    private static int _shmCounter;
+
+    private static IORingBuffer CreateBsd(int physicalSize, bool isPooled, int poolIndex)
+    {
+        // Create a unique name for the shared memory object
+        // macOS has a ~30 char limit for shm names, so keep it short
+        var shmName = $"/io{Environment.ProcessId:X}_{Interlocked.Increment(ref _shmCounter):X}";
+
+        // Create shared memory object
+        var fd = BsdNative.shm_open(shmName, BsdNative.O_RDWR | BsdNative.O_CREAT | BsdNative.O_EXCL, 0600);
+        if (fd < 0)
+        {
+            throw new InvalidOperationException($"shm_open failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        // Immediately unlink so it gets cleaned up when all fds are closed
+        BsdNative.shm_unlink(shmName);
+
+        // Set the file size
+        if (BsdNative.ftruncate(fd, physicalSize) < 0)
+        {
+            BsdNative.close(fd);
+            throw new InvalidOperationException($"ftruncate failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        // Reserve virtual address space for both mappings
+        var region = BsdNative.mmap(
+            nint.Zero,
+            (nuint)(physicalSize * 2),
+            BsdNative.PROT_NONE,
+            BsdNative.MAP_PRIVATE | BsdNative.MAP_ANON,
+            -1,
+            0
+        );
+
+        if (region == BsdNative.MAP_FAILED)
+        {
+            BsdNative.close(fd);
+            throw new InvalidOperationException($"mmap (reserve) failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        // Map first view
+        var buffer = BsdNative.mmap(
+            region,
+            (nuint)physicalSize,
+            BsdNative.PROT_READ | BsdNative.PROT_WRITE,
+            BsdNative.MAP_SHARED | BsdNative.MAP_FIXED,
+            fd,
+            0
+        );
+
+        if (buffer == BsdNative.MAP_FAILED)
+        {
+            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.close(fd);
+            throw new InvalidOperationException($"mmap (first) failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        // Map second view (same fd, same offset = same physical memory)
+        var view2 = BsdNative.mmap(
+            region + physicalSize,
+            (nuint)physicalSize,
+            BsdNative.PROT_READ | BsdNative.PROT_WRITE,
+            BsdNative.MAP_SHARED | BsdNative.MAP_FIXED,
+            fd,
+            0
+        );
+
+        if (view2 == BsdNative.MAP_FAILED)
+        {
+            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.close(fd);
+            throw new InvalidOperationException($"mmap (second) failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        return new IORingBuffer(fd, buffer, physicalSize, isPooled, poolIndex);
+    }
+
+    private static partial class BsdNative
+    {
+        public static readonly nint MAP_FAILED = -1;
+
+        public const int O_RDWR = 0x0002;
+        public const int O_CREAT = 0x0200;
+        public const int O_EXCL = 0x0800;
+        public const int PROT_NONE = 0x0;
+        public const int PROT_READ = 0x1;
+        public const int PROT_WRITE = 0x2;
+        public const int MAP_SHARED = 0x0001;
+        public const int MAP_PRIVATE = 0x0002;
+        public const int MAP_FIXED = 0x0010;
+        public const int MAP_ANON = 0x1000;
+
+        [LibraryImport("libc", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+        public static partial int shm_open(string name, int oflag, int mode);
+
+        [LibraryImport("libc", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+        public static partial int shm_unlink(string name);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial int ftruncate(int fd, long length);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial nint mmap(nint addr, nuint length, int prot, int flags, int fd, long offset);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial int munmap(nint addr, nuint length);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial int close(int fd);
+    }
+
+    #endregion
+
     #region Disposal
 
     private void ReleaseUnmanagedResources()
@@ -495,6 +617,19 @@ public sealed partial class IORingBuffer : IDisposable
             if (_handle != nint.Zero)
             {
                 LinuxNative.close((int)_handle);
+                _handle = nint.Zero;
+            }
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD))
+        {
+            if (_buffer != nint.Zero)
+            {
+                BsdNative.munmap(_buffer, (nuint)(_physicalSize * 2));
+            }
+
+            if (_handle != nint.Zero)
+            {
+                BsdNative.close((int)_handle);
                 _handle = nint.Zero;
             }
         }
