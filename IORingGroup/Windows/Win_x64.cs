@@ -89,10 +89,13 @@ public static partial class Win_x64
     /// </summary>
     /// <param name="entries">SQ/CQ size (power of 2 recommended)</param>
     /// <param name="maxConnections">Maximum concurrent registered sockets</param>
-    /// <param name="outstandingPerSocket">Max outstanding ops per direction per socket (default 2, max 16)</param>
     /// <returns>Ring handle, or IntPtr.Zero on failure</returns>
+    /// <remarks>
+    /// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send).
+    /// CQ is auto-sized to maxConnections * 2.
+    /// </remarks>
     [LibraryImport(LibraryName, SetLastError = true)]
-    public static partial nint ioring_create_rio_ex(uint entries, uint maxConnections, uint outstandingPerSocket);
+    public static partial nint ioring_create_rio_ex(uint entries, uint maxConnections);
 
     /// <summary>
     /// Register a connected socket for RIO operations.

@@ -262,32 +262,6 @@ public class WindowsRIOGroupTests
     }
 
     [SkippableFact]
-    public void Create_WithCustomOutstanding_Succeeds()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        using var ring = new System.Network.Windows.WindowsRIOGroup(
-            queueSize: 256,
-            maxConnections: MaxConnections,
-            outstandingPerSocket: 4
-        );
-
-        Assert.NotNull(ring);
-    }
-
-    [SkippableFact]
-    public void Create_WithInvalidOutstanding_ThrowsArgumentException()
-    {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
-
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, 0));
-
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new System.Network.Windows.WindowsRIOGroup(256, MaxConnections, 100));
-    }
-
-    [SkippableFact]
     public void Create_WithNonPowerOfTwo_ThrowsArgumentException()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");

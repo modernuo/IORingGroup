@@ -141,14 +141,13 @@ IORING_API int ioring_get_last_error(void);
  */
 
 // Create ring with RIO support
-// - outstanding_per_socket: max outstanding ops per direction (recv/send) per socket
-//   Default is 2 (enough for request-response patterns like echo)
-//   Higher values (4-8) for pipelined protocols
-//   CQ is auto-sized to max_connections * outstanding_per_socket * 2
+// - entries: SQ/CQ size (power of 2 recommended)
+// - max_connections: max concurrent registered sockets
+// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send)
+// CQ is auto-sized to max_connections * 2
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
-    uint32_t max_connections,
-    uint32_t outstanding_per_socket
+    uint32_t max_connections
 );
 
 // Register a connected socket for RIO operations

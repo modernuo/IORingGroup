@@ -40,45 +40,27 @@ public sealed class WindowsRIOGroup : IIORingGroup
     private readonly nint _cqeBufferPtr;
 
     /// <summary>
-    /// Default outstanding operations per socket per direction.
-    /// </summary>
-    public const int DefaultOutstandingPerSocket = 2;
-
-    /// <summary>
-    /// Maximum outstanding operations per socket per direction.
-    /// </summary>
-    public const int MaxOutstandingPerSocket = 16;
-
-    /// <summary>
     /// Native ring handle (for diagnostic purposes).
     /// </summary>
     public nint Handle => _ring;
 
     /// <summary>
-    /// Creates a new RIO ring with configurable outstanding operations.
+    /// Creates a new RIO ring.
     /// </summary>
     /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
     /// <param name="maxConnections">Maximum concurrent connections</param>
-    /// <param name="outstandingPerSocket">Max outstanding ops per direction per socket (1-16, default 2)</param>
     /// <remarks>
-    /// The completion queue is auto-sized to: maxConnections * outstandingPerSocket * 2.
-    /// For simple request-response patterns (like echo), use 1-2.
-    /// For pipelined protocols, use 4-8.
+    /// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send).
+    /// The completion queue is auto-sized to: maxConnections * 2.
     /// </remarks>
-    public WindowsRIOGroup(int queueSize, int maxConnections, int outstandingPerSocket = DefaultOutstandingPerSocket)
+    public WindowsRIOGroup(int queueSize, int maxConnections)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
-        if (outstandingPerSocket is < 1 or > MaxOutstandingPerSocket)
-        {
-            throw new ArgumentOutOfRangeException(nameof(outstandingPerSocket),
-                $"Must be between 1 and {MaxOutstandingPerSocket}");
-        }
-
-        _ring = Win_x64.ioring_create_rio_ex((uint)queueSize, (uint)maxConnections, (uint)outstandingPerSocket);
+        _ring = Win_x64.ioring_create_rio_ex((uint)queueSize, (uint)maxConnections);
 
         if (_ring == 0)
         {

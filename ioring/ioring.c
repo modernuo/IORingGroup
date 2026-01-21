@@ -89,9 +89,9 @@ typedef struct acceptex_context {
     int conn_slot;              // Connection slot for this socket
 } acceptex_context_t;
 
-// RIO configuration defaults
-#define RIO_DEFAULT_OUTSTANDING_PER_SOCKET 2  // 1 recv + 1 send typical for echo
-#define RIO_MAX_OUTSTANDING_PER_SOCKET 16     // Upper limit per direction
+// RIO configuration: 1 outstanding op per direction (recv/send) per socket
+// This matches the typical usage pattern of 1 recv + 1 send pending per connection
+#define RIO_OUTSTANDING_PER_SOCKET 1
 
 // Forward declarations
 static void dequeue_rio_completions(ioring_t* ring);
@@ -117,7 +117,7 @@ struct ioring {
     RIO_CQ rio_cq;                      // RIO completion queue
     uint32_t rio_max_connections;       // Max concurrent connections
     uint32_t rio_active_connections;    // Current active connections
-    uint32_t rio_outstanding_per_socket;// Max outstanding ops per direction per socket
+    // Note: outstanding per socket is hardcoded to RIO_OUTSTANDING_PER_SOCKET (1)
     uint32_t rio_cq_size;               // Actual CQ size
     rio_connection_t* rio_connections;  // Per-connection state
 
@@ -624,7 +624,7 @@ static void dequeue_rio_completions(ioring_t* ring) {
 
     for (ULONG i = 0; i < count; i++) {
         uint64_t user_data = results[i].RequestContext;
-        int32_t res = (results[i].Status == 0) ? (int32_t)results[i].BytesTransferred : -(int32_t)results[i].Status;
+        int32_t res = results[i].Status == 0 ? (int32_t)results[i].BytesTransferred : -(int32_t)results[i].Status;
         complete_op(ring, user_data, res, 0);
     }
 
@@ -671,7 +671,7 @@ IORING_API uint32_t ioring_peek_cqe(ioring_t* ring, ioring_cqe_t* cqes, uint32_t
     uint32_t to_copy = count < available ? count : available;
 
     for (uint32_t i = 0; i < to_copy; i++) {
-        cqes[i] = ring->cq[(ring->cq_head + i) & ring->cq_mask];
+        cqes[i] = ring->cq[ring->cq_head + i & ring->cq_mask];
     }
 
     return to_copy;
@@ -719,12 +719,11 @@ IORING_API int ioring_get_last_error(void) {
 // =============================================================================
 
 // Version string for build verification
-#define IORING_VERSION "2026-01-16-v2"
+#define IORING_VERSION "2026-01-20-v1"
 
 IORING_API ioring_t* ioring_create_rio_ex(
     uint32_t entries,
-    uint32_t max_connections,
-    uint32_t outstanding_per_socket
+    uint32_t max_connections
 ) {
     fflush(stdout);
 
@@ -746,10 +745,6 @@ IORING_API ioring_t* ioring_create_rio_ex(
 
     if (max_connections == 0) max_connections = 1024;
 
-    // Clamp outstanding_per_socket to valid range
-    if (outstanding_per_socket == 0) outstanding_per_socket = RIO_DEFAULT_OUTSTANDING_PER_SOCKET;
-    if (outstanding_per_socket > RIO_MAX_OUTSTANDING_PER_SOCKET) outstanding_per_socket = RIO_MAX_OUTSTANDING_PER_SOCKET;
-
     ioring_t* ring = calloc(1, sizeof(ioring_t));
     if (!ring) {
         last_error = ERROR_OUTOFMEMORY;
@@ -758,15 +753,14 @@ IORING_API ioring_t* ioring_create_rio_ex(
 
     ring->sq_entries = entries;
     // User-space CQ must be large enough to hold all RIO completions
-    // RIO CQ size = max_connections * outstanding * 2, so match that
-    uint32_t min_cq_size = max_connections * outstanding_per_socket * 2;
-    ring->cq_entries = (entries * 2 > min_cq_size) ? entries * 2 : min_cq_size;
+    // RIO CQ size = max_connections * 2 (1 recv + 1 send per connection)
+    uint32_t min_cq_size = max_connections * 2;
+    ring->cq_entries = entries * 2 > min_cq_size ? entries * 2 : min_cq_size;
     // Round up to power of 2 for efficient masking
     ring->cq_entries = next_power_of_two(ring->cq_entries);
     ring->sq_mask = entries - 1;
     ring->cq_mask = ring->cq_entries - 1;
     ring->rio_max_connections = max_connections;
-    ring->rio_outstanding_per_socket = outstanding_per_socket;
     ring->rio_cq = RIO_INVALID_CQ;
 
     // Allocate user-space queues
@@ -809,7 +803,8 @@ IORING_API ioring_t* ioring_create_rio_ex(
 
     // Create RIO completion queue
     // CQ must be large enough for all outstanding operations across all RQs
-    uint32_t rio_cq_size = max_connections * outstanding_per_socket * 2;
+    // Size = max_connections * 2 (1 recv + 1 send per connection)
+    uint32_t rio_cq_size = max_connections * 2;
     if (rio_cq_size < ring->cq_entries) {
         rio_cq_size = ring->cq_entries;
     }
@@ -917,9 +912,9 @@ IORING_API int ioring_rio_register(
     WSASetLastError(0);
     conn->rq = rio.RIOCreateRequestQueue(
         socket,
-        ring->rio_outstanding_per_socket,   // Max outstanding receives
+        RIO_OUTSTANDING_PER_SOCKET,          // Max outstanding receives (1)
         1,                                   // Max receive data buffers per op
-        ring->rio_outstanding_per_socket,   // Max outstanding sends
+        RIO_OUTSTANDING_PER_SOCKET,          // Max outstanding sends (1)
         1,                                   // Max send data buffers per op
         ring->rio_cq,                        // Receive completion queue
         ring->rio_cq,                        // Send completion queue
