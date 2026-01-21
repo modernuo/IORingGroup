@@ -150,14 +150,6 @@ public class Program
             }
         }
 
-        // Darwin/macOS: kqueue is synchronous like epoll, fall back to PollGroup
-        if (backend == ServerBackend.IORing &&
-            (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD)))
-        {
-            Console.WriteLine("Darwin/BSD detected, falling back to PollGroup (kqueue)...");
-            backend = ServerBackend.PollGroup;
-        }
-
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
         Console.WriteLine($"Backend: {backend}");
