@@ -71,8 +71,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         _arch = arch;
 
-        // Initialize external buffer tracking (maxConnections * 3 to support recv + send + pipe per connection)
-        _maxExternalBuffers = maxConnections * 3;
+        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
+        _maxExternalBuffers = maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
@@ -531,7 +531,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // =============================================================================
 
     // External buffer tracking (similar to Windows RIO)
-    // Size = maxConnections * 3 to support recv + send + pipe per connection
+    // Size = maxConnections * 2 for recv + send buffer per connection
     private readonly int _maxExternalBuffers;
     private readonly nint[] _externalBufferPtrs;
     private readonly int[] _externalBufferLengths;

@@ -72,8 +72,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         _changeList = new kevent[queueSize];
         _resultEvents = new kevent[queueSize];
 
-        // Initialize external buffer tracking (maxConnections * 3 to support recv + send + pipe per connection)
-        _maxExternalBuffers = maxConnections * 3;
+        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
+        _maxExternalBuffers = maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 

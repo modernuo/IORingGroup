@@ -145,8 +145,8 @@ struct ioring {
     uint32_t pending_count;
     uint32_t pending_capacity;
 
-    // External buffer support (for zero-copy from user-owned memory like Pipe)
-    // Dynamically allocated based on max_connections * 3 (recv + send + pipe per connection)
+    // External buffer support (for zero-copy from user-owned memory)
+    // Dynamically allocated based on max_connections * 2 (recv + send buffer per connection)
     uint32_t max_external_buffers;           // Max external buffers (derived from max_connections)
     RIO_BUFFERID* external_buffer_ids;       // Registered buffer IDs (dynamically allocated)
     void** external_buffer_ptrs;             // Pointers for tracking (dynamically allocated)
@@ -469,7 +469,7 @@ static int rio_execute_op(ioring_t* ring, ioring_sqe_t* sqe) {
         }
 
         // External buffer - use buffer_id from sqe
-        int ext_buf_id = (int)sqe->buf_index;
+        int ext_buf_id = sqe->buf_index;
         if (ext_buf_id < 0 || (uint32_t)ext_buf_id >= ring->max_external_buffers ||
             ring->external_buffer_ids[ext_buf_id] == RIO_INVALID_BUFFERID) {
             complete_op(ring, sqe->user_data, -EINVAL, 0);
@@ -623,7 +623,7 @@ static void dequeue_rio_completions(ioring_t* ring) {
     }
 
     for (ULONG i = 0; i < count; i++) {
-        uint64_t user_data = (uint64_t)results[i].RequestContext;
+        uint64_t user_data = results[i].RequestContext;
         int32_t res = (results[i].Status == 0) ? (int32_t)results[i].BytesTransferred : -(int32_t)results[i].Status;
         complete_op(ring, user_data, res, 0);
     }
@@ -793,8 +793,8 @@ IORING_API ioring_t* ioring_create_rio_ex(
     }
 
     // Allocate external buffer tracking arrays
-    // Size = max_connections * 3 to support recv + send + pipe per connection
-    ring->max_external_buffers = max_connections * 3;
+    // Size = max_connections * 2 to support recv + send buffer per connection
+    ring->max_external_buffers = max_connections * 2;
     ring->external_buffer_count = 0;
     ring->external_buffer_ids = calloc(ring->max_external_buffers, sizeof(RIO_BUFFERID));
     ring->external_buffer_ptrs = calloc(ring->max_external_buffers, sizeof(void*));
@@ -1235,7 +1235,7 @@ IORING_API SOCKET ioring_rio_create_listener(
     if (ring->owned_listener_count >= ring->owned_listener_capacity) {
         // Grow the array
         uint32_t new_capacity = ring->owned_listener_capacity ? ring->owned_listener_capacity * 2 : 4;
-        SOCKET* new_array = (SOCKET*)realloc(ring->owned_listeners, new_capacity * sizeof(SOCKET));
+        SOCKET* new_array = realloc(ring->owned_listeners, new_capacity * sizeof(SOCKET));
         if (!new_array) {
             last_error = WSAENOBUFS;
             closesocket(listener);

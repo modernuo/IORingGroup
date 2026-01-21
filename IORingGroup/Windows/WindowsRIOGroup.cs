@@ -102,11 +102,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
     private nint GetSqe()
     {
         var sqe = Win_x64.ioring_get_sqe(_ring);
-        if (sqe == 0)
-        {
-            throw new InvalidOperationException("Submission queue is full");
-        }
-        return sqe;
+        return sqe == 0 ? throw new InvalidOperationException("Submission queue is full") : sqe;
     }
 
     // =============================================================================

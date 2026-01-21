@@ -2,6 +2,7 @@
 // Copyright (c) 2025, ModernUO
 
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace System.Network;
 
@@ -32,23 +33,24 @@ public enum RingSocketEventType : byte
 public readonly struct RingSocketEvent
 {
     /// <summary>The type of event.</summary>
-    public RingSocketEventType Type { get; init; }
+    public RingSocketEventType Type { get; private init; }
 
     /// <summary>The socket this event relates to (null for Accept events).</summary>
-    public RingSocket Socket { get; init; }
+    public RingSocket Socket { get; private init; }
 
     /// <summary>Number of bytes transferred (for DataReceived/DataSent).</summary>
-    public int BytesTransferred { get; init; }
+    public int BytesTransferred { get; private init; }
 
     /// <summary>Error code if disconnect was due to error (0 for graceful close).</summary>
-    public int Error { get; init; }
+    public int Error { get; private init; }
 
     /// <summary>The accepted socket handle (for Accept events).</summary>
-    public nint AcceptedSocketHandle { get; init; }
+    public nint AcceptedSocketHandle { get; private init; }
 
     /// <summary>
     /// Creates a data received event.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static RingSocketEvent Received(RingSocket socket, int bytes) => new()
     {
         Type = RingSocketEventType.DataReceived,
@@ -59,6 +61,7 @@ public readonly struct RingSocketEvent
     /// <summary>
     /// Creates a data sent event.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static RingSocketEvent Sent(RingSocket socket, int bytes) => new()
     {
         Type = RingSocketEventType.DataSent,
@@ -69,6 +72,7 @@ public readonly struct RingSocketEvent
     /// <summary>
     /// Creates a disconnected event.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static RingSocketEvent Disconnected(RingSocket socket, int error = 0) => new()
     {
         Type = RingSocketEventType.Disconnected,
