@@ -482,6 +482,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 break;
             }
         }
+
         if (toRemove.HasValue)
         {
             dict.Remove(toRemove.Value);

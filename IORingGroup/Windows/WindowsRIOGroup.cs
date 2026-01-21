@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -47,20 +48,15 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// <summary>
     /// Creates a new RIO ring.
     /// </summary>
-    /// <param name="queueSize">Submission/completion queue size (power of 2)</param>
     /// <param name="maxConnections">Maximum concurrent connections</param>
     /// <remarks>
-    /// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send).
-    /// The completion queue is auto-sized to: maxConnections * 2.
+    /// SQ/CQ auto-sized to maxConnections * 2 (1 recv + 1 send per connection).
     /// </remarks>
-    public WindowsRIOGroup(int queueSize, int maxConnections)
+    public WindowsRIOGroup(int maxConnections)
     {
-        if (!IORingGroup.IsPowerOfTwo(queueSize))
-        {
-            throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
-        }
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
 
-        _ring = Win_x64.ioring_create_rio_ex((uint)queueSize, (uint)maxConnections);
+        _ring = Win_x64.ioring_create_rio_ex((uint)maxConnections);
 
         if (_ring == 0)
         {
@@ -68,8 +64,9 @@ public sealed class WindowsRIOGroup : IIORingGroup
             throw new InvalidOperationException($"Failed to create RIO ring: error {error}");
         }
 
-        // Pre-allocate CQE buffer
-        _cqeBuffer = new Win_x64.IORingCqe[queueSize * 2];
+        // Pre-allocate CQE buffer sized to max completions (1 recv + 1 send per connection)
+        var cqSize = (int)BitOperations.RoundUpToPowerOf2((uint)(maxConnections * 2));
+        _cqeBuffer = new Win_x64.IORingCqe[cqSize];
         _cqeBufferHandle = GCHandle.Alloc(_cqeBuffer, GCHandleType.Pinned);
         _cqeBufferPtr = _cqeBufferHandle.AddrOfPinnedObject();
     }
@@ -135,8 +132,7 @@ public sealed class WindowsRIOGroup : IIORingGroup
     /// </summary>
     /// <param name="listener">The listener socket handle</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void CloseListener(nint listener) =>
-        Win_x64.ioring_rio_close_listener(_ring, listener);
+    public void CloseListener(nint listener) => Win_x64.ioring_rio_close_listener(_ring, listener);
 
     /// <summary>
     /// Configures an accepted socket with optimal settings.

@@ -141,14 +141,9 @@ IORING_API int ioring_get_last_error(void);
  */
 
 // Create ring with RIO support
-// - entries: SQ/CQ size (power of 2 recommended)
 // - max_connections: max concurrent registered sockets
-// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send)
-// CQ is auto-sized to max_connections * 2
-IORING_API ioring_t* ioring_create_rio_ex(
-    uint32_t entries,
-    uint32_t max_connections
-);
+// SQ/CQ auto-sized to max_connections * 2 (1 recv + 1 send per connection)
+IORING_API ioring_t* ioring_create_rio_ex(uint32_t max_connections);
 
 // Register a connected socket for RIO operations
 // - socket: the connected socket (not the listener!)

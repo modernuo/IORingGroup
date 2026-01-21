@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace System.Network;
@@ -24,14 +25,14 @@ public static class IORingGroup
     /// Creates an IIORingGroup instance appropriate for the current platform.
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
-    /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 3).</param>
+    /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 2).</param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
     public static IIORingGroup Create(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return CreateWindowsRing(queueSize, maxConnections);
+            return CreateWindowsRing(maxConnections);
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
@@ -49,43 +50,21 @@ public static class IORingGroup
             $"IORingGroup is not supported on platform: {RuntimeInformation.OSDescription}");
     }
 
-    private static IIORingGroup CreateWindowsRing(int queueSize, int maxConnections)
-    {
-        // Windows uses RIO (Registered I/O) for high-performance socket I/O with zero-copy buffers.
-        return new Windows.WindowsRIOGroup(queueSize, maxConnections);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Windows.WindowsRIOGroup CreateWindowsRing(int maxConnections) => new(maxConnections);
 
-    private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
+    private static IORing.LinuxIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
     {
-        // Try io_uring first, fall back to epoll if unavailable
-        IORing.ILinuxArch ioUringArch = RuntimeInformation.ProcessArchitecture switch
+        if (IORing.LinuxIORingGroup.IsAvailable())
         {
-            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6
-                => IORing.Architectures.Linux_arm64.Instance,
-            _ => IORing.Architectures.Linux_x64.Instance,
-        };
-
-        if (IORing.LinuxIORingGroup.IsAvailable(ioUringArch))
-        {
-            return new IORing.LinuxIORingGroup(ioUringArch, queueSize, maxConnections);
+            return new IORing.LinuxIORingGroup(queueSize, maxConnections);
         }
 
         throw new InvalidOperationException("io_uring is not available (blocked by seccomp or kernel too old)");
     }
 
-    private static IIORingGroup CreateDarwinRing(int queueSize, int maxConnections)
-    {
-        return new Darwin.DarwinIORingGroup(queueSize, maxConnections);
-    }
-
-    /// <summary>
-    /// Checks if IIORingGroup is supported on the current platform.
-    /// </summary>
-    public static bool IsSupported =>
-        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ||
-        RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
-        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
-        RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD);
+    private static Darwin.DarwinIORingGroup CreateDarwinRing(int queueSize, int maxConnections) =>
+        new Darwin.DarwinIORingGroup(queueSize, maxConnections);
 
     /// <summary>
     /// Returns true if this is a power of 2 (used to validate queue size).

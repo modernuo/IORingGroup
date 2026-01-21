@@ -188,10 +188,7 @@ public class Program
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // On Windows, use WindowsRIOGroup for full RIO support
-                ring = new WindowsRIOGroup(
-                    queueSize: MaxClients,
-                    maxConnections: MaxClients
-                );
+                ring = new WindowsRIOGroup(maxConnections: MaxClients);
                 Console.WriteLine($"Windows RIO ring created: MaxConnections={MaxClients}");
             }
             else

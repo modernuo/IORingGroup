@@ -85,17 +85,15 @@ public static partial class Win_x64
     // =============================================================================
 
     /// <summary>
-    /// Create a ring with RIO support and configurable outstanding operations.
+    /// Create a ring with RIO support.
     /// </summary>
-    /// <param name="entries">SQ/CQ size (power of 2 recommended)</param>
     /// <param name="maxConnections">Maximum concurrent registered sockets</param>
     /// <returns>Ring handle, or IntPtr.Zero on failure</returns>
     /// <remarks>
-    /// Outstanding ops per socket is hardcoded to 1 per direction (1 recv + 1 send).
-    /// CQ is auto-sized to maxConnections * 2.
+    /// SQ/CQ auto-sized to maxConnections * 2 (1 recv + 1 send per connection).
     /// </remarks>
     [LibraryImport(LibraryName, SetLastError = true)]
-    public static partial nint ioring_create_rio_ex(uint entries, uint maxConnections);
+    public static partial nint ioring_create_rio_ex(uint maxConnections);
 
     /// <summary>
     /// Register a connected socket for RIO operations.

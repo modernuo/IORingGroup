@@ -721,10 +721,7 @@ IORING_API int ioring_get_last_error(void) {
 // Version string for build verification
 #define IORING_VERSION "2026-01-20-v1"
 
-IORING_API ioring_t* ioring_create_rio_ex(
-    uint32_t entries,
-    uint32_t max_connections
-) {
+IORING_API ioring_t* ioring_create_rio_ex(uint32_t max_connections) {
     fflush(stdout);
 
     if (!init_rio()) {
@@ -740,10 +737,10 @@ IORING_API ioring_t* ioring_create_rio_ex(
         return NULL;
     }
 
-    if (entries == 0) entries = 4096;
-    entries = next_power_of_two(entries);
-
     if (max_connections == 0) max_connections = 1024;
+
+    // SQ/CQ sized to max in-flight operations: 1 recv + 1 send per connection
+    uint32_t queue_size = next_power_of_two(max_connections * 2);
 
     ioring_t* ring = calloc(1, sizeof(ioring_t));
     if (!ring) {
@@ -751,23 +748,18 @@ IORING_API ioring_t* ioring_create_rio_ex(
         return NULL;
     }
 
-    ring->sq_entries = entries;
-    // User-space CQ must be large enough to hold all RIO completions
-    // RIO CQ size = max_connections * 2 (1 recv + 1 send per connection)
-    uint32_t min_cq_size = max_connections * 2;
-    ring->cq_entries = entries * 2 > min_cq_size ? entries * 2 : min_cq_size;
-    // Round up to power of 2 for efficient masking
-    ring->cq_entries = next_power_of_two(ring->cq_entries);
-    ring->sq_mask = entries - 1;
-    ring->cq_mask = ring->cq_entries - 1;
+    ring->sq_entries = queue_size;
+    ring->cq_entries = queue_size;
+    ring->sq_mask = queue_size - 1;
+    ring->cq_mask = queue_size - 1;
     ring->rio_max_connections = max_connections;
     ring->rio_cq = RIO_INVALID_CQ;
 
     // Allocate user-space queues
-    ring->sq = (ioring_sqe_t*)calloc(entries, sizeof(ioring_sqe_t));
-    ring->cq = (ioring_cqe_t*)calloc(ring->cq_entries, sizeof(ioring_cqe_t));
-    ring->pending_ops = calloc(entries, sizeof(struct pending_op));
-    ring->pending_capacity = entries;
+    ring->sq = (ioring_sqe_t*)calloc(queue_size, sizeof(ioring_sqe_t));
+    ring->cq = (ioring_cqe_t*)calloc(queue_size, sizeof(ioring_cqe_t));
+    ring->pending_ops = calloc(queue_size, sizeof(struct pending_op));
+    ring->pending_capacity = queue_size;
 
     if (!ring->sq || !ring->cq || !ring->pending_ops) {
         goto fail;

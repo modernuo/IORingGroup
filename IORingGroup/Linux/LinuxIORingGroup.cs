@@ -2,6 +2,7 @@
 // Copyright (c) 2025, ModernUO
 
 using System.Buffers.Binary;
+using System.Network.Linux;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -15,13 +16,12 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <summary>
     /// Tests if io_uring is available and functional on this system.
     /// </summary>
-    /// <param name="arch">Architecture-specific syscall implementation.</param>
     /// <returns>True if io_uring is available, false if blocked or unsupported.</returns>
-    public static bool IsAvailable(ILinuxArch arch)
+    public static bool IsAvailable()
     {
         // Try to create a minimal io_uring (smallest valid queue size)
         var p = new io_uring_params();
-        var fd = arch.io_uring_setup(8, ref p);
+        var fd = LinuxIORing.io_uring_setup(8, ref p);
 
         if (fd < 0)
         {
@@ -32,11 +32,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         // Success - clean up the test ring
-        arch.close(fd);
+        LinuxIORing.close(fd);
         return true;
     }
 
-    private readonly ILinuxArch _arch;
     private readonly int _ringFd;
     private readonly uint _sqEntries;
     private readonly uint _sqMask;
@@ -62,14 +61,12 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     private bool _disposed;
 
-    public LinuxIORingGroup(ILinuxArch arch, int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
+    public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
-
-        _arch = arch;
 
         // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
         _maxExternalBuffers = maxConnections * 2;
@@ -77,7 +74,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         _externalBufferLengths = new int[_maxExternalBuffers];
 
         var p = new io_uring_params();
-        _ringFd = arch.io_uring_setup((uint)queueSize, ref p);
+        _ringFd = LinuxIORing.io_uring_setup((uint)queueSize, ref p);
 
         if (_ringFd < 0)
         {
@@ -90,55 +87,55 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         // Map submission queue ring
         _sqRingSize = p.sq_off.array + p.sq_entries * sizeof(uint);
-        _sqRingPtr = arch.mmap(
+        _sqRingPtr = LinuxIORing.mmap(
             0,
             _sqRingSize,
-            arch.PROT_READ | arch.PROT_WRITE,
-            arch.MAP_SHARED | arch.MAP_POPULATE,
+            LinuxIORing.PROT_READ | LinuxIORing.PROT_WRITE,
+            LinuxIORing.MAP_SHARED | LinuxIORing.MAP_POPULATE,
             _ringFd,
-            (long)arch.IORING_OFF_SQ_RING
+            (long)LinuxIORing.IORING_OFF_SQ_RING
         );
 
         if (_sqRingPtr == -1)
         {
-            arch.close(_ringFd);
+            LinuxIORing.close(_ringFd);
             throw new InvalidOperationException("Failed to mmap SQ ring");
         }
 
         // Map completion queue ring
         _cqRingSize = p.cq_off.cqes + p.cq_entries * (uint)sizeof(io_uring_cqe);
-        _cqRingPtr = arch.mmap(
+        _cqRingPtr = LinuxIORing.mmap(
             0,
             _cqRingSize,
-            arch.PROT_READ | arch.PROT_WRITE,
-            arch.MAP_SHARED | arch.MAP_POPULATE,
+            LinuxIORing.PROT_READ | LinuxIORing.PROT_WRITE,
+            LinuxIORing.MAP_SHARED | LinuxIORing.MAP_POPULATE,
             _ringFd,
-            (long)arch.IORING_OFF_CQ_RING
+            (long)LinuxIORing.IORING_OFF_CQ_RING
         );
 
         if (_cqRingPtr == -1)
         {
-            arch.munmap(_sqRingPtr, _sqRingSize);
-            arch.close(_ringFd);
+            LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+            LinuxIORing.close(_ringFd);
             throw new InvalidOperationException("Failed to mmap CQ ring");
         }
 
         // Map SQEs array
         _sqesSize = (nuint)(p.sq_entries * sizeof(io_uring_sqe));
-        _sqesPtr = arch.mmap(
+        _sqesPtr = LinuxIORing.mmap(
             0,
             _sqesSize,
-            arch.PROT_READ | arch.PROT_WRITE,
-            arch.MAP_SHARED | arch.MAP_POPULATE,
+            LinuxIORing.PROT_READ | LinuxIORing.PROT_WRITE,
+            LinuxIORing.MAP_SHARED | LinuxIORing.MAP_POPULATE,
             _ringFd,
-            (long)arch.IORING_OFF_SQES
+            (long)LinuxIORing.IORING_OFF_SQES
         );
 
         if (_sqesPtr == -1)
         {
-            arch.munmap(_cqRingPtr, _cqRingSize);
-            arch.munmap(_sqRingPtr, _sqRingSize);
-            arch.close(_ringFd);
+            LinuxIORing.munmap(_cqRingPtr, _cqRingSize);
+            LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+            LinuxIORing.close(_ringFd);
             throw new InvalidOperationException("Failed to mmap SQEs");
         }
 
@@ -371,7 +368,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Release store: ensures all SQE writes are visible before kernel sees new tail
         Volatile.Write(ref *_sqTail, tail);
 
-        return _arch.io_uring_enter(_ringFd, toSubmit, 0, 0);
+        return LinuxIORing.io_uring_enter(_ringFd, toSubmit, 0, 0);
     }
 
     /// <inheritdoc/>
@@ -385,7 +382,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Release store: ensures all SQE writes are visible before kernel sees new tail
         Volatile.Write(ref *_sqTail, tail);
 
-        var ret = _arch.io_uring_enter(_ringFd, toSubmit, (uint)waitNr, (uint)IORING_ENTER.GETEVENTS);
+        var ret = LinuxIORing.io_uring_enter(_ringFd, toSubmit, (uint)waitNr, (uint)IORING_ENTER.GETEVENTS);
         return ret;
     }
 
@@ -421,10 +418,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
         // Create non-blocking TCP socket
-        var fd = _arch.socket(
-            _arch.AF_INET,
-            _arch.SOCK_STREAM | _arch.SOCK_NONBLOCK,
-            _arch.IPPROTO_TCP
+        var fd = LinuxIORing.socket(
+            LinuxIORing.AF_INET,
+            LinuxIORing.SOCK_STREAM | LinuxIORing.SOCK_NONBLOCK,
+            LinuxIORing.IPPROTO_TCP
         );
 
         if (fd < 0)
@@ -434,33 +431,33 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         // Disable SO_REUSEADDR (exclusive address use)
         var optval = 0;
-        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_REUSEADDR, (nint)(&optval), sizeof(int));
+        LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_REUSEADDR, (nint)(&optval), sizeof(int));
 
         // Disable TCP_NODELAY (Nagle off)
         optval = 1;
-        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
+        LinuxIORing.setsockopt(fd, LinuxIORing.IPPROTO_TCP, LinuxIORing.TCP_NODELAY, (nint)(&optval), sizeof(int));
 
         // Disable SO_LINGER
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
-        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+        LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
 
         // Parse and bind address
         var addr = new sockaddr_in
         {
-            sin_family = (ushort)_arch.AF_INET,
+            sin_family = LinuxIORing.AF_INET,
             sin_port = BinaryPrimitives.ReverseEndianness(port),
             sin_addr = ParseIPv4(bindAddress)
         };
 
-        if (_arch.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
+        if (LinuxIORing.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
         {
-            _arch.close(fd);
+            LinuxIORing.close(fd);
             return -1;
         }
 
-        if (_arch.listen(fd, backlog) < 0)
+        if (LinuxIORing.listen(fd, backlog) < 0)
         {
-            _arch.close(fd);
+            LinuxIORing.close(fd);
             return -1;
         }
 
@@ -472,7 +469,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     {
         if (listener >= 0)
         {
-            _arch.close((int)listener);
+            LinuxIORing.close((int)listener);
         }
     }
 
@@ -482,19 +479,19 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         var fd = (int)socket;
 
         // Set non-blocking
-        var flags = _arch.fcntl(fd, _arch.F_GETFL, 0);
+        var flags = LinuxIORing.fcntl(fd, LinuxIORing.F_GETFL, 0);
         if (flags >= 0)
         {
-            _arch.fcntl(fd, _arch.F_SETFL, flags | _arch.O_NONBLOCK);
+            LinuxIORing.fcntl(fd, LinuxIORing.F_SETFL, flags | LinuxIORing.O_NONBLOCK);
         }
 
         // TCP_NODELAY (disable Nagle)
         var optval = 1;
-        _arch.setsockopt(fd, _arch.IPPROTO_TCP, _arch.TCP_NODELAY, (nint)(&optval), sizeof(int));
+        LinuxIORing.setsockopt(fd, LinuxIORing.IPPROTO_TCP, LinuxIORing.TCP_NODELAY, (nint)(&optval), sizeof(int));
 
         // Disable SO_LINGER
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
-        _arch.setsockopt(fd, _arch.SOL_SOCKET, _arch.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+        LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
     }
 
     /// <inheritdoc/>
@@ -513,7 +510,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     {
         if (socket >= 0)
         {
-            _arch.close((int)socket);
+            LinuxIORing.close((int)socket);
         }
     }
 
@@ -522,7 +519,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     {
         if (socket >= 0)
         {
-            _arch.shutdown((int)socket, how);
+            LinuxIORing.shutdown((int)socket, how);
         }
     }
 
@@ -573,10 +570,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void UnregisterBuffer(int bufferId)
     {
-        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bufferId));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferId);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(bufferId, _maxExternalBuffers);
 
         if (_externalBufferPtrs[bufferId] != 0)
         {
@@ -594,10 +589,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData)
     {
-        if (bufferId < 0 || bufferId >= _maxExternalBuffers)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bufferId));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferId);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(bufferId, _maxExternalBuffers);
 
         var bufPtr = _externalBufferPtrs[bufferId];
         if (bufPtr == 0)
@@ -693,22 +686,22 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         if (_sqesPtr != 0 && _sqesPtr != -1)
         {
-            _arch.munmap(_sqesPtr, _sqesSize);
+            LinuxIORing.munmap(_sqesPtr, _sqesSize);
         }
 
         if (_cqRingPtr != 0 && _cqRingPtr != -1)
         {
-            _arch.munmap(_cqRingPtr, _cqRingSize);
+            LinuxIORing.munmap(_cqRingPtr, _cqRingSize);
         }
 
         if (_sqRingPtr != 0 && _sqRingPtr != -1)
         {
-            _arch.munmap(_sqRingPtr, _sqRingSize);
+            LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
         }
 
         if (_ringFd >= 0)
         {
-            _arch.close(_ringFd);
+            LinuxIORing.close(_ringFd);
         }
     }
 }

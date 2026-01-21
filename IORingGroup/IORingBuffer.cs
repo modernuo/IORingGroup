@@ -3,7 +3,6 @@
 
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 namespace System.Network;
 
@@ -105,10 +104,7 @@ public sealed partial class IORingBuffer : IDisposable
     /// </summary>
     /// <param name="physicalSize">Physical size in bytes (must be power of 2 and page-aligned).</param>
     /// <returns>A new IORingBuffer instance.</returns>
-    public static IORingBuffer Create(int physicalSize)
-    {
-        return Create(physicalSize, isPooled: false, poolIndex: -1);
-    }
+    public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
 
     /// <summary>
     /// Creates a new double-mapped circular buffer with pool tracking.
@@ -168,10 +164,7 @@ public sealed partial class IORingBuffer : IDisposable
     /// </summary>
     /// <returns>A span representing the writable region.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public unsafe Span<byte> GetWriteSpan()
-    {
-        return new Span<byte>((byte*)_buffer + _tail, WritableBytes);
-    }
+    public unsafe Span<byte> GetWriteSpan() => new((byte*)_buffer + _tail, WritableBytes);
 
     /// <summary>
     /// Advances the write position after writing data.
@@ -180,10 +173,8 @@ public sealed partial class IORingBuffer : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void CommitWrite(int count)
     {
-        if (count < 0 || count > WritableBytes)
-        {
-            ThrowHelper.ThrowArgumentOutOfRange(nameof(count));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, WritableBytes);
 
         _tail = (_tail + count) % _physicalSize;
     }
@@ -207,10 +198,8 @@ public sealed partial class IORingBuffer : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void CommitRead(int count)
     {
-        if (count < 0 || count > ReadableBytes)
-        {
-            ThrowHelper.ThrowArgumentOutOfRange(nameof(count));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, ReadableBytes);
 
         _head = (_head + count) % _physicalSize;
 
@@ -650,9 +639,4 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     #endregion
-}
-
-internal static class ThrowHelper
-{
-    public static void ThrowArgumentOutOfRange(string paramName) => throw new ArgumentOutOfRangeException(paramName);
 }
