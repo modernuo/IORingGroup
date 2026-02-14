@@ -569,7 +569,7 @@ public sealed class RingSocketManager : IDisposable
 
         socket.RecvBuffer.CommitWrite(result);
 
-        if (!socket.DisconnectPending && socket.RecvBuffer.WritableBytes > 0)
+        if (socket is { DisconnectPending: false, RecvBuffer.WritableBytes: > 0 })
         {
             PostRecv(socket);
         }
@@ -579,13 +579,27 @@ public sealed class RingSocketManager : IDisposable
             QueueForDisconnect(socket);
         }
 
-        if (eventIndex < events.Length)
+        if (eventIndex >= events.Length)
         {
-            events[eventIndex] = RingSocketEvent.Received(socket, result);
-            return 1;
+            return 0;
         }
 
-        return 0;
+        events[eventIndex] = RingSocketEvent.Received(socket, result);
+        return 1;
+    }
+
+    /// <summary>
+    /// When disconnect is pending and sends have drained but recv is still in flight,
+    /// close the write side (send FIN) so the pending recv can complete.
+    /// This bridges the gap between Path A and Path B in RingSocket.Disconnect().
+    /// </summary>
+    private void TrySendFinForPendingDisconnect(RingSocket socket)
+    {
+        if (socket is { DisconnectPending: true, SendPending: false,
+                SendBuffer.ReadableBytes: <= 0, RecvPending: true, HandleClosed: false })
+        {
+            CloseSocketHandle(socket);
+        }
     }
 
     private int HandleSendCompletion(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
@@ -603,13 +617,17 @@ public sealed class RingSocketManager : IDisposable
             {
                 QueueForDisconnect(socket);
             }
+            else
+            {
+                TrySendFinForPendingDisconnect(socket);
+            }
             return 0;
         }
 
         socket.SendBuffer.CommitRead(result);
 
         // Continue sending if more data (even if DisconnectPending - drain the buffer)
-        if (socket.Connected && socket.SendBuffer.ReadableBytes > 0)
+        if (socket is { Connected: true, SendBuffer.ReadableBytes: > 0 })
         {
             PostSend(socket);
         }
@@ -617,6 +635,10 @@ public sealed class RingSocketManager : IDisposable
         if (socket.CheckDisconnect())
         {
             QueueForDisconnect(socket);
+        }
+        else
+        {
+            TrySendFinForPendingDisconnect(socket);
         }
 
         if (eventIndex < events.Length)
@@ -634,7 +656,7 @@ public sealed class RingSocketManager : IDisposable
         {
             // Always unregister from RIO if registered (ConnectionId >= 0) and not already unregistered
             // This is critical for DisconnectImmediate() which sets Connected=false before queueing
-            if (socket.ConnectionId >= 0 && !socket.RioUnregistered)
+            if (socket is { ConnectionId: >= 0, RioUnregistered: false })
             {
                 _ring.UnregisterSocket(socket.ConnectionId);
                 socket.RioUnregistered = true;
