@@ -8,8 +8,8 @@
         <WarningLevel>5</WarningLevel>
         <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
         <LangVersion>Preview</LangVersion>
-        <AssemblyVersion>1.0.3</AssemblyVersion>
-        <PackageVersion>1.0.3</PackageVersion>
+        <AssemblyVersion>1.0.4</AssemblyVersion>
+        <PackageVersion>1.0.4</PackageVersion>
         <RootNamespace>System.Network</RootNamespace>
         <AssemblyName>IORingGroup</AssemblyName>
         <IsPackable>true</IsPackable>
