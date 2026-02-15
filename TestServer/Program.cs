@@ -28,7 +28,7 @@ public class Program
 
     private static volatile bool _running = true;
     private static bool _quietMode;
-private static int _benchmarkDuration; // 0 = run until clients disconnect
+    private static int _benchmarkDuration; // 0 = run until clients disconnect
 
     // User data encoding for operations
     // Layout: [4 bits op][1 bit buffer][59 bits client index]
