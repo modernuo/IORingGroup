@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>  // For _mm_pause()
-#include <stdio.h>
 
 /*
  * Windows IORing Implementation with RIO (Registered I/O)
@@ -722,8 +721,6 @@ IORING_API int ioring_get_last_error(void) {
 #define IORING_VERSION "2026-01-20-v1"
 
 IORING_API ioring_t* ioring_create_rio_ex(uint32_t max_connections) {
-    fflush(stdout);
-
     if (!init_rio()) {
         last_error = ERROR_NOT_SUPPORTED;
         return NULL;
@@ -1072,19 +1069,6 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 // Check for completed AcceptEx operations and add to completion queue
 static void check_acceptex_completions(ioring_t* ring) {
     if (!ring->accept_pool) return;
-
-    static int check_count = 0;
-    check_count++;
-
-    int pending_count = 0;
-    for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
-        if (ring->accept_pool[i].pending) pending_count++;
-    }
-
-    // Verbose logging disabled to reduce spam
-    // Uncomment for debugging AcceptEx issues:
-    // BOOL verbose = (check_count % 100000 == 0);
-    (void)pending_count;  // Suppress unused warning
 
     // Iterate through all pending accept contexts and check for completion via events
     for (uint32_t i = 0; i < ring->accept_pool_size; i++) {

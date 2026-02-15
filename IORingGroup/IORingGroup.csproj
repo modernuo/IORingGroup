@@ -8,8 +8,8 @@
         <WarningLevel>5</WarningLevel>
         <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
         <LangVersion>Preview</LangVersion>
-        <AssemblyVersion>1.0.1</AssemblyVersion>
-        <PackageVersion>1.0.1</PackageVersion>
+        <AssemblyVersion>1.0.2</AssemblyVersion>
+        <PackageVersion>1.0.2</PackageVersion>
         <RootNamespace>System.Network</RootNamespace>
         <AssemblyName>IORingGroup</AssemblyName>
         <IsPackable>true</IsPackable>
@@ -21,7 +21,7 @@
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>
         <Description>io_uring/IoRing/RIO bindings for .NET 10+ - high-performance async socket I/O</Description>
-        <Copyright>Copyright (c) 2025, ModernUO</Copyright>
+        <Copyright>Copyright (c) 2026, ModernUO</Copyright>
         <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
         <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
         <PackageProjectUrl>https://github.com/modernuo/IORingGroup</PackageProjectUrl>
