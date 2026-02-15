@@ -50,8 +50,15 @@ public static class IORingGroup
             $"IORingGroup is not supported on platform: {RuntimeInformation.OSDescription}");
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Windows.WindowsRIOGroup CreateWindowsRing(int maxConnections) => new(maxConnections);
+    private static IIORingGroup CreateWindowsRing(int maxConnections)
+    {
+        if (Environment.GetEnvironmentVariable("IORING_MANAGED_RIO") is "1" or "true")
+        {
+            return new Windows.WindowsManagedRIOGroup(maxConnections);
+        }
+
+        return new Windows.WindowsRIOGroup(maxConnections);
+    }
 
     private static IORing.LinuxIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
     {

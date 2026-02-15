@@ -29,6 +29,7 @@ public class Program
 
     private static volatile bool _running = true;
     private static bool _quietMode;
+    private static bool _useManagedRio;
     private static int _benchmarkDuration; // 0 = run until clients disconnect
 
     // User data encoding for operations
@@ -102,6 +103,11 @@ public class Program
             {
                 backend = ServerBackend.IORing;
             }
+            else if (arg.Equals("--mrio", StringComparison.OrdinalIgnoreCase))
+            {
+                backend = ServerBackend.IORing;
+                _useManagedRio = true;
+            }
             else if (arg.Equals("--benchmark", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-b", StringComparison.OrdinalIgnoreCase))
             {
@@ -152,11 +158,12 @@ public class Program
 
         Console.WriteLine("IORingGroup Unified Benchmark Server (Single-threaded)");
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
-        Console.WriteLine($"Backend: {backend}");
+        Console.WriteLine($"Backend: {backend}{(_useManagedRio ? " (managed RIO)" : "")}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
         Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--ioring|--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--affinity|-a <mask>]");
+        Console.WriteLine("Usage: TestServer [--ioring|--rio|-r] [--mrio] [--pollgroup|-p] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--affinity|-a <mask>]");
         Console.WriteLine("  --ioring|--rio|-r: Windows RIO / Linux io_uring / Darwin kqueue (zero-copy echo)");
+        Console.WriteLine("  --mrio: Pure C# managed RIO (Windows only, for A/B benchmarking)");
         Console.WriteLine("  --pollgroup|-p: Cross-platform poll-based (wepoll/epoll/kqueue)");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
@@ -187,9 +194,16 @@ public class Program
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                // On Windows, use WindowsRIOGroup for full RIO support
-                ring = new WindowsRIOGroup(maxConnections: MaxClients);
-                Console.WriteLine($"Windows RIO ring created: MaxConnections={MaxClients}");
+                if (_useManagedRio)
+                {
+                    ring = new WindowsManagedRIOGroup(maxConnections: MaxClients);
+                    Console.WriteLine($"Windows Managed RIO ring created (pure C#): MaxConnections={MaxClients}");
+                }
+                else
+                {
+                    ring = new WindowsRIOGroup(maxConnections: MaxClients);
+                    Console.WriteLine($"Windows RIO ring created: MaxConnections={MaxClients}");
+                }
             }
             else
             {
