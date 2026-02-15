@@ -105,6 +105,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // AcceptEx pool
     private readonly AcceptExContext* _acceptPool;
     private readonly uint _acceptPoolSize;
+    private uint _pendingAcceptCount;
+    private uint _acceptCheckCounter;
 
     // Pending operations (for poll, legacy accept)
     private readonly PendingOp* _pendingOps;
@@ -156,7 +158,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         _maxExternalBuffers = mc * 2;
         _externalBufferIds = (nint*)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(nint));
         _externalBufferPtrs = (byte**)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(byte*));
-        _externalBufferLens = (uint*)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(uint));
+        _externalBufferLens = (uint*)NativeMemory.AllocZeroed(_maxExternalBuffers, sizeof(uint));
 
         // Step 4: Initialize connections
         for (uint i = 0; i < mc; i++)
@@ -586,8 +588,12 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private void DequeueRioCompletions()
     {
-        // Check AcceptEx completions first
-        CheckAcceptExCompletions();
+        // Throttle AcceptEx scan: WaitForSingleObject per pending slot is expensive.
+        // Check every 32 calls (~3ms at typical call rates) unless no accepts are pending.
+        if (_pendingAcceptCount > 0 && (_acceptCheckCounter++ & 31) == 0)
+        {
+            CheckAcceptExCompletions();
+        }
 
         if (_rioCq == RIO_INVALID_CQ)
         {
@@ -737,7 +743,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             RIO_OUTSTANDING_PER_SOCKET, 1,  // maxRecv, maxRecvBuf
             RIO_OUTSTANDING_PER_SOCKET, 1,  // maxSend, maxSendBuf
             _rioCq, _rioCq,                 // recvCq, sendCq
-            (void*)(nint)slot               // context
+            (void*)slot               // context
         );
 
         if (conn->RequestQueue == RIO_INVALID_RQ)
@@ -903,7 +909,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         // Cache AcceptEx function pointer
         if (_fnAcceptEx == null)
         {
-            _fnAcceptEx = RIOInterop.LoadAcceptEx(listener);
+            _fnAcceptEx = LoadAcceptEx(listener);
         }
 
         return listener;
@@ -937,6 +943,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 }
 
                 ctx->Pending = false;
+                _pendingAcceptCount--;
                 ctx->ConnSlot = -1;
             }
         }
@@ -1009,7 +1016,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         // Load AcceptEx if not already done
         if (_fnAcceptEx == null)
         {
-            _fnAcceptEx = RIOInterop.LoadAcceptEx(listenSocket);
+            _fnAcceptEx = LoadAcceptEx(listenSocket);
             if (_fnAcceptEx == null)
             {
                 return false;
@@ -1067,6 +1074,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         ctx->ListenSocket = listenSocket;
         ctx->UserData = userData;
         ctx->Pending = true;
+        _pendingAcceptCount++;
 
         // Initialize overlapped with event
         Unsafe.InitBlock(&ctx->Overlapped, 0, (uint)sizeof(OVERLAPPED));
@@ -1080,8 +1088,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             ctx->AcceptSocket,
             ctx->Buffer,
             0, // Don't receive data with accept
-            (uint)AcceptExAddrSize,
-            (uint)AcceptExAddrSize,
+            AcceptExAddrSize,
+            AcceptExAddrSize,
             &bytesReceived,
             &ctx->Overlapped
         );
@@ -1096,6 +1104,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 closesocket(ctx->AcceptSocket);
                 ctx->AcceptSocket = INVALID_SOCKET;
                 ctx->Pending = false;
+                _pendingAcceptCount--;
                 ctx->ConnSlot = -1;
                 return false;
             }
@@ -1106,6 +1115,12 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private void CheckAcceptExCompletions()
     {
+        if (_pendingAcceptCount == 0)
+        {
+            return;
+        }
+
+        uint found = 0;
         for (uint i = 0; i < _acceptPoolSize; i++)
         {
             var ctx = &_acceptPool[i];
@@ -1117,10 +1132,17 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             // Check if event is signaled (non-blocking)
             if (WaitForSingleObject(ctx->Event, 0) != WAIT_OBJECT_0)
             {
+                // Early exit: if we've checked all pending slots, stop scanning
+                if (++found >= _pendingAcceptCount)
+                {
+                    return;
+                }
+
                 continue;
             }
 
             ctx->Pending = false;
+            _pendingAcceptCount--;
 
             // Get result
             uint bytesTransferred = 0;
@@ -1145,7 +1167,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
                 // Reset context for reuse
                 ctx->AcceptSocket = INVALID_SOCKET;
-                ctx->ConnSlot = -1;
             }
             else
             {
@@ -1164,9 +1185,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 {
                     _connections[connSlot].Reserved = false;
                 }
-
-                ctx->ConnSlot = -1;
             }
+
+            ctx->ConnSlot = -1;
         }
     }
 

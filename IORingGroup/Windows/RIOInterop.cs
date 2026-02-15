@@ -37,7 +37,7 @@ internal static unsafe class RIOInterop
 
     public const nint RIO_INVALID_CQ = 0;
     public const nint RIO_INVALID_RQ = 0;
-    public static readonly nint RIO_INVALID_BUFFERID = unchecked((nint)(long)0xFFFFFFFF);
+    public static readonly nint RIO_INVALID_BUFFERID = unchecked((nint)0xFFFFFFFF);
     public const uint RIO_CORRUPT_CQ = 0xFFFFFFFF;
 
     public const int WSAEWOULDBLOCK = 10035;
