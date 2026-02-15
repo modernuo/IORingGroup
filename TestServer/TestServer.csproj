@@ -19,11 +19,4 @@
     <PackageReference Include="PollGroup" Version="1.7.1" />
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('..\IORingGroup\runtimes\win-x64\native\ioring.dll')">
-    <Content Include="..\IORingGroup\runtimes\win-x64\native\ioring.dll">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>ioring.dll</Link>
-    </Content>
-  </ItemGroup>
-
 </Project>

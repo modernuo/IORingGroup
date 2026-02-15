@@ -37,14 +37,6 @@
         <InternalsVisibleTo Include="IORingGroup.Tests" />
     </ItemGroup>
 
-    <ItemGroup>
-        <Content Include="runtimes\win-x64\native\ioring.dll">
-            <Pack>true</Pack>
-            <PackagePath>runtimes/win-x64/native</PackagePath>
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
-    </ItemGroup>
-
     <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
         <DefineConstants>TRACE;DEBUG</DefineConstants>
         <Optimize>false</Optimize>
