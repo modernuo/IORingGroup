@@ -93,8 +93,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // RIO state
     private readonly nint _rioCq;
     private readonly uint _rioMaxConnections;
-    private uint _rioActiveConnections;
-    private readonly uint _rioCqSize;
     private readonly RioConnection* _connections;
 
     // Owned listeners
@@ -184,8 +182,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         {
             rioCqSize = 2_000_000;
         }
-        _rioCqSize = rioCqSize;
-
         _rioCq = _rio.RIOCreateCompletionQueue(rioCqSize, null);
         if (_rioCq == RIO_INVALID_CQ)
         {
@@ -242,6 +238,16 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => (int)(_cqTail - _cqHead);
     }
+
+    /// <summary>
+    /// Gets the number of registered external buffers.
+    /// </summary>
+    public int ExternalBufferCount => (int)_externalBufferCount;
+
+    /// <summary>
+    /// Gets the maximum number of external buffers.
+    /// </summary>
+    public int MaxExternalBuffers => (int)_maxExternalBuffers;
 
     // =========================================================================
     // GetSqe & CompleteOp (private hot-path helpers)
@@ -758,7 +764,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         conn->Socket = socket;
         conn->Active = true;
-        _rioActiveConnections++;
 
         return slot;
     }
@@ -782,7 +787,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         conn->Socket = INVALID_SOCKET;
         conn->RequestQueue = RIO_INVALID_RQ;
         conn->Active = false;
-        _rioActiveConnections--;
     }
 
     // =========================================================================
