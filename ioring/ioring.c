@@ -130,6 +130,7 @@ struct ioring {
     uint32_t accept_pool_size;          // Size of accept pool
     uint32_t pending_accept_count;      // Number of AcceptEx ops currently pending
     uint32_t accept_check_counter;      // Throttle counter for accept scanning
+    BOOL accepts_found_last_check;      // TRUE if last scan found completed accepts
     LPFN_ACCEPTEX fn_acceptex;          // Cached AcceptEx function pointer
 
     // Legacy mode data (pending operations for sync fallback)
@@ -597,11 +598,16 @@ static void process_pending_polls(ioring_t* ring) {
 
 // Dequeue RIO completions (and AcceptEx completions)
 static void dequeue_rio_completions(ioring_t* ring) {
-    // Throttle AcceptEx scan: WaitForSingleObject per pending slot is expensive.
-    // Check every 32 calls (~3ms at typical call rates) unless no accepts are pending.
-    if (ring->accept_pool && ring->pending_accept_count > 0
-        && (ring->accept_check_counter++ & 31) == 0) {
-        check_acceptex_completions(ring);
+    // AcceptEx scan calls WaitForSingleObject per pending slot.
+    // Adaptive throttle: always check if last scan found completions (active accept traffic,
+    // e.g. DDoS or connection burst). Only throttle (every 32 calls) when last scan found nothing
+    // (steady state with pre-posted accepts sitting idle).
+    if (ring->accept_pool && ring->pending_accept_count > 0) {
+        if (ring->accepts_found_last_check || (ring->accept_check_counter++ & 31) == 0) {
+            uint32_t old_count = ring->pending_accept_count;
+            check_acceptex_completions(ring);
+            ring->accepts_found_last_check = (ring->pending_accept_count < old_count);
+        }
     }
 
     if (ring->rio_cq == RIO_INVALID_CQ) return;

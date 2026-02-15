@@ -107,6 +107,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private readonly uint _acceptPoolSize;
     private uint _pendingAcceptCount;
     private uint _acceptCheckCounter;
+    private bool _acceptsFoundLastCheck;
 
     // Pending operations (for poll, legacy accept)
     private readonly PendingOp* _pendingOps;
@@ -588,11 +589,15 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private void DequeueRioCompletions()
     {
-        // Throttle AcceptEx scan: WaitForSingleObject per pending slot is expensive.
-        // Check every 32 calls (~3ms at typical call rates) unless no accepts are pending.
-        if (_pendingAcceptCount > 0 && (_acceptCheckCounter++ & 31) == 0)
+        // AcceptEx scan calls WaitForSingleObject per pending slot.
+        // Adaptive throttle: always check if last scan found completions (active accept traffic,
+        // e.g. DDoS or connection burst). Only throttle (every 32 calls) when last scan found nothing
+        // (steady state with pre-posted accepts sitting idle).
+        if (_pendingAcceptCount > 0 && (_acceptsFoundLastCheck || (_acceptCheckCounter++ & 31) == 0))
         {
+            var oldCount = _pendingAcceptCount;
             CheckAcceptExCompletions();
+            _acceptsFoundLastCheck = _pendingAcceptCount < oldCount;
         }
 
         if (_rioCq == RIO_INVALID_CQ)
