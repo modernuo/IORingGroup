@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace System.Network;
@@ -95,6 +94,13 @@ public readonly struct RingSocketEvent
 /// Manages RingSocket instances with automatic buffer lifecycle and graceful disconnect.
 /// </summary>
 /// <remarks>
+/// <para><b>Threading:</b> This class is <b>not thread-safe</b>. All method calls —
+/// <see cref="ProcessCompletions"/>, <see cref="Submit"/>, <see cref="CreateSocket"/>,
+/// <see cref="DisconnectImmediate"/>, and <see cref="ProcessSendQueue"/> — must be made
+/// from a single thread (the ring's processing thread). The internal send and disconnect
+/// queues are plain <see cref="System.Collections.Generic.Queue{T}"/> with no synchronization.
+/// This is intentional: single-threaded access eliminates lock contention and enables
+/// zero-allocation hot paths.</para>
 /// <para>
 /// RingSocketManager handles all the complexity of zero-copy I/O:
 /// <list type="bullet">
@@ -147,10 +153,10 @@ public sealed class RingSocketManager : IDisposable
     private readonly Completion[] _completions;
 
     // Send queue (flush-and-forget)
-    private readonly ConcurrentQueue<RingSocket> _sendQueue = new();
+    private readonly Queue<RingSocket> _sendQueue = new();
 
     // Disconnect queue
-    private readonly ConcurrentQueue<RingSocket> _disconnectQueue = new();
+    private readonly Queue<RingSocket> _disconnectQueue = new();
 
     private bool _disposed;
 
@@ -528,8 +534,9 @@ public sealed class RingSocketManager : IDisposable
     /// </summary>
     public void ProcessSendQueue()
     {
-        while (_sendQueue.TryDequeue(out var socket))
+        while (_sendQueue.Count > 0)
         {
+            var socket = _sendQueue.Dequeue();
             socket.SendQueued = false;
 
             // Post send even if DisconnectPending - we need to drain the buffer before disconnecting
@@ -652,8 +659,10 @@ public sealed class RingSocketManager : IDisposable
 
     private void ProcessDisconnectQueue(Span<RingSocketEvent> events, ref int eventCount)
     {
-        while (_disconnectQueue.TryDequeue(out var socket))
+        while (_disconnectQueue.Count > 0)
         {
+            var socket = _disconnectQueue.Dequeue();
+
             // Always unregister from RIO if registered (ConnectionId >= 0) and not already unregistered
             // This is critical for DisconnectImmediate() which sets Connected=false before queueing
             if (socket is { ConnectionId: >= 0, RioUnregistered: false })
