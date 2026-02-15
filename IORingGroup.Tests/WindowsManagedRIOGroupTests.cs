@@ -10,8 +10,56 @@ using System.Network.Windows;
 namespace IORingGroup.Tests;
 
 /// <summary>
+/// Thin safe wrappers around RIOInterop's unsafe P/Invoke methods for test convenience.
+/// </summary>
+internal static unsafe class RIOTestHelpers
+{
+    [DllImport("ws2_32.dll")]
+    private static extern int connect(nint s, RIOInterop.sockaddr_in* name, int namelen);
+
+    [DllImport("ws2_32.dll")]
+    private static extern int getsockname(nint s, RIOInterop.sockaddr_in* name, int* namelen);
+
+    public static nint CreateRIOClientSocket(string ip, int port, out RIOInterop.sockaddr_in addr)
+    {
+        var socket = RIOInterop.WSASocketW(
+            RIOInterop.AF_INET, RIOInterop.SOCK_STREAM, RIOInterop.IPPROTO_TCP,
+            null, 0, RIOInterop.WSA_FLAG_REGISTERED_IO);
+
+        uint addrBytes;
+        RIOInterop.inet_pton(RIOInterop.AF_INET, ip, &addrBytes);
+        addr = new RIOInterop.sockaddr_in
+        {
+            sin_family = RIOInterop.AF_INET,
+            sin_port = RIOInterop.htons((ushort)port),
+            sin_addr = addrBytes,
+            sin_zero = 0
+        };
+
+        return socket;
+    }
+
+    public static int Connect(nint socket, ref RIOInterop.sockaddr_in addr)
+    {
+        fixed (RIOInterop.sockaddr_in* pAddr = &addr)
+            return connect(socket, pAddr, sizeof(RIOInterop.sockaddr_in));
+    }
+
+    public static int GetPort(nint socket)
+    {
+        var addr = new RIOInterop.sockaddr_in();
+        var addrLen = sizeof(RIOInterop.sockaddr_in);
+        if (getsockname(socket, &addr, &addrLen) == 0)
+        {
+            var portBytes = (byte*)&addr.sin_port;
+            return (portBytes[0] << 8) | portBytes[1];
+        }
+        return -1;
+    }
+}
+
+/// <summary>
 /// Tests for the pure C# WindowsManagedRIOGroup implementation.
-/// Mirrors WindowsRIOGroupTests patterns for A/B verification against native DLL.
 /// </summary>
 public class WindowsManagedRIOGroupTests
 {
@@ -123,23 +171,14 @@ public class WindowsManagedRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create a client socket with WSA_FLAG_REGISTERED_IO
-            var clientSocket = Win_x64.WSASocketW(2, 1, 6, 0, 0, Win_x64.WSA_FLAG_REGISTERED_IO);
+            var clientSocket = RIOTestHelpers.CreateRIOClientSocket("127.0.0.1", endpoint.Port, out var addr);
             Skip.If(clientSocket == -1, "WSASocketW failed");
 
-            Win_x64.inet_pton(Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
-            var addr = new Win_x64.sockaddr_in
-            {
-                sin_family = Win_x64.AF_INET,
-                sin_port = Win_x64.htons((ushort)endpoint.Port),
-                sin_addr = addrBytes,
-                sin_zero = 0
-            };
-            var connectResult = Win_x64.connect(clientSocket, ref addr, 16);
-
+            var connectResult = RIOTestHelpers.Connect(clientSocket, ref addr);
             if (connectResult != 0)
             {
-                Win_x64.closesocket(clientSocket);
-                Skip.If(true, $"Connect failed: WSA error {Win_x64.WSAGetLastError()}");
+                RIOInterop.closesocket(clientSocket);
+                Skip.If(true, $"Connect failed: WSA error {RIOInterop.WSAGetLastError()}");
             }
 
             using var serverSide = listener.Accept();
@@ -148,7 +187,7 @@ public class WindowsManagedRIOGroupTests
             Assert.True(connId >= 0, $"RegisterSocket failed with connId={connId}");
 
             ring.UnregisterSocket(connId);
-            Win_x64.closesocket(clientSocket);
+            RIOInterop.closesocket(clientSocket);
         }
         catch (InvalidOperationException ex)
         {
@@ -178,18 +217,10 @@ public class WindowsManagedRIOGroupTests
             {
                 for (var i = 0; i < 5; i++)
                 {
-                    var clientSocket = Win_x64.WSASocketW(2, 1, 6, 0, 0, Win_x64.WSA_FLAG_REGISTERED_IO);
+                    var clientSocket = RIOTestHelpers.CreateRIOClientSocket("127.0.0.1", endpoint.Port, out var addr);
                     Skip.If(clientSocket == -1, "WSASocketW failed");
 
-                    Win_x64.inet_pton(Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
-                    var addr = new Win_x64.sockaddr_in
-                    {
-                        sin_family = Win_x64.AF_INET,
-                        sin_port = Win_x64.htons((ushort)endpoint.Port),
-                        sin_addr = addrBytes,
-                        sin_zero = 0
-                    };
-                    Win_x64.connect(clientSocket, ref addr, 16);
+                    RIOTestHelpers.Connect(clientSocket, ref addr);
                     clientSockets.Add(clientSocket);
 
                     var server = listener.Accept();
@@ -210,7 +241,7 @@ public class WindowsManagedRIOGroupTests
             }
             finally
             {
-                foreach (var s in clientSockets) Win_x64.closesocket(s);
+                foreach (var s in clientSockets) RIOInterop.closesocket(s);
                 foreach (var s in serverSockets) s.Dispose();
             }
         }
@@ -312,23 +343,14 @@ public class WindowsManagedRIOGroupTests
             var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
             // Create RIO client socket
-            var clientSocket = Win_x64.WSASocketW(2, 1, 6, 0, 0, Win_x64.WSA_FLAG_REGISTERED_IO);
+            var clientSocket = RIOTestHelpers.CreateRIOClientSocket("127.0.0.1", endpoint.Port, out var addr);
             Skip.If(clientSocket == -1, "WSASocketW failed");
 
-            Win_x64.inet_pton(Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
-            var addr = new Win_x64.sockaddr_in
-            {
-                sin_family = Win_x64.AF_INET,
-                sin_port = Win_x64.htons((ushort)endpoint.Port),
-                sin_addr = addrBytes,
-                sin_zero = 0
-            };
-            var connectResult = Win_x64.connect(clientSocket, ref addr, 16);
-
+            var connectResult = RIOTestHelpers.Connect(clientSocket, ref addr);
             if (connectResult != 0)
             {
-                Win_x64.closesocket(clientSocket);
-                Skip.If(true, $"Connect failed: WSA error {Win_x64.WSAGetLastError()}");
+                RIOInterop.closesocket(clientSocket);
+                Skip.If(true, $"Connect failed: WSA error {RIOInterop.WSAGetLastError()}");
             }
 
             using var serverSide = listener.Accept();
@@ -337,7 +359,7 @@ public class WindowsManagedRIOGroupTests
             var connId = ring.RegisterSocket(clientSocket);
             if (connId < 0)
             {
-                Win_x64.closesocket(clientSocket);
+                RIOInterop.closesocket(clientSocket);
                 Skip.If(true, "RegisterSocket failed");
             }
 
@@ -395,7 +417,7 @@ public class WindowsManagedRIOGroupTests
             ring.UnregisterSocket(connId);
             ring.UnregisterBuffer(recvBufId);
             ring.UnregisterBuffer(sendBufId);
-            Win_x64.closesocket(clientSocket);
+            RIOInterop.closesocket(clientSocket);
         }
         catch (InvalidOperationException ex)
         {
@@ -417,24 +439,8 @@ public class WindowsManagedRIOGroupTests
             Assert.NotEqual(-1, listener);
 
             // Get the assigned port
-            var addrBuf = new byte[16]; // sockaddr_in
-            var addrLen = addrBuf.Length;
-            int port;
-            unsafe
-            {
-                fixed (byte* pAddr = addrBuf)
-                {
-                    if (Win_x64.getsockname(listener, (nint)pAddr, ref addrLen) == 0)
-                    {
-                        port = (addrBuf[2] << 8) | addrBuf[3];
-                    }
-                    else
-                    {
-                        Skip.If(true, "getsockname failed");
-                        return;
-                    }
-                }
-            }
+            var port = RIOTestHelpers.GetPort(listener);
+            Skip.If(port < 0, "getsockname failed");
 
             // Queue accept
             const ulong acceptUserData = 100;
@@ -536,25 +542,17 @@ public class WindowsManagedRIOGroupTests
 
             for (var cycle = 0; cycle < 10; cycle++)
             {
-                var clientSocket = Win_x64.WSASocketW(2, 1, 6, 0, 0, Win_x64.WSA_FLAG_REGISTERED_IO);
+                var clientSocket = RIOTestHelpers.CreateRIOClientSocket("127.0.0.1", endpoint.Port, out var addr);
                 Skip.If(clientSocket == -1, "WSASocketW failed");
 
-                Win_x64.inet_pton(Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
-                var addr = new Win_x64.sockaddr_in
-                {
-                    sin_family = Win_x64.AF_INET,
-                    sin_port = Win_x64.htons((ushort)endpoint.Port),
-                    sin_addr = addrBytes,
-                    sin_zero = 0
-                };
-                Win_x64.connect(clientSocket, ref addr, 16);
+                RIOTestHelpers.Connect(clientSocket, ref addr);
                 using var serverSide = listener.Accept();
 
                 var connId = ring.RegisterSocket(clientSocket);
                 Assert.True(connId >= 0, $"RegisterSocket failed on cycle {cycle}");
 
                 ring.UnregisterSocket(connId);
-                Win_x64.closesocket(clientSocket);
+                RIOInterop.closesocket(clientSocket);
             }
         }
         catch (InvalidOperationException ex)

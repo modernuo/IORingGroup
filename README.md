@@ -10,8 +10,7 @@ Cross-platform zero-copy async socket I/O for .NET 10+. IORingGroup abstracts io
 
 | Platform       | Backend                  | Mechanism                          |
 |----------------|--------------------------|-------------------------------------|
-| Windows        | `WindowsRIOGroup`        | Registered I/O via native `ioring.dll` |
-| Windows        | `WindowsManagedRIOGroup` | Registered I/O, pure C# (no native DLL) |
+| Windows        | `WindowsManagedRIOGroup` | Registered I/O, pure C#            |
 | Linux          | `LinuxIORingGroup`       | io_uring via direct syscalls        |
 | macOS / FreeBSD| `DarwinIORingGroup`      | kqueue (readiness-based, bridged to completion model) |
 
@@ -195,17 +194,12 @@ Run the echo server and client for performance testing:
 # IORing server (default — uses RIO on Windows, io_uring on Linux, kqueue on macOS)
 dotnet run --project TestServer -c Release -- --ioring --benchmark --duration 10
 
-# Managed RIO server (pure C#, Windows only — for A/B comparison)
-dotnet run --project TestServer -c Release -- --mrio --benchmark --duration 10
-
 # PollGroup server (cross-platform baseline)
 dotnet run --project TestServer -c Release -- --pollgroup --benchmark --duration 10
 
 # Client (connect and blast echo traffic)
 dotnet run --project TestClient -c Release -- --host 127.0.0.1 --port 5000
 ```
-
-Use `IORING_MANAGED_RIO=1` to select the managed RIO backend via `IORingGroup.Create()`.
 
 ## License
 
