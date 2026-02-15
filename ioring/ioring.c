@@ -128,6 +128,9 @@ struct ioring {
     // AcceptEx support (RIO mode only)
     acceptex_context_t* accept_pool;    // Pool of pending AcceptEx contexts
     uint32_t accept_pool_size;          // Size of accept pool
+    uint32_t pending_accept_count;      // Number of AcceptEx ops currently pending
+    uint32_t accept_check_counter;      // Throttle counter for accept scanning
+    BOOL accepts_found_last_check;      // TRUE if last scan found completed accepts
     LPFN_ACCEPTEX fn_acceptex;          // Cached AcceptEx function pointer
 
     // Legacy mode data (pending operations for sync fallback)
@@ -595,9 +598,16 @@ static void process_pending_polls(ioring_t* ring) {
 
 // Dequeue RIO completions (and AcceptEx completions)
 static void dequeue_rio_completions(ioring_t* ring) {
-    // First check for AcceptEx completions (now using event-based notification)
-    if (ring->accept_pool) {
-        check_acceptex_completions(ring);
+    // AcceptEx scan calls WaitForSingleObject per pending slot.
+    // Adaptive throttle: always check if last scan found completions (active accept traffic,
+    // e.g. DDoS or connection burst). Only throttle (every 32 calls) when last scan found nothing
+    // (steady state with pre-posted accepts sitting idle).
+    if (ring->accept_pool && ring->pending_accept_count > 0) {
+        if (ring->accepts_found_last_check || (ring->accept_check_counter++ & 31) == 0) {
+            uint32_t old_count = ring->pending_accept_count;
+            check_acceptex_completions(ring);
+            ring->accepts_found_last_check = (ring->pending_accept_count < old_count);
+        }
     }
 
     if (ring->rio_cq == RIO_INVALID_CQ) return;
@@ -1034,6 +1044,7 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
     ctx->bytes_received = 0;
     ctx->completed = FALSE;
     ctx->pending = TRUE;
+    ring->pending_accept_count++;
 
     // Post AcceptEx
     DWORD bytes_received = 0;
@@ -1057,6 +1068,7 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
             closesocket(ctx->accept_socket);
             ctx->accept_socket = INVALID_SOCKET;
             ctx->pending = FALSE;
+            ring->pending_accept_count--;
             ctx->conn_slot = -1;
             last_error = err;
             return FALSE;
@@ -1068,9 +1080,10 @@ static BOOL post_acceptex(ioring_t* ring, SOCKET listen_socket, uint64_t user_da
 
 // Check for completed AcceptEx operations and add to completion queue
 static void check_acceptex_completions(ioring_t* ring) {
-    if (!ring->accept_pool) return;
+    if (!ring->accept_pool || ring->pending_accept_count == 0) return;
 
-    // Iterate through all pending accept contexts and check for completion via events
+    // Iterate through pending accept contexts and check for completion via events
+    uint32_t checked = 0;
     for (uint32_t i = 0; i < ring->accept_pool_size; i++) {
         acceptex_context_t* found_ctx = &ring->accept_pool[i];
 
@@ -1078,10 +1091,15 @@ static void check_acceptex_completions(ioring_t* ring) {
 
         // Check if the event is signaled (non-blocking)
         DWORD wait_result = WaitForSingleObject(found_ctx->event, 0);
-        if (wait_result != WAIT_OBJECT_0) continue;  // Not completed yet
+        if (wait_result != WAIT_OBJECT_0) {
+            // Early exit: if we've checked all pending slots, stop scanning
+            if (++checked >= ring->pending_accept_count) return;
+            continue;
+        }
 
         // Event is signaled - AcceptEx has completed
         found_ctx->pending = FALSE;
+        ring->pending_accept_count--;
 
         // Get the result using GetOverlappedResult
         DWORD bytes_transferred = 0;
@@ -1253,6 +1271,7 @@ IORING_API void ioring_rio_close_listener(ioring_t* ring, SOCKET listener) {
                 }
 
                 ctx->pending = FALSE;
+                ring->pending_accept_count--;
                 ctx->rq = RIO_INVALID_RQ;
                 ctx->conn_slot = -1;
             }

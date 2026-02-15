@@ -178,41 +178,60 @@ public class WindowsRIOGroupTests
         {
             using var ring = new System.Network.Windows.WindowsRIOGroup(MaxConnections);
 
-            // Create connected socket pair
+            // Create a listener using regular .NET sockets (listener doesn't need RIO flag)
             using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
             listener.Listen(1);
+            var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-            using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            client.Connect((IPEndPoint)listener.LocalEndPoint!);
+            // Create a CLIENT socket with WSA_FLAG_REGISTERED_IO (required for RIOCreateRequestQueue)
+            var rioSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0,
+                System.Network.Windows.Win_x64.WSA_FLAG_OVERLAPPED | System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+            Skip.If(rioSocket == -1, "WSASocketW with WSA_FLAG_REGISTERED_IO failed");
 
-            using var server = listener.Accept();
-            server.Blocking = false;
+            // Connect via P/Invoke
+            System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
+            var addr = new System.Network.Windows.Win_x64.sockaddr_in
+            {
+                sin_family = System.Network.Windows.Win_x64.AF_INET,
+                sin_port = System.Network.Windows.Win_x64.htons((ushort)endpoint.Port),
+                sin_addr = addrBytes,
+                sin_zero = 0
+            };
+            var connectResult = System.Network.Windows.Win_x64.connect(rioSocket, ref addr, 16);
+            if (connectResult != 0)
+            {
+                var err = System.Network.Windows.Win_x64.WSAGetLastError();
+                System.Network.Windows.Win_x64.closesocket(rioSocket);
+                Skip.If(true, $"Connect failed with error {err}");
+            }
+
+            // Accept on listener side (regular socket, just to complete the handshake)
+            using var serverSide = listener.Accept();
 
             // Try to register - capture detailed error info
-            var connId = ring.RegisterSocket(server.Handle);
+            var connId = ring.RegisterSocket(rioSocket);
             if (connId < 0)
             {
                 var error = System.Network.Windows.Win_x64.ioring_get_last_error();
                 var errorMsg = error switch
                 {
                     10022 => "WSAEINVAL - Invalid argument",
-                    10045 => "WSAEOPNOTSUPP - Operation not supported (RIOCreateRequestQueue failed - rebuild ioring.dll)",
+                    10045 => "WSAEOPNOTSUPP - Operation not supported (RIOCreateRequestQueue failed)",
                     10055 => "WSAENOBUFS - No buffer space",
                     10038 => "WSAENOTSOCK - Not a socket",
                     10093 => "WSANOTINITIALISED - Winsock not initialized",
                     _ => $"Unknown error {error}"
                 };
 
-                // Skip instead of fail if it's the known RIO issue (needs DLL rebuild)
-                Skip.If(error == 10045, "RegisterSocket failed with WSAEOPNOTSUPP - rebuild ioring.dll with latest changes");
-
+                System.Network.Windows.Win_x64.closesocket(rioSocket);
                 Assert.Fail($"RegisterSocket failed: {errorMsg}\n" +
-                    $"Socket handle: {server.Handle}");
+                    $"Socket handle: {rioSocket}");
             }
 
             Assert.True(connId >= 0);
             ring.UnregisterSocket(connId);
+            System.Network.Windows.Win_x64.closesocket(rioSocket);
         }
         catch (InvalidOperationException ex)
         {
@@ -237,30 +256,44 @@ public class WindowsRIOGroupTests
 
         using var ring = new System.Network.Windows.WindowsRIOGroup(MaxConnections);
 
-        // Create connected socket pair
+        // Create a listener using regular .NET sockets
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
         var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        client.Connect(endpoint);
+        // Create a CLIENT socket with WSA_FLAG_REGISTERED_IO (required for RIOCreateRequestQueue)
+        var rioSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0,
+            System.Network.Windows.Win_x64.WSA_FLAG_OVERLAPPED | System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+        Skip.If(rioSocket == -1, "WSASocketW with WSA_FLAG_REGISTERED_IO failed");
 
-        using var server = listener.Accept();
-        server.Blocking = false;
-
-        // Register the server socket
-        var connId = ring.RegisterSocket(server.Handle);
-
-        if (connId < 0)
+        // Connect via P/Invoke
+        System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
+        var addr = new System.Network.Windows.Win_x64.sockaddr_in
         {
-            var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-            Skip.If(error == 10045, "RIOCreateRequestQueue failed with WSAEOPNOTSUPP - rebuild ioring.dll");
+            sin_family = System.Network.Windows.Win_x64.AF_INET,
+            sin_port = System.Network.Windows.Win_x64.htons((ushort)endpoint.Port),
+            sin_addr = addrBytes,
+            sin_zero = 0
+        };
+        var connectResult = System.Network.Windows.Win_x64.connect(rioSocket, ref addr, 16);
+        if (connectResult != 0)
+        {
+            var err = System.Network.Windows.Win_x64.WSAGetLastError();
+            System.Network.Windows.Win_x64.closesocket(rioSocket);
+            Skip.If(true, $"Connect failed with error {err}");
         }
+
+        // Accept on listener side
+        using var serverSide = listener.Accept();
+
+        // Register the RIO socket
+        var connId = ring.RegisterSocket(rioSocket);
 
         Assert.True(connId >= 0, $"RegisterSocket failed with connId={connId}");
 
         ring.UnregisterSocket(connId);
+        System.Network.Windows.Win_x64.closesocket(rioSocket);
     }
 
     [SkippableFact]
@@ -275,29 +308,40 @@ public class WindowsRIOGroupTests
         listener.Listen(10);
         var endpoint = (IPEndPoint)listener.LocalEndPoint!;
 
-        var clients = new List<Socket>();
-        var servers = new List<Socket>();
+        System.Network.Windows.Win_x64.inet_pton(System.Network.Windows.Win_x64.AF_INET, "127.0.0.1", out var addrBytes);
+
+        var rioSockets = new List<nint>();
+        var serverSockets = new List<Socket>();
         var connIds = new List<int>();
 
         try
         {
-            // Create 5 connections
+            // Create 5 connections using RIO-compatible sockets
             for (var i = 0; i < 5; i++)
             {
-                var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                client.Connect(endpoint);
-                clients.Add(client);
+                var rioSocket = System.Network.Windows.Win_x64.WSASocketW(2, 1, 6, 0, 0,
+                    System.Network.Windows.Win_x64.WSA_FLAG_OVERLAPPED | System.Network.Windows.Win_x64.WSA_FLAG_REGISTERED_IO);
+                Skip.If(rioSocket == -1, $"WSASocketW failed for connection {i}");
 
-                var server = listener.Accept();
-                server.Blocking = false;
-                servers.Add(server);
-
-                var connId = ring.RegisterSocket(server.Handle);
-                if (connId < 0)
+                var addr = new System.Network.Windows.Win_x64.sockaddr_in
                 {
-                    var error = System.Network.Windows.Win_x64.ioring_get_last_error();
-                    Skip.If(error == 10045, "RIOCreateRequestQueue failed with WSAEOPNOTSUPP - rebuild ioring.dll");
+                    sin_family = System.Network.Windows.Win_x64.AF_INET,
+                    sin_port = System.Network.Windows.Win_x64.htons((ushort)endpoint.Port),
+                    sin_addr = addrBytes,
+                    sin_zero = 0
+                };
+                var connectResult = System.Network.Windows.Win_x64.connect(rioSocket, ref addr, 16);
+                if (connectResult != 0)
+                {
+                    System.Network.Windows.Win_x64.closesocket(rioSocket);
+                    Skip.If(true, $"Connect failed for connection {i}");
                 }
+                rioSockets.Add(rioSocket);
+
+                var serverSide = listener.Accept();
+                serverSockets.Add(serverSide);
+
+                var connId = ring.RegisterSocket(rioSocket);
                 Assert.True(connId >= 0, $"Failed to register connection {i}");
                 connIds.Add(connId);
             }
@@ -310,8 +354,8 @@ public class WindowsRIOGroupTests
         }
         finally
         {
-            foreach (var s in clients) s.Dispose();
-            foreach (var s in servers) s.Dispose();
+            foreach (var s in rioSockets) System.Network.Windows.Win_x64.closesocket(s);
+            foreach (var s in serverSockets) s.Dispose();
         }
     }
 

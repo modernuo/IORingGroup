@@ -12,6 +12,8 @@ public class Program
     private const int DefaultPort = 5000;
     private const string DefaultHost = "127.0.0.1";
 
+    private static int _messageSize = 128; // Default message payload size
+
     public static async Task Main(string[] args)
     {
         var host = DefaultHost;
@@ -42,6 +44,10 @@ public class Program
             else if ((args[i] == "--concurrent" || args[i] == "-C") && i + 1 < args.Length)
             {
                 maxConcurrent = int.Parse(args[++i]);
+            }
+            else if ((args[i] == "--size" || args[i] == "-s") && i + 1 < args.Length)
+            {
+                _messageSize = int.Parse(args[++i]);
             }
             else if ((args[i] == "--affinity" || args[i] == "-a") && i + 1 < args.Length)
             {
@@ -188,11 +194,18 @@ public class Program
 
     private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount, int maxConcurrent)
     {
+        // Ensure thread pool has enough threads for concurrent connections
+        ThreadPool.GetMinThreads(out var minWorker, out var minIO);
+        var needed = Math.Max(maxConcurrent * 2, minWorker);
+        ThreadPool.SetMinThreads(needed, Math.Max(needed, minIO));
+
         Console.WriteLine("IORingGroup Benchmark Client");
         Console.WriteLine($"Host: {host}:{port}");
         Console.WriteLine($"Connections: {connectionCount}");
         Console.WriteLine($"Messages per connection: {messagesPerConnection:N0}");
+        Console.WriteLine($"Message size: {_messageSize} bytes");
         Console.WriteLine($"Max concurrent: {maxConcurrent}");
+        Console.WriteLine($"Thread pool min: {needed} workers");
         Console.WriteLine();
 
         // Use semaphore to limit concurrent connection attempts
@@ -256,8 +269,16 @@ public class Program
                 await client.ConnectAsync(host, port);
 
                 using var stream = client.GetStream();
-                var message = $"Benchmark message from connection {connectionId:D4}";
-                var data = Encoding.UTF8.GetBytes(message);
+
+                // Build a message of the configured size
+                var data = new byte[_messageSize];
+                var header = Encoding.UTF8.GetBytes($"C{connectionId:D4}|");
+                header.AsSpan().CopyTo(data);
+                // Fill remaining bytes with a repeating pattern for easy verification
+                for (var j = header.Length; j < data.Length; j++)
+                {
+                    data[j] = (byte)('A' + (j % 26));
+                }
 
                 // Pipelined I/O: send and receive concurrently
                 long bytesSent = 0;

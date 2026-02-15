@@ -126,6 +126,7 @@ public sealed class RingSocket
     /// <summary>
     /// Queues this socket for sending any data in the send buffer.
     /// Safe to call multiple times - the socket is only queued once.
+    /// Must be called from the ring's processing thread.
     /// </summary>
     /// <remarks>
     /// This is a "flush-and-forget" operation. Write data to <see cref="SendBuffer"/>,
@@ -145,6 +146,7 @@ public sealed class RingSocket
     /// <summary>
     /// Requests a graceful disconnect. The socket will be closed after all
     /// in-flight I/O operations complete, ensuring buffer safety.
+    /// Must be called from the ring's processing thread.
     /// </summary>
     /// <remarks>
     /// <para>
