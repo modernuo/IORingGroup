@@ -22,10 +22,19 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private readonly int _kqueueFd;
     private readonly int _queueSize;
 
-    // Pending operations keyed by fd - we can have at most one recv and one send per fd
-    // Using Dictionary for simplicity, could optimize with arrays for production
-    private readonly Dictionary<nint, PendingOp> _pendingRecvs = new();
-    private readonly Dictionary<nint, PendingOp> _pendingSends = new();
+    // Connection ID management (dense slot allocation)
+    private readonly int _maxConnections;
+    private readonly int[] _connIdToFd;       // connId -> FD, initialized to -1
+    private readonly int[] _freeSlots;        // free stack
+    private int _freeSlotCount;
+
+    // Pending operations (fixed arrays indexed by connection ID)
+    private readonly PendingOp[] _pendingRecvs;
+    private readonly PendingOp[] _pendingSends;
+    private readonly bool[] _hasRecv;
+    private readonly bool[] _hasSend;
+
+    // Accept operations stay as dictionary (keyed by listener FD, sparse, typically 1-2)
     private readonly Dictionary<nint, PendingOp> _pendingAccepts = new();
 
     // Completion queue (user-space ring buffer)
@@ -66,11 +75,28 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
 
         _queueSize = queueSize;
+        _maxConnections = maxConnections;
         _cqMask = queueSize * 2 - 1;
 
         _cqEntries = new Completion[queueSize * 2];
         _changeList = new kevent[queueSize];
         _resultEvents = new kevent[queueSize];
+
+        // Allocate connection ID management arrays
+        _connIdToFd = new int[maxConnections];
+        _freeSlots = new int[maxConnections];
+        _pendingRecvs = new PendingOp[maxConnections];
+        _pendingSends = new PendingOp[maxConnections];
+        _hasRecv = new bool[maxConnections];
+        _hasSend = new bool[maxConnections];
+
+        // Initialize free stack (all slots available, lowest first for pop order)
+        for (var i = 0; i < maxConnections; i++)
+        {
+            _connIdToFd[i] = -1;
+            _freeSlots[i] = maxConnections - 1 - i; // stack: top = 0, bottom = maxConnections-1
+        }
+        _freeSlotCount = maxConnections;
 
         // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
         _maxExternalBuffers = maxConnections * 2;
@@ -86,8 +112,19 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    public int SubmissionQueueSpace => _queueSize - _changeCount -
-        _pendingRecvs.Count - _pendingSends.Count - _pendingAccepts.Count;
+    public int SubmissionQueueSpace
+    {
+        get
+        {
+            var pending = _pendingAccepts.Count;
+            for (var i = 0; i < _maxConnections; i++)
+            {
+                if (_hasRecv[i]) pending++;
+                if (_hasSend[i]) pending++;
+            }
+            return _queueSize - _changeCount - pending;
+        }
+    }
 
     /// <inheritdoc/>
     public int CompletionQueueCount => (_cqTail - _cqHead) & _cqMask;
@@ -107,7 +144,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             filter = (short)kqueue_filter.WRITE;
         }
 
-        AddKqueueChange(fd, filter, kqueue_flags.ADD | kqueue_flags.ONESHOT, userData);
+        AddKqueueChange(fd, filter, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)userData);
     }
 
     /// <inheritdoc/>
@@ -149,13 +186,22 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EINPROGRESS)
             {
-                // Connection in progress - register for write readiness
-                _pendingSends[fd] = new PendingOp
+                // Connection in progress — find connId and store as pending send
+                var connId = FindConnIdByFd((int)fd);
+                if (connId >= 0)
                 {
-                    Opcode = (byte)IORingOp.Connect,
-                    Fd = fd,
-                    UserData = userData
-                };
+                    _pendingSends[connId] = new PendingOp
+                    {
+                        Opcode = (byte)IORingOp.Connect,
+                        Fd = fd,
+                        UserData = userData
+                    };
+                    _hasSend[connId] = true;
+                }
+                else
+                {
+                    AddCompletion(userData, -EINPROGRESS);
+                }
             }
             else
             {
@@ -165,31 +211,33 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void PrepareSend(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareSend(int connId, nint buf, int len, MsgFlags flags, ulong userData)
     {
-        _pendingSends[fd] = new PendingOp
+        _pendingSends[connId] = new PendingOp
         {
             Opcode = (byte)IORingOp.Send,
-            Fd = fd,
+            Fd = _connIdToFd[connId],
             Addr = buf,
             Len = len,
             Flags = (int)flags,
             UserData = userData
         };
+        _hasSend[connId] = true;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void PrepareRecv(nint fd, nint buf, int len, MsgFlags flags, ulong userData)
+    private void PrepareRecv(int connId, nint buf, int len, MsgFlags flags, ulong userData)
     {
-        _pendingRecvs[fd] = new PendingOp
+        _pendingRecvs[connId] = new PendingOp
         {
             Opcode = (byte)IORingOp.Recv,
-            Fd = fd,
+            Fd = _connIdToFd[connId],
             Addr = buf,
             Len = len,
             Flags = (int)flags,
             UserData = userData
         };
+        _hasRecv[connId] = true;
     }
 
     /// <inheritdoc/>
@@ -205,11 +253,34 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareCancel(ulong targetUserData, ulong userData)
     {
-        // Remove pending operations with matching userData
-        // This is O(n) but cancellation should be rare
-        RemovePendingByUserData(_pendingRecvs, targetUserData);
-        RemovePendingByUserData(_pendingSends, targetUserData);
-        RemovePendingByUserData(_pendingAccepts, targetUserData);
+        // Scan fixed arrays for matching userData — O(n) but cancellation is rare
+        for (var i = 0; i < _maxConnections; i++)
+        {
+            if (_hasRecv[i] && _pendingRecvs[i].UserData == targetUserData)
+            {
+                _hasRecv[i] = false;
+            }
+            if (_hasSend[i] && _pendingSends[i].UserData == targetUserData)
+            {
+                _hasSend[i] = false;
+            }
+        }
+
+        // Also check accepts
+        nint? toRemove = null;
+        foreach (var kvp in _pendingAccepts)
+        {
+            if (kvp.Value.UserData == targetUserData)
+            {
+                toRemove = kvp.Key;
+                break;
+            }
+        }
+        if (toRemove.HasValue)
+        {
+            _pendingAccepts.Remove(toRemove.Value);
+        }
+
         AddCompletion(userData, 0);
     }
 
@@ -227,23 +298,34 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         var submitted = 0;
 
-        // Register kqueue interest for all pending operations
+        // Register kqueue interest for pending accept operations
         foreach (var kvp in _pendingAccepts)
         {
-            AddKqueueChange(kvp.Key, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Value.UserData);
+            AddKqueueChange(kvp.Key, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Key);
             submitted++;
         }
 
-        foreach (var kvp in _pendingRecvs)
+        // Register kqueue interest for pending connection operations
+        for (var i = 0; i < _maxConnections; i++)
         {
-            AddKqueueChange(kvp.Key, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Value.UserData);
-            submitted++;
-        }
-
-        foreach (var kvp in _pendingSends)
-        {
-            AddKqueueChange(kvp.Key, (short)kqueue_filter.WRITE, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Value.UserData);
-            submitted++;
+            if (_hasRecv[i])
+            {
+                var fd = _connIdToFd[i];
+                if (fd >= 0)
+                {
+                    AddKqueueChange(fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
+                    submitted++;
+                }
+            }
+            if (_hasSend[i])
+            {
+                var fd = _connIdToFd[i];
+                if (fd >= 0)
+                {
+                    AddKqueueChange(fd, (short)kqueue_filter.WRITE, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
+                    submitted++;
+                }
+            }
         }
 
         // Submit all kqueue changes
@@ -324,54 +406,57 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             ref var ev = ref _resultEvents[i];
             var fd = ev.ident;
 
+            // Check for accept events first (by checking the accept dictionary)
+            if (_pendingAccepts.Remove(fd, out var acceptOp))
+            {
+                // Check for errors on accept
+                if ((ev.flags & (ushort)kqueue_flags.ERROR) != 0)
+                {
+                    AddCompletion(acceptOp.UserData, -(int)ev.data);
+                    continue;
+                }
+
+                ExecuteAccept(ref acceptOp);
+                continue;
+            }
+
+            // Connection event — extract connId from udata
+            var connId = (int)ev.udata;
+            if (connId < 0 || connId >= _maxConnections)
+            {
+                continue;
+            }
+
             // Check for errors
             if ((ev.flags & (ushort)kqueue_flags.ERROR) != 0)
             {
-                // Error on this fd - find and complete the pending operation
-                if (_pendingRecvs.Remove(fd, out var recvOp))
+                if (_hasRecv[connId])
                 {
-                    AddCompletion(recvOp.UserData, -(int)ev.data);
+                    _hasRecv[connId] = false;
+                    AddCompletion(_pendingRecvs[connId].UserData, -(int)ev.data);
                 }
-                if (_pendingSends.Remove(fd, out var sendOp))
+                if (_hasSend[connId])
                 {
-                    AddCompletion(sendOp.UserData, -(int)ev.data);
-                }
-                if (_pendingAccepts.Remove(fd, out var acceptOp))
-                {
-                    AddCompletion(acceptOp.UserData, -(int)ev.data);
+                    _hasSend[connId] = false;
+                    AddCompletion(_pendingSends[connId].UserData, -(int)ev.data);
                 }
                 continue;
             }
 
             // Handle based on filter type
-            if (ev.filter == (short)kqueue_filter.READ)
+            if (ev.filter == (short)kqueue_filter.READ && _hasRecv[connId])
             {
-                // Check for accept first
-                if (_pendingAccepts.Remove(fd, out var acceptOp))
-                {
-                    ExecuteAccept(ref acceptOp);
-                }
-                else if (_pendingRecvs.Remove(fd, out var recvOp))
-                {
-                    ExecuteRecv(ref recvOp);
-                }
+                ExecuteRecv(connId);
             }
-            else if (ev.filter == (short)kqueue_filter.WRITE)
+            else if (ev.filter == (short)kqueue_filter.WRITE && _hasSend[connId])
             {
-                if (_pendingSends.Remove(fd, out var sendOp))
+                if (_pendingSends[connId].Opcode == (byte)IORingOp.Connect)
                 {
-                    if (sendOp.Opcode == (byte)IORingOp.Connect)
-                    {
-                        // Connect completed - check for errors
-                        int error = 0;
-                        var len = sizeof(int);
-                        Darwin.getsockopt((int)fd, SOL_SOCKET, SO_ERROR, (nint)(&error), ref len);
-                        AddCompletion(sendOp.UserData, error == 0 ? 0 : -error);
-                    }
-                    else
-                    {
-                        ExecuteSend(ref sendOp);
-                    }
+                    ExecuteConnectComplete(connId);
+                }
+                else
+                {
+                    ExecuteSend(connId);
                 }
             }
         }
@@ -389,7 +474,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             {
                 // No connection ready yet - re-queue the accept
                 _pendingAccepts[op.Fd] = op;
-                AddKqueueChange(op.Fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.UserData);
+                AddKqueueChange(op.Fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.Fd);
                 return;
             }
             AddCompletion(op.UserData, -errno);
@@ -400,8 +485,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
     }
 
-    private void ExecuteRecv(ref PendingOp op)
+    private void ExecuteRecv(int connId)
     {
+        ref var op = ref _pendingRecvs[connId];
         var result = Darwin.recv((int)op.Fd, op.Addr, (nuint)op.Len, op.Flags);
 
         if (result < 0)
@@ -409,21 +495,22 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // No data ready yet - re-queue the recv
-                _pendingRecvs[op.Fd] = op;
-                AddKqueueChange(op.Fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.UserData);
+                // No data ready yet — keep pending, next Submit() will re-arm
                 return;
             }
+            _hasRecv[connId] = false;
             AddCompletion(op.UserData, -errno);
         }
         else
         {
+            _hasRecv[connId] = false;
             AddCompletion(op.UserData, (int)result);
         }
     }
 
-    private void ExecuteSend(ref PendingOp op)
+    private void ExecuteSend(int connId)
     {
+        ref var op = ref _pendingSends[connId];
         var result = Darwin.send((int)op.Fd, op.Addr, (nuint)op.Len, op.Flags);
 
         if (result < 0)
@@ -431,21 +518,31 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // Buffer full - re-queue the send
-                _pendingSends[op.Fd] = op;
-                AddKqueueChange(op.Fd, (short)kqueue_filter.WRITE, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.UserData);
+                // Buffer full — keep pending, next Submit() will re-arm
                 return;
             }
+            _hasSend[connId] = false;
             AddCompletion(op.UserData, -errno);
         }
         else
         {
+            _hasSend[connId] = false;
             AddCompletion(op.UserData, (int)result);
         }
     }
 
+    private void ExecuteConnectComplete(int connId)
+    {
+        ref var op = ref _pendingSends[connId];
+        int error = 0;
+        var len = sizeof(int);
+        Darwin.getsockopt((int)op.Fd, SOL_SOCKET, SO_ERROR, (nint)(&error), ref len);
+        _hasSend[connId] = false;
+        AddCompletion(op.UserData, error == 0 ? 0 : -error);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void AddKqueueChange(nint fd, short filter, kqueue_flags flags, ulong userData)
+    private void AddKqueueChange(nint fd, short filter, kqueue_flags flags, nint udata)
     {
         if (_changeCount >= _changeList.Length)
         {
@@ -459,7 +556,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             ident = fd,
             filter = filter,
             flags = (ushort)flags,
-            udata = (nint)userData
+            udata = udata
         };
     }
 
@@ -471,22 +568,20 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         _cqTail++;
     }
 
-    private static void RemovePendingByUserData(Dictionary<nint, PendingOp> dict, ulong targetUserData)
+    /// <summary>
+    /// Linear scan to find a connId by FD. Only used for PrepareConnect which is rare.
+    /// </summary>
+    private int FindConnIdByFd(int fd)
     {
-        nint? toRemove = null;
-        foreach (var kvp in dict)
+        for (var i = 0; i < _maxConnections; i++)
         {
-            if (kvp.Value.UserData == targetUserData)
+            if (_connIdToFd[i] == fd)
             {
-                toRemove = kvp.Key;
-                break;
+                return i;
             }
         }
 
-        if (toRemove.HasValue)
-        {
-            dict.Remove(toRemove.Value);
-        }
+        return -1;
     }
 
     // =============================================================================
@@ -581,17 +676,33 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public int RegisterSocket(nint socket)
     {
-        // On Darwin, the socket fd is used directly as the connection ID
-        return (int)socket;
+        if (_freeSlotCount <= 0)
+        {
+            return -1;
+        }
+
+        // Pop from free stack
+        var connId = _freeSlots[--_freeSlotCount];
+        _connIdToFd[connId] = (int)socket;
+
+        return connId;
     }
 
     /// <inheritdoc/>
     public void UnregisterSocket(int connId)
     {
-        // Remove any pending operations for this socket
-        var fd = (nint)connId;
-        _pendingRecvs.Remove(fd);
-        _pendingSends.Remove(fd);
+        if (connId < 0 || connId >= _maxConnections)
+        {
+            return;
+        }
+
+        // Clear pending ops
+        _hasRecv[connId] = false;
+        _hasSend[connId] = false;
+
+        // Return slot to free stack
+        _connIdToFd[connId] = -1;
+        _freeSlots[_freeSlotCount++] = connId;
     }
 
     /// <inheritdoc/>
@@ -599,8 +710,6 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         if (socket >= 0)
         {
-            _pendingRecvs.Remove(socket);
-            _pendingSends.Remove(socket);
             Darwin.close((int)socket);
         }
     }
@@ -765,8 +874,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
         _disposed = true;
 
-        _pendingRecvs.Clear();
-        _pendingSends.Clear();
+        // Clear pending ops
+        for (var i = 0; i < _maxConnections; i++)
+        {
+            _hasRecv[i] = false;
+            _hasSend[i] = false;
+        }
+
         _pendingAccepts.Clear();
 
         if (_kqueueFd >= 0)
