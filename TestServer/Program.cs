@@ -12,6 +12,7 @@ namespace TestServer;
 public enum ServerBackend
 {
     IORing,     // Unified: Windows RIO / Linux io_uring / Darwin kqueue
+    Epoll,      // Linux epoll (fallback, for testing/benchmarking)
     PollGroup   // Cross-platform: wepoll (Windows) / epoll (Linux) / kqueue (macOS)
 }
 
@@ -90,10 +91,14 @@ public class Program
         {
             var arg = args[i];
             if (arg.Equals("--pollgroup", StringComparison.OrdinalIgnoreCase) ||
-                arg.Equals("-p", StringComparison.OrdinalIgnoreCase) ||
-                arg.Equals("--epoll", StringComparison.OrdinalIgnoreCase))
+                arg.Equals("-p", StringComparison.OrdinalIgnoreCase))
             {
                 backend = ServerBackend.PollGroup;
+            }
+            else if (arg.Equals("--epoll", StringComparison.OrdinalIgnoreCase) ||
+                     arg.Equals("-e", StringComparison.OrdinalIgnoreCase))
+            {
+                backend = ServerBackend.Epoll;
             }
             else if (arg.Equals("--ioring", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("--rio", StringComparison.OrdinalIgnoreCase) ||
@@ -156,6 +161,7 @@ public class Program
         Console.WriteLine($"Port: {Port}");
         Console.WriteLine("Usage: TestServer [--ioring|--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--affinity|-a <mask>]");
         Console.WriteLine("  --ioring|--rio|-r: Windows RIO / Linux io_uring / Darwin kqueue (zero-copy echo)");
+        Console.WriteLine("  --epoll|-e: Linux epoll (explicit fallback, for benchmarking)");
         Console.WriteLine("  --pollgroup|-p: Cross-platform poll-based (wepoll/epoll/kqueue)");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
@@ -168,6 +174,10 @@ public class Program
         if (backend == ServerBackend.IORing)
         {
             RunIORingServer(benchmarkMode);
+        }
+        else if (backend == ServerBackend.Epoll)
+        {
+            RunEpollServer(benchmarkMode);
         }
         else
         {
@@ -633,6 +643,59 @@ public class Program
             }
 
         return count;
+    }
+
+    #endregion
+
+    #region Epoll Server
+
+    private static void RunEpollServer(bool benchmarkMode)
+    {
+        try
+        {
+            using var ring = System.Network.IORingGroup.CreateLinuxEpoll(queueSize: MaxClients, maxConnections: MaxClients);
+            Console.WriteLine($"Epoll ring created: MaxConnections={MaxClients}");
+
+            _bufferPool = new IORingBufferPool(
+                ring,
+                slabSize: 256,
+                bufferSize: BufferSize,
+                initialSlabs: 4,
+                maxSlabs: 64
+            );
+            Console.WriteLine($"Buffer pool created: {_bufferPool.TotalCapacity} buffers ({_bufferPool.BufferSize} bytes each)");
+
+            var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
+            if (listener == -1)
+            {
+                throw new InvalidOperationException("Failed to create listener");
+            }
+
+            Console.WriteLine($"Epoll server listening on port {Port} (listener fd={listener})");
+
+            try
+            {
+                RunServerLoop(ring, listener, benchmarkMode);
+            }
+            finally
+            {
+                ring.CloseListener(listener);
+                for (var i = 0; i < MaxClients; i++)
+                {
+                    if (_clients[i].Active)
+                    {
+                        CloseClient(ring, i);
+                    }
+                }
+                _bufferPool.Dispose();
+                _bufferPool = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Epoll server error: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+        }
     }
 
     #endregion
