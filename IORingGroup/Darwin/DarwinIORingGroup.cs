@@ -127,7 +127,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    public int CompletionQueueCount => (_cqTail - _cqHead) & _cqMask;
+    public int CompletionQueueCount => _cqTail - _cqHead;
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

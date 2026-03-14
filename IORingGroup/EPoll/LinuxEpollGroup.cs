@@ -129,7 +129,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// <inheritdoc/>
     public int SubmissionQueueSpace
     {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get
         {
             var pendingCount = 0;
@@ -573,7 +572,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                     }
 
                     // Handle EPOLLRDHUP (remote hangup) — complete recv with 0 if still pending
-                    if ((events & (uint)epoll_events.EPOLLRDHUP) != 0 && _hasRecv[connId])
+                    // Use else-if to avoid duplicate completions when EPOLLIN and EPOLLRDHUP fire together
+                    else if ((events & (uint)epoll_events.EPOLLRDHUP) != 0 && _hasRecv[connId])
                     {
                         var recvUserData = _pendingRecvs[connId].UserData;
                         _hasRecv[connId] = false;
