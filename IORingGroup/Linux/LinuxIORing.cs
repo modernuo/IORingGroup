@@ -30,6 +30,21 @@ public static partial class LinuxIORing
     public const uint IORING_UNREGISTER_BUFFERS = 1;
     public const uint IORING_REGISTER_FILES = 2;
     public const uint IORING_UNREGISTER_FILES = 3;
+    public const uint IORING_REGISTER_EVENTFD = 4;
+
+    // eventfd flags
+    public const int EFD_NONBLOCK = 0x800;
+
+    // poll constants
+    public const short POLLIN = 0x0001;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct pollfd
+    {
+        public int fd;
+        public short events;
+        public short revents;
+    }
 
     // mmap offsets for io_uring
     public const ulong IORING_OFF_SQ_RING = 0;
@@ -77,6 +92,15 @@ public static partial class LinuxIORing
 
     [LibraryImport("libc", SetLastError = true)]
     public static partial int fcntl(int fd, int cmd, int arg);
+
+    [LibraryImport("libc", SetLastError = true)]
+    public static partial int eventfd(uint initval, int flags);
+
+    [LibraryImport("libc", SetLastError = true)]
+    public static partial int poll(nint fds, nuint nfds, int timeout);
+
+    [LibraryImport("libc", SetLastError = true)]
+    public static partial long read(int fd, nint buf, nuint count);
 
     /// <summary>
     /// io_uring_setup syscall wrapper.

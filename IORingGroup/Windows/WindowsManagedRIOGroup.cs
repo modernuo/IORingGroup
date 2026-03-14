@@ -119,6 +119,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private readonly uint* _externalBufferLens;
     private uint _externalBufferCount;
 
+    private readonly nint _completionEvent;
     private bool _disposed;
 
     // =========================================================================
@@ -172,7 +173,14 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             _externalBufferIds[i] = RIO_INVALID_BUFFERID;
         }
 
-        // Step 6: Create RIO completion queue (polling mode, no notification)
+        // Step 6: Create completion notification event and RIO completion queue
+        _completionEvent = CreateEventW(null, 1, 0, null); // Manual reset event
+        if (_completionEvent == 0)
+        {
+            FreeAllMemory();
+            throw new InvalidOperationException("Failed to create completion notification event");
+        }
+
         var rioCqSize = mc * 2;
         if (rioCqSize < queueSize)
         {
@@ -182,9 +190,17 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         {
             rioCqSize = 2_000_000;
         }
-        _rioCq = _rio.RIOCreateCompletionQueue(rioCqSize, null);
+
+        var notificationCompletion = new RIO_NOTIFICATION_COMPLETION
+        {
+            Type = 1, // RIO_EVENT_COMPLETION
+            EventHandle = _completionEvent,
+            NotifyReset = 1 // Auto-reset event on RIONotify
+        };
+        _rioCq = _rio.RIOCreateCompletionQueue(rioCqSize, &notificationCompletion);
         if (_rioCq == RIO_INVALID_CQ)
         {
+            CloseHandle(_completionEvent);
             FreeAllMemory();
             throw new InvalidOperationException("Failed to create RIO completion queue");
         }
@@ -422,6 +438,20 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         }
 
         return submitted;
+    }
+
+    // =========================================================================
+    // Completion Notification
+    // =========================================================================
+
+    /// <inheritdoc/>
+    public void WaitForCompletion(int timeoutMs)
+    {
+        // Arm notification: resets event (NotifyReset=1) and arms CQ
+        _rio.RIONotify(_rioCq);
+
+        // Wait for completion or timeout
+        WaitForSingleObject(_completionEvent, (uint)timeoutMs);
     }
 
     // =========================================================================
@@ -1266,6 +1296,12 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         if (_rioCq != RIO_INVALID_CQ)
         {
             _rio.RIOCloseCompletionQueue(_rioCq);
+        }
+
+        // Close completion notification event
+        if (_completionEvent != 0)
+        {
+            CloseHandle(_completionEvent);
         }
 
         // Deregister external buffers

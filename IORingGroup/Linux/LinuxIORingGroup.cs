@@ -59,6 +59,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private readonly uint* _cqTail;
     private readonly io_uring_cqe* _cqes;
 
+    private readonly int _eventFd = -1;
     private bool _disposed;
 
     public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
@@ -152,6 +153,28 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Read actual ring masks from mapped memory (ring_mask field is an OFFSET, not the value!)
         _sqMask = *(uint*)(_sqRingPtr + (nint)p.sq_off.ring_mask);
         _cqMask = *(uint*)(_cqRingPtr + (nint)p.cq_off.ring_mask);
+
+        // Create and register eventfd for completion notification
+        _eventFd = LinuxIORing.eventfd(0, LinuxIORing.EFD_NONBLOCK);
+        if (_eventFd < 0)
+        {
+            LinuxIORing.munmap(_sqesPtr, _sqesSize);
+            LinuxIORing.munmap(_cqRingPtr, _cqRingSize);
+            LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+            LinuxIORing.close(_ringFd);
+            throw new InvalidOperationException("Failed to create eventfd for completion notification");
+        }
+
+        int efd = _eventFd;
+        if (LinuxIORing.io_uring_register(_ringFd, LinuxIORing.IORING_REGISTER_EVENTFD, (nint)(&efd), 1) < 0)
+        {
+            LinuxIORing.close(_eventFd);
+            LinuxIORing.munmap(_sqesPtr, _sqesSize);
+            LinuxIORing.munmap(_cqRingPtr, _cqRingSize);
+            LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+            LinuxIORing.close(_ringFd);
+            throw new InvalidOperationException("Failed to register eventfd with io_uring");
+        }
 
         // Initialize local tail from shared memory
         _sqTailLocal = *_sqTail;
@@ -409,6 +432,24 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AdvanceCompletionQueue(int count) => Volatile.Write(ref *_cqHead, *_cqHead + (uint)count);
+
+    /// <inheritdoc/>
+    public void WaitForCompletion(int timeoutMs)
+    {
+        // Clear any pending eventfd notifications from already-processed completions
+        ulong val;
+        LinuxIORing.read(_eventFd, (nint)(&val), 8); // Non-blocking: returns EAGAIN if counter=0
+
+        // Check if completions arrived in the kernel CQ since last PeekCompletions
+        if (CompletionQueueCount > 0)
+        {
+            return;
+        }
+
+        // Wait for new completions or timeout
+        var pfd = new LinuxIORing.pollfd { fd = _eventFd, events = LinuxIORing.POLLIN };
+        LinuxIORing.poll((nint)(&pfd), 1, timeoutMs);
+    }
 
     // =============================================================================
     // Listener and Socket Management
@@ -697,6 +738,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         if (_sqRingPtr != 0 && _sqRingPtr != -1)
         {
             LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+        }
+
+        if (_eventFd >= 0)
+        {
+            LinuxIORing.close(_eventFd);
         }
 
         if (_ringFd >= 0)

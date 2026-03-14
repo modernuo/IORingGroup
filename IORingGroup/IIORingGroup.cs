@@ -229,4 +229,24 @@ public interface IIORingGroup : IDisposable
     /// The offset can extend into the double-mapped region (0 to 2x physical size).
     /// </remarks>
     void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData);
+
+    // =============================================================================
+    // Completion Notification
+    // =============================================================================
+
+    /// <summary>
+    /// Waits for I/O completions or until the specified timeout expires.
+    /// Used to sleep efficiently while remaining responsive to network events.
+    /// </summary>
+    /// <param name="timeoutMs">Maximum time to wait in milliseconds.</param>
+    /// <remarks>
+    /// Platform implementations:
+    /// <list type="bullet">
+    /// <item>Windows RIO: Arms RIONotify then WaitForSingleObject on completion event</item>
+    /// <item>Linux io_uring: Polls eventfd registered with the ring</item>
+    /// <item>macOS kqueue: kevent() with timeout</item>
+    /// </list>
+    /// This method has zero overhead when not called (under load, the caller skips it).
+    /// </remarks>
+    void WaitForCompletion(int timeoutMs);
 }

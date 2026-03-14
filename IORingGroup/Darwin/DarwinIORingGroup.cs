@@ -270,7 +270,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Wait for at least waitNr completions
         while (CompletionQueueCount < waitNr)
         {
-            PollAndExecute(blocking: true);
+            PollAndExecute(-1);
         }
 
         return submitted;
@@ -281,7 +281,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public int PeekCompletions(Span<Completion> completions)
     {
         // Poll kqueue for ready events and execute I/O
-        PollAndExecute(blocking: false);
+        PollAndExecute(0);
 
         // Copy completions to output
         var available = CompletionQueueCount;
@@ -306,11 +306,17 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <summary>
     /// Polls kqueue for ready events and executes the corresponding I/O operations.
     /// </summary>
-    private void PollAndExecute(bool blocking)
+    /// <param name="timeoutMs">
+    /// 0 for non-blocking, negative for blocking indefinitely, positive for timed wait.
+    /// </param>
+    private void PollAndExecute(int timeoutMs)
     {
-        // Use a zero timeout for non-blocking poll
-        timespec timeout = default;
-        var timeoutPtr = blocking ? nint.Zero : (nint)(&timeout);
+        var timeout = new timespec
+        {
+            tv_sec = timeoutMs > 0 ? timeoutMs / 1000 : 0,
+            tv_nsec = timeoutMs > 0 ? (timeoutMs % 1000) * 1_000_000L : 0
+        };
+        var timeoutPtr = timeoutMs < 0 ? nint.Zero : (nint)(&timeout);
 
         var eventCount = Darwin.kevent(_kqueueFd, null, 0, _resultEvents, _resultEvents.Length, timeoutPtr);
 
@@ -487,6 +493,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         {
             dict.Remove(toRemove.Value);
         }
+    }
+
+    /// <inheritdoc/>
+    public void WaitForCompletion(int timeoutMs)
+    {
+        PollAndExecute(timeoutMs);
     }
 
     // =============================================================================

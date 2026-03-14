@@ -204,6 +204,7 @@ internal static unsafe class RIOInterop
         public delegate* unmanaged[Stdcall]<nint, RIORESULT*, uint, uint> RIODequeueCompletion;
         public delegate* unmanaged[Stdcall]<byte*, uint, nint> RIORegisterBuffer;
         public delegate* unmanaged[Stdcall]<nint, void> RIODeregisterBuffer;
+        public delegate* unmanaged[Stdcall]<nint, int> RIONotify;
 
         public bool IsValid =>
             RIOReceive != null &&
@@ -213,7 +214,22 @@ internal static unsafe class RIOInterop
             RIOCreateRequestQueue != null &&
             RIODequeueCompletion != null &&
             RIORegisterBuffer != null &&
-            RIODeregisterBuffer != null;
+            RIODeregisterBuffer != null &&
+            RIONotify != null;
+    }
+
+    /// <summary>
+    /// RIO notification completion structure for event-based CQ notification.
+    /// Passed to RIOCreateCompletionQueue to enable RIONotify support.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit, Size = 32)]
+    public struct RIO_NOTIFICATION_COMPLETION
+    {
+        /// <summary>1 = RIO_EVENT_COMPLETION</summary>
+        [FieldOffset(0)] public int Type;
+        [FieldOffset(8)] public nint EventHandle;
+        /// <summary>If TRUE, event is auto-reset when RIONotify is called.</summary>
+        [FieldOffset(16)] public int NotifyReset;
     }
 
     // AcceptEx function pointer is stored per-ring instance in WindowsManagedRIOGroup
@@ -295,6 +311,7 @@ internal static unsafe class RIOInterop
                 RIODequeueCompletion = (delegate* unmanaged[Stdcall]<nint, RIORESULT*, uint, uint>)table.RIODequeueCompletion,
                 RIORegisterBuffer = (delegate* unmanaged[Stdcall]<byte*, uint, nint>)table.RIORegisterBuffer,
                 RIODeregisterBuffer = (delegate* unmanaged[Stdcall]<nint, void>)table.RIODeregisterBuffer,
+                RIONotify = (delegate* unmanaged[Stdcall]<nint, int>)table.RIONotify,
             };
         }
         finally

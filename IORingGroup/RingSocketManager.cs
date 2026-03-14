@@ -411,6 +411,16 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
+    /// Waits for I/O completions or until the specified timeout expires.
+    /// Delegates to the underlying ring's platform-native wait mechanism.
+    /// </summary>
+    /// <param name="timeoutMs">Maximum time to wait in milliseconds.</param>
+    public void WaitForCompletion(int timeoutMs)
+    {
+        _ring.WaitForCompletion(timeoutMs);
+    }
+
+    /// <summary>
     /// Queues a socket for sending.
     /// Called by RingSocket.QueueSend().
     /// </summary>
