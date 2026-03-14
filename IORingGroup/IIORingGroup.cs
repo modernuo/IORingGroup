@@ -115,7 +115,7 @@ public interface IIORingGroup : IDisposable
     /// The socket is created with platform-optimal flags:
     /// - Non-blocking mode
     /// - TCP_NODELAY (Nagle disabled)
-    /// - SO_REUSEADDR disabled (exclusive address use)
+    /// - SO_REUSEADDR enabled (allows bind over TIME_WAIT sockets)
     /// - SO_LINGER disabled
     /// On Windows RIO, the socket includes WSA_FLAG_REGISTERED_IO for AcceptEx compatibility.
     /// </remarks>

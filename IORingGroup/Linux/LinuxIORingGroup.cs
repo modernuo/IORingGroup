@@ -429,8 +429,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             return -1;
         }
 
-        // Disable SO_REUSEADDR (exclusive address use)
-        var optval = 0;
+        // Enable SO_REUSEADDR for quick restart (bind over TIME_WAIT sockets)
+        var optval = 1;
         LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_REUSEADDR, (nint)(&optval), sizeof(int));
 
         // Disable TCP_NODELAY (Nagle off)
