@@ -431,10 +431,24 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         while (CompletionQueueCount < waitNr)
         {
-            PollAndExecute(blocking: true);
+            PollAndExecute(timeoutMs: -1);
         }
 
         return submitted;
+    }
+
+    /// <inheritdoc/>
+    public void WaitForCompletion(int timeoutMs)
+    {
+        // Already have completions ready to hand out — don't block.
+        if (CompletionQueueCount > 0)
+        {
+            return;
+        }
+
+        // Block up to timeoutMs for readiness, executing any ready I/O into completions.
+        // Lets the caller sleep instead of busy-polling PeekCompletions.
+        PollAndExecute(timeoutMs);
     }
 
     /// <inheritdoc/>
@@ -442,7 +456,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     public int PeekCompletions(Span<Completion> completions)
     {
         // Poll epoll for ready events and execute I/O
-        PollAndExecute(blocking: false);
+        PollAndExecute(timeoutMs: 0);
 
         // Copy completions to output
         var available = CompletionQueueCount;
@@ -471,12 +485,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// <summary>
     /// Polls epoll for ready events and executes the corresponding I/O operations.
     /// </summary>
-    private void PollAndExecute(bool blocking)
+    /// <param name="timeoutMs">epoll_wait timeout: -1 blocks indefinitely, 0 is non-blocking, &gt;0 waits up to that many milliseconds.</param>
+    private void PollAndExecute(int timeoutMs)
     {
         int eventCount;
         fixed (byte* evPtr = _eventBuffer)
         {
-            eventCount = Syscalls.epoll_wait(_epollFd, (nint)evPtr, _maxEvents, blocking ? -1 : 0);
+            eventCount = Syscalls.epoll_wait(_epollFd, (nint)evPtr, _maxEvents, timeoutMs);
         }
 
         if (eventCount < 0)
