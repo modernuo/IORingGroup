@@ -20,6 +20,7 @@ public sealed partial class IORingBuffer : IDisposable
     private nint _handle;
     private nint _buffer;
     private readonly int _physicalSize;
+    private readonly int _mask; // physicalSize - 1; valid as a wrap mask because size is always a power of 2
     private int _head;  // Read position (0 to physicalSize-1)
     private int _tail;  // Write position (0 to physicalSize-1)
     private bool _disposed;
@@ -102,7 +103,7 @@ public sealed partial class IORingBuffer : IDisposable
     /// <summary>
     /// Creates a new double-mapped circular buffer.
     /// </summary>
-    /// <param name="physicalSize">Physical size in bytes (must be power of 2 and page-aligned).</param>
+    /// <param name="physicalSize">Physical size in bytes. Must be a power of 2 and a multiple of the platform allocation granularity (64 KB on Windows, the page size on Unix).</param>
     /// <returns>A new IORingBuffer instance.</returns>
     public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
 
@@ -122,10 +123,20 @@ public sealed partial class IORingBuffer : IDisposable
             throw new ArgumentException("Size must be a power of 2", nameof(physicalSize));
         }
 
-        var pageSize = Environment.SystemPageSize;
-        if (physicalSize % pageSize != 0)
+        // Windows places the second mapping at an offset of physicalSize and requires both the
+        // base address and the offset to be aligned to the 64 KB allocation granularity, not just
+        // the page size. Unix mappings only need page alignment. physicalSize is already validated
+        // as a power of 2, so on Windows this is effectively a 64 KB minimum-size check.
+        var alignment = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? 65536
+            : Environment.SystemPageSize;
+
+        if (physicalSize % alignment != 0)
         {
-            throw new ArgumentException($"Size must be a multiple of page size ({pageSize})", nameof(physicalSize));
+            throw new ArgumentException(
+                $"Size must be a multiple of the allocation granularity ({alignment} bytes on this platform)",
+                nameof(physicalSize)
+            );
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -151,6 +162,7 @@ public sealed partial class IORingBuffer : IDisposable
         _handle = handle;
         _buffer = buffer;
         _physicalSize = physicalSize;
+        _mask = physicalSize - 1;
         _head = 0;
         _tail = 0;
         IsPooled = isPooled;
@@ -176,7 +188,7 @@ public sealed partial class IORingBuffer : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(count, WritableBytes);
 
-        _tail = (_tail + count) % _physicalSize;
+        _tail = (_tail + count) & _mask;
     }
 
     /// <summary>
@@ -201,7 +213,7 @@ public sealed partial class IORingBuffer : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(count, ReadableBytes);
 
-        _head = (_head + count) % _physicalSize;
+        _head = (_head + count) & _mask;
 
         // NOTE: We intentionally do NOT reset head/tail to 0 when empty.
         // With zero-copy I/O, a recv may already be posted at the current _tail offset.
@@ -221,7 +233,50 @@ public sealed partial class IORingBuffer : IDisposable
 
     #region Windows Implementation
 
+    // VirtualAlloc2 and MapViewOfFile3 (and the MEM_*_PLACEHOLDER flags) are exported from
+    // kernelbase.dll starting with Windows 10 1803 / Windows Server 2019. They are absent on
+    // Windows Server 2012, 2012 R2, and 2016. Resolve availability once so the hot path stays a
+    // single bool check rather than an exception on first call.
+    private static readonly bool UsePlaceholderApi = DetectPlaceholderApi();
+
+    private static bool DetectPlaceholderApi()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return false;
+        }
+
+        if (!NativeLibrary.TryLoad("kernelbase.dll", out var lib))
+        {
+            return false;
+        }
+
+        try
+        {
+            return NativeLibrary.TryGetExport(lib, "VirtualAlloc2", out _)
+                && NativeLibrary.TryGetExport(lib, "MapViewOfFile3", out _);
+        }
+        finally
+        {
+            NativeLibrary.Free(lib);
+        }
+    }
+
+    // Test seam: forces the legacy (pre-1803) or placeholder path regardless of what the OS
+    // exports, so the Server 2012/2016 fallback can be exercised on a modern Windows runner.
+    // null = auto-detect from UsePlaceholderApi (production default). No effect off Windows.
+    internal static bool? ForceLegacyWindowsPath;
+
     private static IORingBuffer CreateWindows(int physicalSize, bool isPooled, int poolIndex)
+    {
+        var useLegacy = ForceLegacyWindowsPath ?? !UsePlaceholderApi;
+        return useLegacy
+            ? CreateWindowsLegacy(physicalSize, isPooled, poolIndex)
+            : CreateWindowsPlaceholder(physicalSize, isPooled, poolIndex);
+    }
+
+    // Modern path (Windows 10 1803 / Server 2019+): the placeholder split is race-free.
+    private static IORingBuffer CreateWindowsPlaceholder(int physicalSize, bool isPooled, int poolIndex)
     {
         // Reserve a region of virtual memory (2x size for double-mapping)
         var region = WindowsNative.VirtualAlloc2(
@@ -313,6 +368,96 @@ public sealed partial class IORingBuffer : IDisposable
         return new IORingBuffer(handle, buffer, physicalSize, isPooled, poolIndex);
     }
 
+    // Legacy path (Windows Server 2012 / 2012 R2 / 2016, or any pre-1803 build) where the
+    // placeholder APIs do not exist. Reserve a 2x hole to locate contiguous address space,
+    // release it, then map the same section into both halves. The window between the release and
+    // the maps is racy: another allocation can steal the hole, so retry a bounded number of times.
+    // Warming the buffer pool at startup on a single thread makes this window effectively
+    // uncontended, so in practice the first attempt succeeds.
+    private static IORingBuffer CreateWindowsLegacy(int physicalSize, bool isPooled, int poolIndex)
+    {
+        // Single pagefile-backed section shared by both views.
+        var handle = WindowsNative.CreateFileMappingW(
+            WindowsNative.InvalidHandleValue,
+            nint.Zero,
+            WindowsNative.PAGE_READWRITE,
+            0,
+            (uint)physicalSize,
+            null
+        );
+
+        if (handle == nint.Zero)
+        {
+            throw new InvalidOperationException($"CreateFileMapping failed: {Marshal.GetLastPInvokeError()}");
+        }
+
+        var buffer = nint.Zero;
+        const int maxAttempts = 100;
+
+        for (var attempt = 0; attempt < maxAttempts && buffer == nint.Zero; attempt++)
+        {
+            // Reserve 2x to locate a contiguous, correctly aligned hole.
+            var region = WindowsNative.VirtualAlloc(
+                nint.Zero,
+                (nuint)((long)physicalSize * 2),
+                WindowsNative.MEM_RESERVE,
+                WindowsNative.PAGE_NOACCESS
+            );
+
+            if (region == nint.Zero)
+            {
+                WindowsNative.CloseHandle(handle);
+                throw new InvalidOperationException($"VirtualAlloc reserve failed: {Marshal.GetLastPInvokeError()}");
+            }
+
+            // Release the reservation so the hole is available to map into.
+            WindowsNative.VirtualFree(region, 0, WindowsNative.MEM_RELEASE);
+
+            // Map the first half at the start of the hole.
+            var view1 = WindowsNative.MapViewOfFileEx(
+                handle,
+                WindowsNative.FILE_MAP_READ | WindowsNative.FILE_MAP_WRITE,
+                0,
+                0,
+                (nuint)physicalSize,
+                region
+            );
+
+            if (view1 == nint.Zero)
+            {
+                continue; // hole was taken between release and map; retry
+            }
+
+            // Map the second half immediately after (same section => same physical pages).
+            var view2 = WindowsNative.MapViewOfFileEx(
+                handle,
+                WindowsNative.FILE_MAP_READ | WindowsNative.FILE_MAP_WRITE,
+                0,
+                0,
+                (nuint)physicalSize,
+                region + physicalSize
+            );
+
+            if (view2 == nint.Zero)
+            {
+                WindowsNative.UnmapViewOfFile(view1);
+                continue; // second half was taken; retry the whole reservation
+            }
+
+            buffer = view1;
+        }
+
+        if (buffer == nint.Zero)
+        {
+            WindowsNative.CloseHandle(handle);
+            throw new InvalidOperationException(
+                $"Failed to reserve a contiguous double-mapped region after {maxAttempts} attempts"
+            );
+        }
+
+        return new IORingBuffer(handle, buffer, physicalSize, isPooled, poolIndex);
+    }
+
     private static partial class WindowsNative
     {
         public const nint InvalidHandleValue = -1;
@@ -324,6 +469,10 @@ public sealed partial class IORingBuffer : IDisposable
         public const uint PAGE_NOACCESS = 0x01;
         public const uint PAGE_READWRITE = 0x04;
 
+        // Access rights for MapViewOfFileEx (FILE_MAP_*, not PAGE_*).
+        public const uint FILE_MAP_WRITE = 0x0002;
+        public const uint FILE_MAP_READ = 0x0004;
+
         [LibraryImport("kernelbase.dll", SetLastError = true)]
         public static partial nint VirtualAlloc2(
             nint process, nint address, ulong size, uint allocationType, uint protect,
@@ -332,6 +481,15 @@ public sealed partial class IORingBuffer : IDisposable
         [LibraryImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static partial bool VirtualFree(nint lpAddress, uint dwSize, uint dwFreeType);
+
+        // Legacy reserve/map primitives for the pre-placeholder fallback. Present on every supported Windows.
+        [LibraryImport("kernel32.dll", SetLastError = true)]
+        public static partial nint VirtualAlloc(nint lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+
+        [LibraryImport("kernel32.dll", SetLastError = true)]
+        public static partial nint MapViewOfFileEx(
+            nint hFileMappingObject, uint dwDesiredAccess,
+            uint dwFileOffsetHigh, uint dwFileOffsetLow, nuint dwNumberOfBytesToMap, nint lpBaseAddress);
 
         [LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
         public static partial nint CreateFileMappingW(
