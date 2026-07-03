@@ -21,6 +21,7 @@ public class Program
         var benchmarkCount = 0;
         var benchmarkConnections = 1;
         var maxConcurrent = 1000; // Default max concurrent connections
+        var pingPong = false;     // Strict request/response (one message in flight)
         nint cpuAffinity = 0;
 
         for (var i = 0; i < args.Length; i++)
@@ -40,6 +41,10 @@ public class Program
             else if ((args[i] == "--connections" || args[i] == "-c") && i + 1 < args.Length)
             {
                 benchmarkConnections = int.Parse(args[++i]);
+            }
+            else if (args[i] == "--pingpong" || args[i] == "-pp")
+            {
+                pingPong = true;
             }
             else if ((args[i] == "--concurrent" || args[i] == "-C") && i + 1 < args.Length)
             {
@@ -79,7 +84,7 @@ public class Program
 
         if (benchmarkCount > 0)
         {
-            await RunBenchmark(host, port, benchmarkCount, benchmarkConnections, maxConcurrent);
+            await RunBenchmark(host, port, benchmarkCount, benchmarkConnections, maxConcurrent, pingPong);
             return;
         }
 
@@ -192,7 +197,7 @@ public class Program
         }
     }
 
-    private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount, int maxConcurrent)
+    private static async Task RunBenchmark(string host, int port, int messagesPerConnection, int connectionCount, int maxConcurrent, bool pingPong = false)
     {
         // Ensure thread pool has enough threads for concurrent connections
         ThreadPool.GetMinThreads(out var minWorker, out var minIO);
@@ -205,6 +210,7 @@ public class Program
         Console.WriteLine($"Messages per connection: {messagesPerConnection:N0}");
         Console.WriteLine($"Message size: {_messageSize} bytes");
         Console.WriteLine($"Max concurrent: {maxConcurrent}");
+        Console.WriteLine($"Mode: {(pingPong ? "ping-pong (one message in flight)" : "pipelined")}");
         Console.WriteLine($"Thread pool min: {needed} workers");
         Console.WriteLine();
 
@@ -222,7 +228,9 @@ public class Program
                 await semaphore.WaitAsync();
                 try
                 {
-                    return await RunBenchmarkConnection(host, port, messagesPerConnection, connId);
+                    return pingPong
+                        ? await RunPingPongConnection(host, port, messagesPerConnection, connId)
+                        : await RunBenchmarkConnection(host, port, messagesPerConnection, connId);
                 }
                 finally
                 {
@@ -237,17 +245,32 @@ public class Program
         var totalMessages = results.Sum(r => r.Messages);
         var totalBytes = results.Sum(r => r.Bytes);
         var successfulConnections = results.Count(r => r.Success);
+        // Each message is echoed, so a fully-correct run round-trips
+        // 2 * size bytes per message. Bytes are exact; the message count is
+        // approximate in pipelined mode (TCP coalesces reads), so bytes are the
+        // pass/fail signal.
+        var expectedBytes = (long)connectionCount * messagesPerConnection * _messageSize * 2;
 
         Console.WriteLine();
         Console.WriteLine("=== Benchmark Results ===");
         Console.WriteLine($"Successful connections: {successfulConnections}/{connectionCount}");
-        Console.WriteLine($"Total messages: {totalMessages:N0}");
-        Console.WriteLine($"Total bytes: {totalBytes:N0}");
+        Console.WriteLine($"Total messages: {totalMessages:N0} (approx; pipelined reads coalesce)");
+        Console.WriteLine($"Total bytes: {totalBytes:N0} (expected {expectedBytes:N0})");
         Console.WriteLine($"Total time: {sw.ElapsedMilliseconds:N0} ms");
         if (sw.ElapsedMilliseconds > 0)
         {
             Console.WriteLine($"Rate: {totalMessages * 1000.0 / sw.ElapsedMilliseconds:N0} msg/s");
             Console.WriteLine($"Throughput: {totalBytes * 1000.0 / sw.ElapsedMilliseconds / 1024 / 1024:N2} MB/s");
+        }
+
+        // Fail the run (non-zero exit) if any connection stalled/errored or any
+        // bytes were lost. This is what makes the harness usable as a CI check.
+        if (successfulConnections != connectionCount || totalBytes < expectedBytes)
+        {
+            Console.Error.WriteLine(
+                $"BENCHMARK FAILED: {successfulConnections}/{connectionCount} connections succeeded, " +
+                $"{totalBytes}/{expectedBytes} bytes echoed.");
+            Environment.ExitCode = 1;
         }
     }
 
@@ -270,6 +293,13 @@ public class Program
 
                 using var stream = client.GetStream();
 
+                // Overall timeout: a healthy echo of `messageCount` small messages
+                // completes in well under this. A stalled/dropped echo (e.g. a
+                // stranded server-side recv) trips it and marks the connection failed
+                // instead of hanging the whole run.
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                var ct = cts.Token;
+
                 // Build a message of the configured size
                 var data = new byte[_messageSize];
                 var header = Encoding.UTF8.GetBytes($"C{connectionId:D4}|");
@@ -290,7 +320,7 @@ public class Program
                 {
                     for (var i = 0; i < messageCount; i++)
                     {
-                        await stream.WriteAsync(data);
+                        await stream.WriteAsync(data, ct);
                         Interlocked.Add(ref bytesSent, data.Length);
                     }
                     // Signal end of sending by shutting down the send side
@@ -306,7 +336,7 @@ public class Program
 
                     while (totalReceived < totalExpected)
                     {
-                        var bytesRead = await stream.ReadAsync(buffer);
+                        var bytesRead = await stream.ReadAsync(buffer, ct);
                         if (bytesRead == 0)
                         {
                             break;  // Connection closed
@@ -329,6 +359,83 @@ public class Program
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused && retry < maxRetries - 1)
             {
                 // Retry with exponential backoff
+                await Task.Delay(10 * (1 << retry));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Connection {connectionId} error: {ex.Message}");
+                return result;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Strict request/response: send one message, read the full echo back, repeat.
+    /// Unlike the pipelined path this keeps only one message in flight, so the server
+    /// spends most of its time with a recv armed and no inbound data pending — the
+    /// exact condition that exposes readiness-bridge bugs (e.g. an epoll recv that
+    /// gets stranded when a send is armed on the same fd).
+    /// </summary>
+    private static async Task<BenchmarkResult> RunPingPongConnection(string host, int port, int messageCount, int connectionId)
+    {
+        var result = new BenchmarkResult();
+        const int maxRetries = 5;
+
+        for (var retry = 0; retry < maxRetries; retry++)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                client.NoDelay = true;
+                client.LingerState = new LingerOption(true, 0);
+                await client.ConnectAsync(host, port);
+
+                using var stream = client.GetStream();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                var ct = cts.Token;
+
+                var data = new byte[_messageSize];
+                var header = Encoding.UTF8.GetBytes($"C{connectionId:D4}|");
+                header.AsSpan().CopyTo(data);
+                for (var j = header.Length; j < data.Length; j++)
+                {
+                    data[j] = (byte)('A' + (j % 26));
+                }
+
+                var buffer = new byte[_messageSize];
+                long messages = 0;
+                long bytes = 0;
+
+                for (var i = 0; i < messageCount; i++)
+                {
+                    await stream.WriteAsync(data, ct);
+                    bytes += data.Length;
+
+                    // Read the full echo back before sending the next message.
+                    var received = 0;
+                    while (received < data.Length)
+                    {
+                        var n = await stream.ReadAsync(buffer.AsMemory(received), ct);
+                        if (n == 0)
+                        {
+                            throw new IOException($"Server closed after {received}/{data.Length} echo bytes on message {i}");
+                        }
+                        received += n;
+                    }
+
+                    bytes += received;
+                    messages++;
+                }
+
+                result.Bytes = bytes;
+                result.Messages = messages;
+                result.Success = true;
+                return result;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused && retry < maxRetries - 1)
+            {
                 await Task.Delay(10 * (1 << retry));
             }
             catch (Exception ex)

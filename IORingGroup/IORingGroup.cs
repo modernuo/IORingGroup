@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace System.Network;
@@ -53,14 +52,33 @@ public static class IORingGroup
     private static IIORingGroup CreateWindowsRing(int maxConnections) =>
         new Windows.WindowsManagedRIOGroup(maxConnections);
 
-    private static IORing.LinuxIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
+    private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
     {
         if (IORing.LinuxIORingGroup.IsAvailable())
         {
             return new IORing.LinuxIORingGroup(queueSize, maxConnections);
         }
 
-        throw new InvalidOperationException("io_uring is not available (blocked by seccomp or kernel too old)");
+        // Fallback to epoll when io_uring is unavailable
+        return new EPoll.LinuxEpollGroup(queueSize, maxConnections);
+    }
+
+    /// <summary>
+    /// Creates an epoll-based IIORingGroup for Linux explicitly.
+    /// Useful for testing or when io_uring should be bypassed.
+    /// </summary>
+    /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
+    /// <param name="maxConnections">Maximum concurrent connections.</param>
+    /// <returns>Epoll-based IIORingGroup implementation.</returns>
+    /// <exception cref="PlatformNotSupportedException">Thrown if not running on Linux.</exception>
+    public static IIORingGroup CreateLinuxEpoll(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            throw new PlatformNotSupportedException("epoll requires Linux");
+        }
+
+        return new EPoll.LinuxEpollGroup(queueSize, maxConnections);
     }
 
     private static Darwin.DarwinIORingGroup CreateDarwinRing(int queueSize, int maxConnections) =>

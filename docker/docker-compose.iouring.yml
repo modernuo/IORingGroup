@@ -1,0 +1,7 @@
+# Overlay for the io_uring backend. The default Docker seccomp profile blocks
+# io_uring_setup/io_uring_enter, so the server must run unconfined for the
+# io_uring path to be exercised (otherwise it falls back to epoll).
+services:
+  server:
+    security_opt:
+      - seccomp=unconfined

@@ -1,0 +1,55 @@
+# Echo integration test harness for the Linux backends.
+#
+# By default the client runs in ping-pong mode (one message in flight, waits for
+# each full echo before sending the next). That is the correctness regression
+# test: it keeps the server sitting with a recv armed and no inbound data, which
+# is what exposes readiness-bridge bugs. A stalled/dropped echo shows up as a
+# failed connection and the client exits non-zero.
+#
+# The server backend is selected via BACKEND_FLAG (default: --epoll).
+#
+# Usage:
+#   epoll correctness (default):
+#     docker compose -f docker/docker-compose.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+#
+#   pipelined throughput (add the overlay):
+#     docker compose -f docker/docker-compose.yml -f docker/docker-compose.pipelined.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+#
+#   io_uring backend (needs io_uring syscalls, which the default Docker seccomp
+#   profile blocks — run unconfined via the overlay):
+#     BACKEND_FLAG=--ioring docker compose -f docker/docker-compose.yml \
+#       -f docker/docker-compose.iouring.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+name: ioring-echo-test
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["/app/server/TestServer", "${BACKEND_FLAG:---epoll}", "--quiet"]
+    networks: [ionet]
+    expose: ["5000"]
+
+  client:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command:
+      - "/app/client/TestClient"
+      - "--host"
+      - "server"
+      - "--port"
+      - "5000"
+      - "--benchmark"
+      - "${MESSAGES:-1000}"
+      - "--connections"
+      - "${CONNECTIONS:-50}"
+      - "--pingpong"
+    depends_on: [server]
+    networks: [ionet]
+
+networks:
+  ionet:
