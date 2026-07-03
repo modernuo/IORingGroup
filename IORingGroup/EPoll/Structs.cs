@@ -1,30 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Runtime.InteropServices;
-
 namespace System.Network.EPoll;
 
-/// <summary>
-/// epoll_event for x64 Linux — 12 bytes, packed to match kernel __attribute__((packed)).
-/// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 12)]
-internal struct epoll_event_packed
-{
-    [FieldOffset(0)] public uint events;
-    [FieldOffset(4)] public long data;
-}
-
-/// <summary>
-/// epoll_event for ARM64 Linux — 16 bytes, natural alignment.
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct epoll_event_aligned
-{
-    public uint events;
-    public uint _padding;
-    public long data;
-}
+// The kernel epoll_event layout (12 bytes packed on x86_64, 16 bytes aligned
+// elsewhere) is handled directly via raw byte offsets in LinuxEpollGroup — see
+// EpollCtlMod and PollAndExecute — so no managed struct is defined for it.
 
 /// <summary>
 /// epoll event flags.

@@ -396,7 +396,20 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
         var eventCount = Darwin.kevent(_kqueueFd, null, 0, _resultEvents, _resultEvents.Length, timeoutPtr);
 
-        if (eventCount <= 0)
+        if (eventCount < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno == EINTR)
+            {
+                // Interrupted by a signal — the caller re-polls.
+                return;
+            }
+
+            // A hard error would otherwise spin SubmitAndWait's wait loop forever.
+            throw new InvalidOperationException($"kevent() wait failed: errno {errno}");
+        }
+
+        if (eventCount == 0)
         {
             return;
         }
@@ -847,6 +860,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private const int EAGAIN = 35;
     private const int EWOULDBLOCK = EAGAIN;
     private const int EINPROGRESS = 36;
+    private const int EINTR = 4;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct sockaddr_in

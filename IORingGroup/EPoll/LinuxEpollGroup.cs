@@ -33,8 +33,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     private readonly PendingOp[] _pendingSends;
     private readonly bool[] _hasRecv;
     private readonly bool[] _hasSend;
-    private readonly bool[] _recvSubmitted;    // whether epoll is armed for this recv
-    private readonly bool[] _sendSubmitted;    // whether epoll is armed for this send
+
+    // Recv/send interest bits (EPOLLIN | EPOLLOUT) currently armed in epoll for
+    // each connection, or 0 if disarmed. Recv and send share a single fd, so a
+    // single EPOLL_CTL_MOD sets the combined mask. EPOLLONESHOT disarms the whole
+    // fd on any event, so this is reset to 0 the moment an event is delivered and
+    // Submit() re-arms whatever direction is still pending.
+    private readonly uint[] _armedIo;
 
     // Accept operations (dictionary keyed by listener FD — typically 1-2 listeners)
     private readonly Dictionary<int, PendingOp> _pendingAccepts = new();
@@ -97,8 +102,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         _pendingSends = new PendingOp[maxConnections];
         _hasRecv = new bool[maxConnections];
         _hasSend = new bool[maxConnections];
-        _recvSubmitted = new bool[maxConnections];
-        _sendSubmitted = new bool[maxConnections];
+        _armedIo = new uint[maxConnections];
 
         // Initialize free stack (all slots available, lowest first for pop order)
         for (var i = 0; i < maxConnections; i++)
@@ -134,12 +138,18 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             var pendingCount = 0;
             for (var i = 0; i < _maxConnections; i++)
             {
-                if (_hasRecv[i] && !_recvSubmitted[i])
+                uint want = 0;
+                if (_hasRecv[i])
                 {
-                    pendingCount++;
+                    want |= (uint)epoll_events.EPOLLIN;
                 }
 
-                if (_hasSend[i] && !_sendSubmitted[i])
+                if (_hasSend[i])
+                {
+                    want |= (uint)epoll_events.EPOLLOUT;
+                }
+
+                if (want != 0 && want != _armedIo[i])
                 {
                     pendingCount++;
                 }
@@ -245,7 +255,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         UserData = userData
                     };
                     _hasSend[connId] = true;
-                    _sendSubmitted[connId] = false;
                 }
                 else
                 {
@@ -278,13 +287,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             if (_hasRecv[i] && _pendingRecvs[i].UserData == targetUserData)
             {
                 _hasRecv[i] = false;
-                _recvSubmitted[i] = false;
             }
 
             if (_hasSend[i] && _pendingSends[i].UserData == targetUserData)
             {
                 _hasSend[i] = false;
-                _sendSubmitted[i] = false;
             }
         }
 
@@ -329,7 +336,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasSend[connId] = true;
-        _sendSubmitted[connId] = false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -345,7 +351,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasRecv[connId] = true;
-        _recvSubmitted[connId] = false;
     }
 
     // =============================================================================
@@ -357,48 +362,42 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     {
         var submitted = 0;
 
-        // Iterate connections for un-submitted pending recv or send
+        // Arm each connection for the full set of directions it currently wants.
+        // Recv and send share one fd, so we always MOD the combined mask — arming
+        // one direction must never drop interest in the other. EPOLLONESHOT means
+        // the kernel disarms the fd after a single event, so _armedIo is reset to 0
+        // on delivery and the still-pending direction is re-armed here next time.
         for (var i = 0; i < _maxConnections; i++)
         {
-            var needsRecv = _hasRecv[i] && !_recvSubmitted[i];
-            var needsSend = _hasSend[i] && !_sendSubmitted[i];
-
-            if (!needsRecv && !needsSend)
-            {
-                continue;
-            }
-
             var fd = _connIdToFd[i];
             if (fd < 0)
             {
                 continue;
             }
 
-            // Build epoll event mask
-            var events = (uint)(epoll_events.EPOLLET | epoll_events.EPOLLONESHOT | epoll_events.EPOLLRDHUP);
-            if (needsRecv)
+            uint want = 0;
+            if (_hasRecv[i])
             {
-                events |= (uint)epoll_events.EPOLLIN;
+                want |= (uint)epoll_events.EPOLLIN;
             }
 
-            if (needsSend)
+            if (_hasSend[i])
             {
-                events |= (uint)epoll_events.EPOLLOUT;
+                want |= (uint)epoll_events.EPOLLOUT;
             }
+
+            // Nothing pending, or already armed for exactly these directions.
+            if (want == 0 || want == _armedIo[i])
+            {
+                continue;
+            }
+
+            var events = want | (uint)(epoll_events.EPOLLET | epoll_events.EPOLLONESHOT | epoll_events.EPOLLRDHUP);
 
             // Arm epoll with connId as data
             if (EpollCtlMod(fd, events, (long)i))
             {
-                if (needsRecv)
-                {
-                    _recvSubmitted[i] = true;
-                }
-
-                if (needsSend)
-                {
-                    _sendSubmitted[i] = true;
-                }
-
+                _armedIo[i] = want;
                 submitted++;
             }
         }
@@ -480,7 +479,22 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             eventCount = Syscalls.epoll_wait(_epollFd, (nint)evPtr, _maxEvents, blocking ? -1 : 0);
         }
 
-        if (eventCount <= 0)
+        if (eventCount < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno == EINTR)
+            {
+                // Interrupted by a signal — the caller re-polls. Returning here
+                // (rather than looping internally) keeps SubmitAndWait responsive.
+                return;
+            }
+
+            // A hard error (e.g. EBADF) would otherwise spin SubmitAndWait's wait
+            // loop forever. Surface it instead of silently swallowing it.
+            throw new InvalidOperationException($"epoll_wait() failed: errno {errno}");
+        }
+
+        if (eventCount == 0)
         {
             return;
         }
@@ -526,6 +540,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         continue;
                     }
 
+                    // EPOLLONESHOT disarmed the whole fd on this delivery, so clear
+                    // the armed mask for both directions. Whatever remains pending
+                    // (after the handlers below run) is re-armed by the next Submit().
+                    _armedIo[connId] = 0;
+
                     // Handle error conditions
                     if ((events & ((uint)epoll_events.EPOLLERR | (uint)epoll_events.EPOLLHUP)) != 0)
                     {
@@ -535,7 +554,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         {
                             var recvUserData = _pendingRecvs[connId].UserData;
                             _hasRecv[connId] = false;
-                            _recvSubmitted[connId] = false;
                             AddCompletion(recvUserData, errorResult);
                         }
 
@@ -543,7 +561,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         {
                             var sendUserData = _pendingSends[connId].UserData;
                             _hasSend[connId] = false;
-                            _sendSubmitted[connId] = false;
                             AddCompletion(sendUserData, errorResult);
                         }
 
@@ -553,14 +570,12 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                     // Handle EPOLLIN (recv ready)
                     if ((events & (uint)epoll_events.EPOLLIN) != 0 && _hasRecv[connId])
                     {
-                        _recvSubmitted[connId] = false;
                         ExecuteRecv(connId);
                     }
 
                     // Handle EPOLLOUT (send ready or connect complete)
                     if ((events & (uint)epoll_events.EPOLLOUT) != 0 && _hasSend[connId])
                     {
-                        _sendSubmitted[connId] = false;
                         if (_pendingSends[connId].Opcode == (byte)IORingOp.Connect)
                         {
                             ExecuteConnectComplete(connId);
@@ -577,7 +592,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                     {
                         var recvUserData = _pendingRecvs[connId].UserData;
                         _hasRecv[connId] = false;
-                        _recvSubmitted[connId] = false;
                         AddCompletion(recvUserData, 0);
                     }
                 }
@@ -618,18 +632,17 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // No data ready yet — keep pending (don't clear _hasRecv), return
+                // No data ready yet — keep pending (don't clear _hasRecv), return.
+                // _armedIo was cleared in PollAndExecute, so Submit() re-arms EPOLLIN.
                 return;
             }
 
             _hasRecv[connId] = false;
-            _recvSubmitted[connId] = false;
             AddCompletion(op.UserData, -errno);
         }
         else
         {
             _hasRecv[connId] = false;
-            _recvSubmitted[connId] = false;
             AddCompletion(op.UserData, (int)result);
         }
     }
@@ -644,18 +657,17 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // Buffer full — keep pending, return
+                // Buffer full — keep pending, return.
+                // _armedIo was cleared in PollAndExecute, so Submit() re-arms EPOLLOUT.
                 return;
             }
 
             _hasSend[connId] = false;
-            _sendSubmitted[connId] = false;
             AddCompletion(op.UserData, -errno);
         }
         else
         {
             _hasSend[connId] = false;
-            _sendSubmitted[connId] = false;
             AddCompletion(op.UserData, (int)result);
         }
     }
@@ -668,7 +680,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         Syscalls.getsockopt(op.Fd, SOL_SOCKET, SO_ERROR, (nint)(&error), ref len);
 
         _hasSend[connId] = false;
-        _sendSubmitted[connId] = false;
         AddCompletion(op.UserData, error == 0 ? 0 : -error);
     }
 
@@ -782,8 +793,10 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             return -1;
         }
 
-        // Disable SO_REUSEADDR (exclusive address use)
-        var optval = 0;
+        // Enable SO_REUSEADDR for quick restart (bind over TIME_WAIT sockets).
+        // Matches the io_uring and Darwin listeners; without it a fast restart
+        // fails to bind while the previous port is still in TIME_WAIT.
+        var optval = 1;
         Syscalls.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (nint)(&optval), sizeof(int));
 
         // Enable TCP_NODELAY (disable Nagle)
@@ -863,6 +876,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Pop from free stack
         var connId = _freeSlots[--_freeSlotCount];
         _connIdToFd[connId] = fd;
+        _armedIo[connId] = 0;
 
         // Add to epoll with EPOLLET|EPOLLONESHOT but no initial event mask
         // This registers the fd; actual interest will be set by Submit()
@@ -902,8 +916,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Clear pending ops
         _hasRecv[connId] = false;
         _hasSend[connId] = false;
-        _recvSubmitted[connId] = false;
-        _sendSubmitted[connId] = false;
+        _armedIo[connId] = 0;
 
         // Return slot to free stack
         _connIdToFd[connId] = -1;
@@ -1065,8 +1078,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         {
             _hasRecv[i] = false;
             _hasSend[i] = false;
-            _recvSubmitted[i] = false;
-            _sendSubmitted[i] = false;
+            _armedIo[i] = 0;
         }
 
         _pendingAccepts.Clear();
