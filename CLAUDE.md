@@ -18,7 +18,15 @@ dotnet test IORingGroup.Tests/IORingGroup.Tests.csproj --filter "FullyQualifiedN
 dotnet run --project TestServer -- --port 2594 --mode ioring
 # Run benchmark client
 dotnet run --project TestClient -- --host 127.0.0.1 --port 2594
+
+# Linux backend echo integration test (epoll correctness, in Docker)
+docker compose -f docker/docker-compose.yml up --build \
+  --abort-on-container-exit --exit-code-from client
 ```
+
+Backends that can't run on the dev host are exercised in containers — see
+`docker/README.md` for the epoll and io_uring echo harness (ping-pong
+correctness + pipelined throughput). macOS/kqueue is tested on real hardware.
 
 ## Project Overview
 
@@ -31,6 +39,7 @@ IORingGroup is a cross-platform zero-copy async socket I/O library for .NET 10+ 
 **Platform backends** (each implements `IIORingGroup`):
 - `Windows/WindowsManagedRIOGroup` — Windows Registered I/O, pure C#
 - `Linux/LinuxIORingGroup` — Linux io_uring via direct syscalls
+- `EPoll/LinuxEpollGroup` — Linux epoll fallback (readiness-based, bridges to completion model). Used automatically when io_uring is unavailable (old kernels, seccomp-blocked syscalls); `IORingGroup.CreateLinuxEpoll()` selects it explicitly.
 - `Darwin/DarwinIORingGroup` — macOS/BSD kqueue (readiness-based, bridges to completion model)
 
 **Core types**:

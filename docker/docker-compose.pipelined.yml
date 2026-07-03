@@ -1,0 +1,14 @@
+# Overlay: run the client in pipelined (flood) mode for throughput numbers
+# instead of the default ping-pong correctness check.
+services:
+  client:
+    command:
+      - "/app/client/TestClient"
+      - "--host"
+      - "server"
+      - "--port"
+      - "5000"
+      - "--benchmark"
+      - "${MESSAGES:-5000}"
+      - "--connections"
+      - "${CONNECTIONS:-50}"
