@@ -21,7 +21,8 @@ public sealed partial class IORingBuffer : IDisposable
     private nint _buffer;
     private readonly int _physicalSize;
     private readonly int _mask; // physicalSize - 1; valid as a wrap mask because size is always a power of 2
-    private int _head;  // Read position (0 to physicalSize-1)
+    private int _head;  // Reclaim position - advances on I/O completion (0 to physicalSize-1)
+    private int _sent;  // Send position - advances when handed to the transport
     private int _tail;  // Write position (0 to physicalSize-1)
     private bool _disposed;
 
@@ -88,6 +89,48 @@ public sealed partial class IORingBuffer : IDisposable
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => _head;
+    }
+
+    /// <summary>
+    /// Gets the offset of the first byte not yet handed to the transport.
+    /// </summary>
+    /// <remarks>
+    /// Sends post from here so several can be in flight; <see cref="ReadOffset"/> is the reclaim
+    /// point and advances only on completion, keeping in-flight bytes safe from overwrite. Required
+    /// for zero-copy I/O, where the transport may re-read this memory to retransmit.
+    /// </remarks>
+    public int SendOffset
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _sent;
+    }
+
+    /// <summary>
+    /// Gets the number of bytes queued but not yet handed to the transport.
+    /// </summary>
+    public int SendableBytes
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            var sent = _sent;
+            var tail = _tail;
+            return tail >= sent ? tail - sent : _physicalSize - sent + tail;
+        }
+    }
+
+    /// <summary>
+    /// Gets the number of bytes handed to the transport but not yet completed.
+    /// </summary>
+    public int InFlightBytes
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            var head = _head;
+            var sent = _sent;
+            return sent >= head ? sent - head : _physicalSize - head + sent;
+        }
     }
 
     /// <summary>
@@ -164,6 +207,7 @@ public sealed partial class IORingBuffer : IDisposable
         _physicalSize = physicalSize;
         _mask = physicalSize - 1;
         _head = 0;
+        _sent = 0;
         _tail = 0;
         IsPooled = isPooled;
         PoolIndex = poolIndex;
@@ -213,6 +257,13 @@ public sealed partial class IORingBuffer : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(count, ReadableBytes);
 
+        // Reclaiming past the send cursor would hand the writer space the transport is still
+        // reading from. On the recv path _sent tracks _head so this is a no-op.
+        if (count > InFlightBytes)
+        {
+            _sent = (_head + count) & _mask;
+        }
+
         _head = (_head + count) & _mask;
 
         // NOTE: We intentionally do NOT reset head/tail to 0 when empty.
@@ -228,7 +279,41 @@ public sealed partial class IORingBuffer : IDisposable
     public void Reset()
     {
         _head = 0;
+        _sent = 0;
         _tail = 0;
+    }
+
+    /// <summary>
+    /// Reclaims a partially completed send, rewinding the send cursor so the bytes the transport
+    /// did not accept become sendable again.
+    /// </summary>
+    /// <param name="sent">Bytes the transport actually accepted.</param>
+    /// <remarks>
+    /// Only valid when nothing else is in flight; sends posted beyond the gap cannot be repaired in
+    /// order. Routine on send() semantics (epoll, io_uring, kqueue), which is why this is a normal
+    /// path rather than a fatal one.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CommitShortSend(int sent)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(sent);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(sent, InFlightBytes);
+
+        _head = (_head + sent) & _mask;
+        _sent = _head;
+    }
+
+    /// <summary>
+    /// Advances the send position after handing <paramref name="count"/> bytes to the transport.
+    /// The bytes stay unreclaimed until the matching completion calls <see cref="CommitRead"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CommitSend(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, SendableBytes);
+
+        _sent = (_sent + count) & _mask;
     }
 
     #region Windows Implementation

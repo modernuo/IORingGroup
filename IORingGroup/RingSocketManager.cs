@@ -200,6 +200,7 @@ public sealed class RingSocketManager : IDisposable
         }
 
         _maxSockets = maxSockets;
+        MaxOutstandingSendsPerSocket = Math.Max(1, ring.MaxOutstandingSendsPerSocket);
         _sockets = new RingSocket?[maxSockets];
         _generations = new ushort[maxSockets];
         _completions = new Completion[maxSockets];
@@ -513,28 +514,42 @@ public sealed class RingSocketManager : IDisposable
         socket.RecvPending = true;
     }
 
+    /// <summary>
+    /// Maximum sends in flight per socket, taken from the ring so it can never exceed what the
+    /// platform reserved at request-queue creation.
+    /// </summary>
+    public int MaxOutstandingSendsPerSocket { get; }
+
     private void PostSend(RingSocket socket)
     {
-        if (socket.SendPending || !socket.Connected)
+        if (!socket.Connected)
         {
             return;
         }
 
         var sendBuffer = socket.SendBuffer;
-        var readLength = sendBuffer.ReadableBytes;
-        if (readLength == 0)
-        {
-            return;
-        }
 
-        _ring.PrepareSendBuffer(
-            socket.ConnectionId,
-            sendBuffer.BufferId,
-            sendBuffer.ReadOffset,
-            readLength,
-            IORingUserData.Encode(IORingUserData.OpSend, socket.Id, socket.Generation)
-        );
-        socket.SendPending = true;
+        // Drain everything queued, up to the outstanding limit. Posting from SendOffset rather than
+        // ReadOffset allows a second send while the first is still outstanding.
+        while (socket.SendsInFlight < MaxOutstandingSendsPerSocket)
+        {
+            var sendLength = sendBuffer.SendableBytes;
+            if (sendLength == 0)
+            {
+                return;
+            }
+
+            _ring.PrepareSendBuffer(
+                socket.ConnectionId,
+                sendBuffer.BufferId,
+                sendBuffer.SendOffset,
+                sendLength,
+                IORingUserData.Encode(IORingUserData.OpSend, socket.Id, socket.Generation)
+            );
+
+            sendBuffer.CommitSend(sendLength);
+            socket.PushInFlight(sendLength);
+        }
     }
 
     /// <summary>
@@ -621,7 +636,7 @@ public sealed class RingSocketManager : IDisposable
 
     private int HandleSendCompletion(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
     {
-        socket.SendPending = false;
+        var posted = socket.SendsInFlight > 0 ? socket.PopInFlight() : 0;
 
         if (result <= 0)
         {
@@ -641,10 +656,47 @@ public sealed class RingSocketManager : IDisposable
             return 0;
         }
 
+        // Short send: routine on send() semantics, absent on RIO. Recoverable only while nothing
+        // else is outstanding; sends already posted beyond the gap cannot be repaired in order, and
+        // a corrupted stream is worse than a dropped connection.
+        if (result != posted)
+        {
+            if (socket.SendsInFlight > 0)
+            {
+                socket.Disconnect();
+
+                if (socket.CheckDisconnect())
+                {
+                    QueueForDisconnect(socket);
+                }
+
+                return 0;
+            }
+
+            socket.SendBuffer.CommitShortSend(result);
+
+            if (socket is { Connected: true, SendBuffer.SendableBytes: > 0 })
+            {
+                PostSend(socket);
+            }
+
+            if (socket.CheckDisconnect())
+            {
+                QueueForDisconnect(socket);
+            }
+            else
+            {
+                TrySendFinForPendingDisconnect(socket);
+            }
+
+            return eventIndex < events.Length ? EmitSent(socket, result, events, eventIndex) : 0;
+        }
+
         socket.SendBuffer.CommitRead(result);
 
-        // Continue sending if more data (even if DisconnectPending - drain the buffer)
-        if (socket is { Connected: true, SendBuffer.ReadableBytes: > 0 })
+        // Continue sending if more data (even if DisconnectPending - drain the buffer).
+        // SendableBytes, not ReadableBytes: the latter now also counts bytes still in flight.
+        if (socket is { Connected: true, SendBuffer.SendableBytes: > 0 })
         {
             PostSend(socket);
         }
@@ -665,6 +717,12 @@ public sealed class RingSocketManager : IDisposable
         }
 
         return 0;
+    }
+
+    private static int EmitSent(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
+    {
+        events[eventIndex] = RingSocketEvent.Sent(socket, result);
+        return 1;
     }
 
     private void ProcessDisconnectQueue(Span<RingSocketEvent> events, ref int eventCount)
