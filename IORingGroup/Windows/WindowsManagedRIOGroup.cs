@@ -64,8 +64,18 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         public uint Flags;
     }
 
-    // RIO: 1 outstanding op per direction (recv/send) per socket
-    private const uint RIO_OUTSTANDING_PER_SOCKET = 1;
+    // RIO: outstanding recv ops per socket. One is enough - a new recv is posted on completion.
+    private const uint RIO_OUTSTANDING_RECV_PER_SOCKET = 1;
+
+    // Ceiling on configured sends-in-flight. RIO reserves per-request-queue resources from
+    // non-paged pool at creation, so an unbounded value fails socket creation under load rather
+    // than at startup.
+    public const int MaxConfigurableOutstandingSends = 64;
+
+    private readonly uint _outstandingSendsPerSocket;
+
+    /// <inheritdoc/>
+    public int MaxOutstandingSendsPerSocket => (int)_outstandingSendsPerSocket;
 
     // =========================================================================
     // Fields
@@ -126,9 +136,13 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // Constructor
     // =========================================================================
 
-    public WindowsManagedRIOGroup(int maxConnections)
+    public WindowsManagedRIOGroup(int maxConnections, int maxOutstandingSends = 1)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxOutstandingSends, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxOutstandingSends, MaxConfigurableOutstandingSends);
+
+        _outstandingSendsPerSocket = (uint)maxOutstandingSends;
 
         // Step 1: Initialize WinSock and load RIO function table
         _rio = LoadRIOFunctions();
@@ -137,7 +151,10 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             throw new InvalidOperationException("Failed to load RIO function pointers");
         }
 
-        // Step 2: Compute queue sizes
+        // Step 2: Compute queue sizes.
+        // Not scaled by the outstanding-send limit: these are user-space staging rings drained each
+        // loop iteration, and DequeueRioCompletions back-pressures on them. Only the RIO completion
+        // queue below must hold everything outstanding, since it corrupts rather than back-pressures.
         var mc = (uint)maxConnections;
         var queueSize = BitOperations.RoundUpToPowerOf2(mc * 2);
 
@@ -181,7 +198,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             throw new InvalidOperationException("Failed to create completion notification event");
         }
 
-        var rioCqSize = mc * 2;
+        // Must cover every socket holding its full complement of recv + send ops: RIO corrupts a
+        // full completion queue (RIO_CORRUPT_CQ) rather than back-pressuring.
+        var rioCqSize = mc * (RIO_OUTSTANDING_RECV_PER_SOCKET + _outstandingSendsPerSocket);
         if (rioCqSize < queueSize)
         {
             rioCqSize = queueSize;
@@ -781,8 +800,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         WSASetLastError(0);
         conn->RequestQueue = _rio.RIOCreateRequestQueue(
             socket,
-            RIO_OUTSTANDING_PER_SOCKET, 1,  // maxRecv, maxRecvBuf
-            RIO_OUTSTANDING_PER_SOCKET, 1,  // maxSend, maxSendBuf
+            RIO_OUTSTANDING_RECV_PER_SOCKET, 1,  // maxRecv, maxRecvBuf
+            _outstandingSendsPerSocket, 1,       // maxSend, maxSendBuf
             _rioCq, _rioCq,                 // recvCq, sendCq
             (void*)slot               // context
         );

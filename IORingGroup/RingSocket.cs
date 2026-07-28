@@ -67,9 +67,41 @@ public sealed class RingSocket
     internal bool RecvPending { get; set; }
 
     /// <summary>
-    /// Gets whether a send operation is currently in-flight.
+    /// Gets whether any send operation is currently in-flight.
     /// </summary>
-    internal bool SendPending { get; set; }
+    internal bool SendPending => SendsInFlight > 0;
+
+    /// <summary>
+    /// Number of sends handed to the transport but not yet completed.
+    /// </summary>
+    /// <remarks>
+    /// Capped by <see cref="RingSocketManager.MaxOutstandingSendsPerSocket"/>. Exceeding 1 matters
+    /// on RIO only, where completions are ACK-bound and gating on them would cap a connection at
+    /// one send per round trip.
+    /// </remarks>
+    internal int SendsInFlight { get; private set; }
+
+    // Posted lengths, oldest first. Completions on a request queue arrive in submission order, so
+    // each completion reclaims the length at the head.
+    private readonly int[] _inFlightLengths;
+    private int _inFlightHead;
+
+    /// <summary>Records a posted send of <paramref name="length"/> bytes.</summary>
+    internal void PushInFlight(int length)
+    {
+        _inFlightLengths[(_inFlightHead + SendsInFlight) % _inFlightLengths.Length] = length;
+        SendsInFlight++;
+    }
+
+    /// <summary>Removes and returns the oldest posted send length.</summary>
+    internal int PopInFlight()
+    {
+        var length = _inFlightLengths[_inFlightHead];
+        _inFlightHead = (_inFlightHead + 1) % _inFlightLengths.Length;
+        SendsInFlight--;
+        return length;
+    }
+
 
     /// <summary>
     /// Gets whether a disconnect has been requested.
@@ -121,6 +153,7 @@ public sealed class RingSocket
         RecvBuffer = recvBuffer;
         SendBuffer = sendBuffer;
         Connected = true;
+        _inFlightLengths = new int[manager.MaxOutstandingSendsPerSocket];
     }
 
     /// <summary>

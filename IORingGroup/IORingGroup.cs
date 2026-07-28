@@ -27,12 +27,20 @@ public static class IORingGroup
     /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 2).</param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
-    public static IIORingGroup Create(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
+    public static IIORingGroup Create(
+        int queueSize = DefaultQueueSize,
+        int maxConnections = DefaultMaxConnections,
+        int maxOutstandingSends = 1
+    )
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return CreateWindowsRing(maxConnections);
+            return CreateWindowsRing(maxConnections, maxOutstandingSends);
         }
+
+        // Other backends ignore maxOutstandingSends and report 1 via MaxOutstandingSendsPerSocket:
+        // they complete sends on copy, so extra sends in flight gain nothing and cost ordering
+        // guarantees (io_uring) or correctness (epoll/kqueue hold one pending send per connection).
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
@@ -49,8 +57,8 @@ public static class IORingGroup
             $"IORingGroup is not supported on platform: {RuntimeInformation.OSDescription}");
     }
 
-    private static IIORingGroup CreateWindowsRing(int maxConnections) =>
-        new Windows.WindowsManagedRIOGroup(maxConnections);
+    private static IIORingGroup CreateWindowsRing(int maxConnections, int maxOutstandingSends) =>
+        new Windows.WindowsManagedRIOGroup(maxConnections, maxOutstandingSends);
 
     private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
     {

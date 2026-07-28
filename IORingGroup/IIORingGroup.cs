@@ -20,6 +20,17 @@ public interface IIORingGroup : IDisposable
     int CompletionQueueCount { get; }
 
     /// <summary>
+    /// Maximum sends in flight per socket. Only RIO exceeds 1.
+    /// </summary>
+    /// <remarks>
+    /// RIO completes sends on acknowledgement, so one at a time caps a connection at one send per
+    /// round trip; its request queue is FIFO, making concurrent sends safe. Other backends complete
+    /// on copy, so they gain nothing: io_uring would need IOSQE_IO_LINK to preserve ordering, and
+    /// epoll/kqueue hold a single pending send per connection.
+    /// </remarks>
+    int MaxOutstandingSendsPerSocket => 1;
+
+    /// <summary>
     /// Queues a poll operation to monitor a file descriptor for events.
     /// </summary>
     /// <param name="fd">File descriptor or socket handle to poll.</param>

@@ -324,6 +324,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // One pending send per connection: this overwrites the slot unconditionally, so a second send
+    // posted before the first completes discards it and wedges the socket. Upheld by
+    // MaxOutstandingSendsPerSocket == 1; raising it requires a real queue here.
     private void PrepareSend(int connId, nint buf, int len, MsgFlags flags, ulong userData)
     {
         _pendingSends[connId] = new PendingOp
