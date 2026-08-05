@@ -62,7 +62,15 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
 
-    private bool _disposed;
+    // Wake eventfd, registered level-triggered in the epoll set. Its counter latches, so a Wake()
+    // landing before the caller blocks makes epoll_wait return immediately instead of losing it.
+    private readonly int _wakeFd = -1;
+
+    // Sentinel epoll data for the wake fd. The high bit is clear so IsAcceptData never matches it,
+    // and it is checked before the connId path, so it cannot collide with a real connection.
+    private const long WakeEventData = long.MaxValue;
+
+    private volatile bool _disposed;
 
     private struct PendingOp
     {
@@ -123,6 +131,31 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         {
             var errno = Marshal.GetLastPInvokeError();
             throw new InvalidOperationException($"epoll_create1() failed: errno {errno}");
+        }
+
+        // Register the wake eventfd. Level-triggered on purpose: the counter stays readable until
+        // drained, so a wake cannot be missed between epoll_wait calls. A failure here is not
+        // fatal — Wake() becomes a no-op and callers fall back to their own timeout.
+        _wakeFd = Syscalls.eventfd(0, EFD_NONBLOCK);
+        if (_wakeFd >= 0)
+        {
+            var evBuf = stackalloc byte[16];
+
+            // Zero explicitly — see EpollCtlMod for why the padding cannot be left to chance.
+            *(ulong*)evBuf = 0;
+            *(ulong*)(evBuf + 8) = 0;
+
+            *(uint*)evBuf = (uint)epoll_events.EPOLLIN;
+            if (_epollEventSize == 12)
+            {
+                *(long*)(evBuf + 4) = WakeEventData;
+            }
+            else
+            {
+                *(long*)(evBuf + 8) = WakeEventData;
+            }
+
+            Syscalls.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_ADD, _wakeFd, (nint)evBuf);
         }
     }
 
@@ -455,6 +488,21 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
+    public void Wake()
+    {
+        if (_disposed || _wakeFd < 0)
+        {
+            return;
+        }
+
+        // The eventfd counter latches, so this cannot be lost if it lands between the caller's
+        // idle check and its epoll_wait. EAGAIN means the counter is already saturated, which
+        // still counts as signalled.
+        ulong one = 1;
+        Syscalls.write(_wakeFd, (nint)(&one), 8);
+    }
+
+    /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int PeekCompletions(Span<Completion> completions)
     {
@@ -535,6 +583,14 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                 else
                 {
                     data = *(long*)(ptr + 8);
+                }
+
+                if (data == WakeEventData)
+                {
+                    // Drain the counter so the level-triggered fd stops reporting ready.
+                    ulong drain;
+                    Syscalls.read(_wakeFd, (nint)(&drain), 8);
+                    continue;
                 }
 
                 if (IsAcceptData(data))
@@ -1112,6 +1168,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         _pendingAccepts.Clear();
         _acceptsSubmitted.Clear();
+
+        // _disposed was set at the top of Dispose, so a concurrent Wake() observes it and returns
+        // before touching this fd.
+        if (_wakeFd >= 0)
+        {
+            Syscalls.close(_wakeFd);
+        }
 
         if (_epollFd >= 0)
         {

@@ -9,6 +9,7 @@ public sealed unsafe partial class LinuxEpollGroup
 {
     // epoll constants
     private const int EPOLL_CLOEXEC = 0x80000;
+    private const int EFD_NONBLOCK = 0x800;
 
     // Socket constants (duplicated from LinuxIORing for backend independence)
     private const int AF_INET = 2;
@@ -74,6 +75,15 @@ public sealed unsafe partial class LinuxEpollGroup
 
         [LibraryImport("libc", SetLastError = true)]
         public static partial int fcntl(int fd, int cmd, int arg);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial int eventfd(uint initval, int flags);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial long read(int fd, nint buf, nuint count);
+
+        [LibraryImport("libc", SetLastError = true)]
+        public static partial long write(int fd, nint buf, nuint count);
     }
 
     [StructLayout(LayoutKind.Sequential)]

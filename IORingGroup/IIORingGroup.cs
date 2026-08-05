@@ -260,4 +260,25 @@ public interface IIORingGroup : IDisposable
     /// This method has zero overhead when not called (under load, the caller skips it).
     /// </remarks>
     void WaitForCompletion(int timeoutMs);
+
+    /// <summary>
+    /// Wakes a thread blocked in <see cref="WaitForCompletion"/>.
+    /// </summary>
+    /// <remarks>
+    /// Thread-safe, idempotent, and sticky: a call that lands between a caller's idle check and
+    /// its <see cref="WaitForCompletion"/> makes that wait return immediately rather than being
+    /// lost. That is what lets a caller decide it is idle and then block, with no lock and no
+    /// risk of a missed wakeup.
+    /// <para>
+    /// Platform implementations:
+    /// <list type="bullet">
+    /// <item>Windows RIO: SetEvent on an auto-reset wake event in the wait set</item>
+    /// <item>Linux io_uring: writes the eventfd already registered with the ring</item>
+    /// <item>Linux epoll: writes a dedicated eventfd registered in the epoll set</item>
+    /// <item>macOS kqueue: triggers an EVFILT_USER event</item>
+    /// </list>
+    /// </para>
+    /// Safe to call after <see cref="IDisposable.Dispose"/>, where it is a no-op.
+    /// </remarks>
+    void Wake();
 }

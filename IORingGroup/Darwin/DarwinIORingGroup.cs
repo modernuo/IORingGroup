@@ -48,7 +48,17 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private int _changeCount;
     private readonly kevent[] _resultEvents;
 
-    private bool _disposed;
+    // EVFILT_USER identity for Wake(). Idents only need to be unique within a filter, and this is
+    // the only EVFILT_USER registration, so a fixed value is safe.
+    private const nint WakeIdent = 1;
+    private const uint NOTE_TRIGGER = 0x01000000;
+
+    // Prebuilt change list for Wake(). kevent treats the change list as input only and the
+    // contents never vary, so sharing one array across threads is safe and avoids allocating
+    // on every wake.
+    private readonly kevent[] _wakeTrigger;
+
+    private volatile bool _disposed;
 
     // External buffer tracking (for IORingBuffer/Pool support)
     private readonly int _maxExternalBuffers;
@@ -109,6 +119,30 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             throw new InvalidOperationException($"kqueue() failed: errno {errno}");
         }
+
+        // Register the user event used by Wake(). EV_CLEAR makes it latch until it is delivered
+        // once, so a Wake() landing before the caller blocks is reported rather than lost.
+        _wakeTrigger =
+        [
+            new kevent
+            {
+                ident = WakeIdent,
+                filter = (short)kqueue_filter.USER,
+                fflags = NOTE_TRIGGER
+            }
+        ];
+
+        kevent[] register =
+        [
+            new kevent
+            {
+                ident = WakeIdent,
+                filter = (short)kqueue_filter.USER,
+                flags = (ushort)(kqueue_flags.ADD | kqueue_flags.CLEAR)
+            }
+        ];
+
+        Darwin.kevent(_kqueueFd, register, 1, null, 0, nint.Zero);
     }
 
     /// <inheritdoc/>
@@ -428,6 +462,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             ref var ev = ref _resultEvents[i];
             var fd = ev.ident;
 
+            // Wake() only exists to break the kevent wait; there is no I/O behind it.
+            if (ev.filter == (short)kqueue_filter.USER)
+            {
+                continue;
+            }
+
             // Check for accept events first (by checking the accept dictionary)
             if (_pendingAccepts.Remove(fd, out var acceptOp))
             {
@@ -610,6 +650,19 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     public void WaitForCompletion(int timeoutMs)
     {
         PollAndExecute(timeoutMs);
+    }
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        // Goes straight to kevent rather than through AddKqueueChange: this is called from other
+        // threads, and the batched change list is not thread-safe.
+        Darwin.kevent(_kqueueFd, _wakeTrigger, 1, null, 0, nint.Zero);
     }
 
     // =============================================================================
@@ -986,6 +1039,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         READ = -1,
         WRITE = -2,
+        USER = -10,
     }
 
     [Flags]

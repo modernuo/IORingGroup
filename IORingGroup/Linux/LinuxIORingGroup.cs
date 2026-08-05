@@ -60,7 +60,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private readonly io_uring_cqe* _cqes;
 
     private readonly int _eventFd = -1;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
@@ -449,6 +449,21 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Wait for new completions or timeout
         var pfd = new LinuxIORing.pollfd { fd = _eventFd, events = LinuxIORing.POLLIN };
         LinuxIORing.poll((nint)(&pfd), 1, timeoutMs);
+    }
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        if (_disposed || _eventFd < 0)
+        {
+            return;
+        }
+
+        // The eventfd is the same one WaitForCompletion polls, and its counter latches: if this
+        // lands before the caller blocks, the poll returns immediately instead of the wake being
+        // lost. EAGAIN means the counter is already saturated, which is still "signalled".
+        ulong one = 1;
+        LinuxIORing.write(_eventFd, (nint)(&one), 8);
     }
 
     // =============================================================================

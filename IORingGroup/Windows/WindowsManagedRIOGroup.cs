@@ -130,7 +130,18 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private uint _externalBufferCount;
 
     private readonly nint _completionEvent;
-    private bool _disposed;
+
+    // Auto-reset, and part of the WaitForCompletion wait set. Auto-reset is what makes Wake()
+    // sticky: a SetEvent landing before the wait is consumed by that wait rather than lost.
+    private readonly nint _wakeEvent;
+
+    // High-resolution waitable timer, used instead of the WaitForMultipleObjects timeout so that
+    // sub-millisecond waits are honoured. The plain timeout argument is quantised to the system
+    // timer resolution (15.625 ms by default), which is far coarser than the loop needs.
+    private readonly nint _idleTimer;
+
+    private bool _loggedWaitFailure;
+    private volatile bool _disposed;
 
     // =========================================================================
     // Constructor
@@ -197,6 +208,18 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             FreeAllMemory();
             throw new InvalidOperationException("Failed to create completion notification event");
         }
+
+        _wakeEvent = CreateEventW(null, 0, 0, null); // Auto reset event
+        if (_wakeEvent == 0)
+        {
+            CloseHandle(_completionEvent);
+            FreeAllMemory();
+            throw new InvalidOperationException("Failed to create wake event");
+        }
+
+        // Requires Windows 10 1803 / Server 2019. A failure here is not fatal: WaitForCompletion
+        // falls back to the coarse WaitForMultipleObjects timeout.
+        _idleTimer = CreateWaitableTimerExW(null, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 
         // Must cover every socket holding its full complement of recv + send ops: RIO corrupts a
         // full completion queue (RIO_CORRUPT_CQ) rather than back-pressuring.
@@ -466,11 +489,59 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     /// <inheritdoc/>
     public void WaitForCompletion(int timeoutMs)
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         // Arm notification: resets event (NotifyReset=1) and arms CQ
         _rio.RIONotify(_rioCq);
 
-        // Wait for completion or timeout
-        WaitForSingleObject(_completionEvent, (uint)timeoutMs);
+        var handles = stackalloc nint[3];
+        handles[0] = _completionEvent;
+        handles[1] = _wakeEvent;
+        var count = 2u;
+
+        var waitMs = (uint)timeoutMs;
+
+        // Prefer the high-resolution timer over the wait's own timeout. WaitForMultipleObjects
+        // quantises dwMilliseconds to the system timer resolution (15.625 ms unless something
+        // raised it), so a 2 ms request would routinely sleep 8x longer than asked.
+        if (_idleTimer != 0 && timeoutMs > 0)
+        {
+            // Negative means relative, in 100ns units.
+            var dueTime = -(long)timeoutMs * 10_000L;
+            if (SetWaitableTimer(_idleTimer, &dueTime, 0, null, null, 0) != 0)
+            {
+                handles[count++] = _idleTimer;
+                waitMs = INFINITE;
+            }
+        }
+
+        var result = WaitForMultipleObjects(count, handles, 0, waitMs);
+
+        if (result == WAIT_FAILED && !_loggedWaitFailure)
+        {
+            // Degrades to the caller spinning, which is the pre-existing behaviour, but it should
+            // not do so silently. Logged once so a persistent failure cannot flood.
+            _loggedWaitFailure = true;
+            Console.Error.WriteLine(
+                $"IORingGroup: WaitForMultipleObjects failed (error {Marshal.GetLastPInvokeError()}); the event loop will spin instead of sleeping."
+            );
+        }
+    }
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        if (_disposed || _wakeEvent == 0)
+        {
+            return;
+        }
+
+        // Auto-reset, so this latches: if it lands between the caller's idle check and its
+        // WaitForCompletion, that wait returns immediately rather than losing the signal.
+        SetEvent(_wakeEvent);
     }
 
     // =========================================================================
@@ -1317,10 +1388,21 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             _rio.RIOCloseCompletionQueue(_rioCq);
         }
 
-        // Close completion notification event
+        // Close completion notification event. _disposed was set at the top of Dispose, so a
+        // concurrent Wake() observes it and returns before touching these handles.
         if (_completionEvent != 0)
         {
             CloseHandle(_completionEvent);
+        }
+
+        if (_wakeEvent != 0)
+        {
+            CloseHandle(_wakeEvent);
+        }
+
+        if (_idleTimer != 0)
+        {
+            CloseHandle(_idleTimer);
         }
 
         // Deregister external buffers
