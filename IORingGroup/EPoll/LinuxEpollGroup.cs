@@ -721,6 +721,12 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Build epoll_event in a stack buffer
         var evBuf = stackalloc byte[16]; // max size (ARM64)
 
+        // Zero explicitly. The module is compiled with [module: SkipLocalsInit], so the
+        // stackalloc arrives with garbage, and the ARM64 layout below writes only bytes
+        // 0-3 and 8-15 — leaving the alignment padding at 4-7 to leak to the kernel.
+        *(ulong*)evBuf = 0;
+        *(ulong*)(evBuf + 8) = 0;
+
         // events at offset 0
         *(uint*)evBuf = events;
 
@@ -899,6 +905,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Add to epoll with EPOLLET|EPOLLONESHOT but no initial event mask
         // This registers the fd; actual interest will be set by Submit()
         var evBuf = stackalloc byte[16];
+
+        // Zero explicitly — see EpollCtlMod for why the padding cannot be left to chance.
+        *(ulong*)evBuf = 0;
+        *(ulong*)(evBuf + 8) = 0;
+
         *(uint*)evBuf = (uint)(epoll_events.EPOLLET | epoll_events.EPOLLONESHOT);
         if (_epollEventSize == 12)
         {
