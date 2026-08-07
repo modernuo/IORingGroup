@@ -96,7 +96,10 @@ public class WakeTests
         ring.Wake();
     }
 
-    [Fact]
+    // SkippableFact, not Fact: Skip.IfNot throws a SkipException, which xunit only understands as
+    // a skip on a skippable test. Under a plain Fact it surfaces as a failure on every
+    // non-Windows platform, which is exactly where this is meant to be quietly ignored.
+    [SkippableFact]
     public void ShortWaitBeatsDefaultTimerResolution()
     {
         Skip.IfNot(OperatingSystem.IsWindows(), "Timer resolution quantisation is a Windows concern.");
