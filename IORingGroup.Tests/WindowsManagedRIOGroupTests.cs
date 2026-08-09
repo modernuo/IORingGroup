@@ -67,6 +67,26 @@ public class WindowsManagedRIOGroupTests
     private const int MaxConnections = 128;
 
     [SkippableFact]
+    public void Dispose_WithPendingAccepts_DoesNotTouchFreedMemory()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        // A pre-posted AcceptEx that never receives a connection forces Dispose down its
+        // CancelIoEx path. Cancellation is asynchronous: the kernel writes the final status into
+        // the OVERLAPPED afterwards, so Dispose must wait for that write before freeing the
+        // accept pool. The corruption this guards against is intermittent, so this is a smoke
+        // test of the wait-then-free ordering, not a deterministic reproduction.
+        var ring = new WindowsManagedRIOGroup(MaxConnections);
+        var listener = ring.CreateListener("127.0.0.1", 0, 128);
+        Skip.If(listener == -1, "CreateListener failed");
+
+        ring.PrepareAccept(listener, 0, 0, 100);
+        ring.Submit();
+
+        ring.Dispose();
+    }
+
+    [SkippableFact]
     public void Create_ReturnsValidInstance()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");

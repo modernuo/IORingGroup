@@ -464,8 +464,17 @@ internal static unsafe class RIOInterop
     [DllImport("kernel32.dll")]
     public static extern int SetEvent(nint hEvent);
 
-    [DllImport("kernel32.dll")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint WaitForMultipleObjects(uint nCount, nint* lpHandles, int bWaitAll, uint dwMilliseconds);
+
+    // Pre-1803 fallback for the high-resolution waitable timer: raise the system timer resolution
+    // itself, which makes the plain wait timeout quantise to ~1ms instead of 15.625ms. Returns 0
+    // (TIMERR_NOERROR) on success, and every successful call must be paired with timeEndPeriod.
+    [DllImport("winmm.dll")]
+    public static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll")]
+    public static extern uint timeEndPeriod(uint uPeriod);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern nint CreateWaitableTimerExW(void* lpTimerAttributes, void* lpTimerName, uint dwFlags, uint dwDesiredAccess);

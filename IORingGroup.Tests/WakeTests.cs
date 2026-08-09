@@ -106,6 +106,11 @@ public class WakeTests
 
         using var ring = CreateRing();
 
+        // A host that reports no high-resolution wait (pre-1803 without a working timeBeginPeriod)
+        // is documented to quantise short waits to 15.625ms -- failing there would punish the
+        // library for behaving exactly as designed.
+        Skip.IfNot(ring.SupportsHighResolutionWait, "This host cannot honour short waits, by design.");
+
         // Warm up so first-call costs stay out of the measurement.
         ring.WaitForCompletion(2);
 
