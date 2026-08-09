@@ -37,6 +37,28 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     // Accept operations stay as dictionary (keyed by listener FD, sparse, typically 1-2)
     private readonly Dictionary<nint, PendingOp> _pendingAccepts = new();
 
+    // Listener fds whose ONESHOT read filter is currently registered. Delivery removes the fd
+    // (the kernel deleted the filter), so Submit() re-adds only unarmed listeners instead of
+    // queueing a kevent change for every listener on every call.
+    private readonly HashSet<nint> _acceptsSubmitted = new();
+
+    // Directions currently armed in the kqueue per connection. ONESHOT filters delete
+    // themselves on delivery, so the bit is cleared when the event is dispatched; a filter left
+    // behind by a cancelled op stays armed (the kernel still holds it) and is reused by the next
+    // op on that connection. Submit() adds only what is wanted but not armed.
+    private const byte ArmedRead = 1;
+    private const byte ArmedWrite = 2;
+    private readonly byte[] _armedIo;
+
+    // Dirty-connection queue: every write to _hasRecv/_hasSend/_armedIo/_connIdToFd calls
+    // MarkDirty, so Submit() re-examines only connections whose arming inputs changed since the
+    // last call — O(changed), not O(maxConnections) per event-loop iteration. _isDirty
+    // deduplicates, which also bounds the queue at _maxConnections entries. The invariant that
+    // makes the shortcut sound: a connection with wanted-but-unarmed work is always in this queue.
+    private readonly int[] _dirtyQueue;
+    private readonly bool[] _isDirty;
+    private int _dirtyCount;
+
     // Completion queue (user-space ring buffer)
     private readonly Completion[] _cqEntries;
     private int _cqHead;
@@ -106,6 +128,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         _pendingSends = new PendingOp[maxConnections];
         _hasRecv = new bool[maxConnections];
         _hasSend = new bool[maxConnections];
+        _armedIo = new byte[maxConnections];
+        _dirtyQueue = new int[maxConnections];
+        _isDirty = new bool[maxConnections];
 
         // Initialize free stack (all slots available, lowest first for pop order)
         for (var i = 0; i < maxConnections; i++)
@@ -248,6 +273,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                         UserData = userData
                     };
                     _hasSend[connId] = true;
+                    MarkDirty(connId);
                 }
                 else
                 {
@@ -277,6 +303,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             UserData = userData
         };
         _hasSend[connId] = true;
+        MarkDirty(connId);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -292,6 +319,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             UserData = userData
         };
         _hasRecv[connId] = true;
+        MarkDirty(connId);
     }
 
     /// <inheritdoc/>
@@ -313,10 +341,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             if (_hasRecv[i] && _pendingRecvs[i].UserData == targetUserData)
             {
                 _hasRecv[i] = false;
+                MarkDirty(i);
             }
             if (_hasSend[i] && _pendingSends[i].UserData == targetUserData)
             {
                 _hasSend[i] = false;
+                MarkDirty(i);
             }
         }
 
@@ -333,6 +363,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         if (toRemove.HasValue)
         {
             _pendingAccepts.Remove(toRemove.Value);
+
+            // Forget the armed state too. The kernel filter may well still exist, but if the
+            // listener is closed and its fd recycled, a stale entry here would make Submit skip
+            // arming the new listener -- and a redundant re-ADD is a harmless update.
+            _acceptsSubmitted.Remove(toRemove.Value);
         }
 
         AddCompletion(userData, 0);
@@ -347,38 +382,65 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         AddCompletion(userData, result == 0 ? 0 : -Marshal.GetLastPInvokeError());
     }
 
+    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with a call to this,
+    // or Submit() will never re-examine the connection. Idempotent between Submits.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkDirty(int connId)
+    {
+        if (!_isDirty[connId])
+        {
+            _isDirty[connId] = true;
+            _dirtyQueue[_dirtyCount++] = connId;
+        }
+    }
+
     /// <inheritdoc/>
     public int Submit()
     {
         var submitted = 0;
 
-        // Register kqueue interest for pending accept operations
+        // Register kqueue interest for pending accepts not already armed. Delivery removes the
+        // listener from _acceptsSubmitted (the ONESHOT filter deleted itself), so an armed
+        // listener costs nothing here — without this, every Submit queued a change per listener
+        // and the flush syscall below ran on every event-loop iteration, even idle ones.
         foreach (var kvp in _pendingAccepts)
         {
-            AddKqueueChange(kvp.Key, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Key);
-            submitted++;
+            if (_acceptsSubmitted.Add(kvp.Key))
+            {
+                AddKqueueChange(kvp.Key, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, kvp.Key);
+                submitted++;
+            }
         }
 
-        // Register kqueue interest for pending connection operations
-        for (var i = 0; i < _maxConnections; i++)
+        // Arm only connections whose arming inputs changed since the last Submit — O(changed),
+        // not O(maxConnections). A direction that is wanted and already armed keeps its live
+        // kernel filter (ONESHOT only dies on delivery, and delivery clears the armed bit), so
+        // only the wanted-but-unarmed ones need a change queued.
+        var dirty = _dirtyCount;
+        _dirtyCount = 0;
+        for (var d = 0; d < dirty; d++)
         {
-            if (_hasRecv[i])
+            var i = _dirtyQueue[d];
+            _isDirty[i] = false;
+
+            var fd = _connIdToFd[i];
+            if (fd < 0)
             {
-                var fd = _connIdToFd[i];
-                if (fd >= 0)
-                {
-                    AddKqueueChange(fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
-                    submitted++;
-                }
+                continue;
             }
-            if (_hasSend[i])
+
+            if (_hasRecv[i] && (_armedIo[i] & ArmedRead) == 0)
             {
-                var fd = _connIdToFd[i];
-                if (fd >= 0)
-                {
-                    AddKqueueChange(fd, (short)kqueue_filter.WRITE, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
-                    submitted++;
-                }
+                AddKqueueChange(fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
+                _armedIo[i] |= ArmedRead;
+                submitted++;
+            }
+
+            if (_hasSend[i] && (_armedIo[i] & ArmedWrite) == 0)
+            {
+                AddKqueueChange(fd, (short)kqueue_filter.WRITE, kqueue_flags.ADD | kqueue_flags.ONESHOT, (nint)i);
+                _armedIo[i] |= ArmedWrite;
+                submitted++;
             }
         }
 
@@ -391,6 +453,18 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 var errno = Marshal.GetLastPInvokeError();
                 // Log error but don't throw - some changes may have succeeded
                 Console.Error.WriteLine($"[DarwinIORingGroup] kevent submit failed: errno {errno}");
+
+                // The full scan used to retry everything on the next Submit; restore that by
+                // forgetting what this round claimed to arm. Re-ADDing a filter that did make
+                // it into the kqueue is a harmless update, so over-retrying is safe.
+                for (var d = 0; d < dirty; d++)
+                {
+                    var i = _dirtyQueue[d];
+                    _armedIo[i] = 0;
+                    MarkDirty(i);
+                }
+
+                _acceptsSubmitted.Clear();
             }
             _changeCount = 0;
         }
@@ -488,6 +562,10 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             // Check for accept events first (by checking the accept dictionary)
             if (_pendingAccepts.Remove(fd, out var acceptOp))
             {
+                // The ONESHOT filter deleted itself on this delivery; a re-posted accept must be
+                // re-armed by the next Submit.
+                _acceptsSubmitted.Remove(fd);
+
                 // Check for errors on accept
                 if ((ev.flags & (ushort)kqueue_flags.ERROR) != 0)
                 {
@@ -505,6 +583,20 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             {
                 continue;
             }
+
+            // The delivered ONESHOT filter deleted itself, so it is no longer armed -- cleared
+            // unconditionally, before the guards below decide whether the event is stale. The
+            // dirty mark makes the next Submit re-arm whatever the handlers leave pending, and
+            // covers every flag write those handlers perform.
+            if (ev.filter == (short)kqueue_filter.READ)
+            {
+                _armedIo[connId] &= unchecked((byte)~ArmedRead);
+            }
+            else if (ev.filter == (short)kqueue_filter.WRITE)
+            {
+                _armedIo[connId] &= unchecked((byte)~ArmedWrite);
+            }
+            MarkDirty(connId);
 
             // Check for errors
             if ((ev.flags & (ushort)kqueue_flags.ERROR) != 0)
@@ -551,8 +643,10 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // No connection ready yet - re-queue the accept
+                // No connection ready yet - re-queue the accept. The change queued here re-arms
+                // the filter directly, so record it as submitted or Submit would queue a second.
                 _pendingAccepts[op.Fd] = op;
+                _acceptsSubmitted.Add(op.Fd);
                 AddKqueueChange(op.Fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.Fd);
                 return;
             }
@@ -772,8 +866,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         if (listener >= 0)
         {
-            // Remove any pending accepts for this listener
+            // Remove any pending accepts for this listener. The armed entry must go too: the
+            // filter dies with the fd, and a stale entry would make Submit skip arming a new
+            // listener that recycles this fd number.
             _pendingAccepts.Remove(listener);
+            _acceptsSubmitted.Remove(listener);
             Darwin.close((int)listener);
         }
     }
@@ -811,6 +908,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         var connId = _freeSlots[--_freeSlotCount];
         _connIdToFd[connId] = (int)socket;
 
+        // A recycled slot may carry armed bits from a previous socket whose filters died with
+        // its fd. Reset so Submit arms the new socket's ops from scratch.
+        _armedIo[connId] = 0;
+        MarkDirty(connId);
+
         return connId;
     }
 
@@ -825,10 +927,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Clear pending ops
         _hasRecv[connId] = false;
         _hasSend[connId] = false;
+        _armedIo[connId] = 0;
 
         // Return slot to free stack
         _connIdToFd[connId] = -1;
         _freeSlots[_freeSlotCount++] = connId;
+        MarkDirty(connId);
     }
 
     /// <inheritdoc/>
@@ -1018,6 +1122,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
 
         _pendingAccepts.Clear();
+        _acceptsSubmitted.Clear();
 
         if (_kqueueFd >= 0)
         {

@@ -41,6 +41,15 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     // Submit() re-arms whatever direction is still pending.
     private readonly uint[] _armedIo;
 
+    // Dirty-connection queue: every write to _hasRecv/_hasSend/_armedIo/_connIdToFd calls
+    // MarkDirty, so Submit() re-examines only connections whose arming inputs changed since the
+    // last call — O(changed), not O(maxConnections) per event-loop iteration. _isDirty
+    // deduplicates, which also bounds the queue at _maxConnections entries. The invariant that
+    // makes the shortcut sound: a connection with wanted != armed is always in this queue.
+    private readonly int[] _dirtyQueue;
+    private readonly bool[] _isDirty;
+    private int _dirtyCount;
+
     // Accept operations (dictionary keyed by listener FD — typically 1-2 listeners)
     private readonly Dictionary<int, PendingOp> _pendingAccepts = new();
     private readonly HashSet<int> _acceptsSubmitted = new();
@@ -116,6 +125,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         _hasRecv = new bool[maxConnections];
         _hasSend = new bool[maxConnections];
         _armedIo = new uint[maxConnections];
+        _dirtyQueue = new int[maxConnections];
+        _isDirty = new bool[maxConnections];
 
         // Initialize free stack (all slots available, lowest first for pop order)
         for (var i = 0; i < maxConnections; i++)
@@ -311,6 +322,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         UserData = userData
                     };
                     _hasSend[connId] = true;
+                    MarkDirty(connId);
                 }
                 else
                 {
@@ -343,11 +355,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             if (_hasRecv[i] && _pendingRecvs[i].UserData == targetUserData)
             {
                 _hasRecv[i] = false;
+                MarkDirty(i);
             }
 
             if (_hasSend[i] && _pendingSends[i].UserData == targetUserData)
             {
                 _hasSend[i] = false;
+                MarkDirty(i);
             }
         }
 
@@ -395,6 +409,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasSend[connId] = true;
+        MarkDirty(connId);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -410,24 +425,48 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasRecv[connId] = true;
+        MarkDirty(connId);
     }
 
     // =============================================================================
     // Submit / Wait / Peek
     // =============================================================================
 
+    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with a call to this,
+    // or Submit() will never re-examine the connection. Idempotent between Submits.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkDirty(int connId)
+    {
+        if (!_isDirty[connId])
+        {
+            _isDirty[connId] = true;
+            _dirtyQueue[_dirtyCount++] = connId;
+        }
+    }
+
     /// <inheritdoc/>
     public int Submit()
     {
         var submitted = 0;
 
-        // Arm each connection for the full set of directions it currently wants.
+        // Arm each dirty connection for the full set of directions it currently wants.
         // Recv and send share one fd, so we always MOD the combined mask — arming
         // one direction must never drop interest in the other. EPOLLONESHOT means
         // the kernel disarms the fd after a single event, so _armedIo is reset to 0
-        // on delivery and the still-pending direction is re-armed here next time.
-        for (var i = 0; i < _maxConnections; i++)
+        // on delivery (which marks the connection dirty) and the still-pending
+        // direction is re-armed here next time. Only dirty connections are examined:
+        // idle iterations cost nothing regardless of how many connections exist.
+        var dirty = _dirtyCount;
+        _dirtyCount = 0;
+        for (var d = 0; d < dirty; d++)
         {
+            var i = _dirtyQueue[d];
+
+            // Clear before processing so a failed MOD can re-mark for the next Submit.
+            // A re-mark appends at an index no greater than the one being read (at most
+            // one append per processed entry), so it never overwrites an unread entry.
+            _isDirty[i] = false;
+
             var fd = _connIdToFd[i];
             if (fd < 0)
             {
@@ -458,6 +497,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             {
                 _armedIo[i] = want;
                 submitted++;
+            }
+            else
+            {
+                // The full scan retried failed arms every Submit; keep that behaviour.
+                MarkDirty(i);
             }
         }
 
@@ -658,8 +702,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
                     // EPOLLONESHOT disarmed the whole fd on this delivery, so clear
                     // the armed mask for both directions. Whatever remains pending
-                    // (after the handlers below run) is re-armed by the next Submit().
+                    // (after the handlers below run) is re-armed by the next Submit(),
+                    // which the dirty mark guarantees will re-examine this connection.
+                    // The flag writes in the handlers below are covered by this mark.
                     _armedIo[connId] = 0;
+                    MarkDirty(connId);
 
                     // Handle error conditions
                     if ((events & ((uint)epoll_events.EPOLLERR | (uint)epoll_events.EPOLLHUP)) != 0)
@@ -999,6 +1046,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         var connId = _freeSlots[--_freeSlotCount];
         _connIdToFd[connId] = fd;
         _armedIo[connId] = 0;
+        MarkDirty(connId);
 
         // Add to epoll with EPOLLET|EPOLLONESHOT but no initial event mask
         // This registers the fd; actual interest will be set by Submit()
@@ -1048,6 +1096,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Return slot to free stack
         _connIdToFd[connId] = -1;
         _freeSlots[_freeSlotCount++] = connId;
+        MarkDirty(connId);
     }
 
     /// <inheritdoc/>
