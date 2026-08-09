@@ -37,24 +37,18 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     // Accept operations stay as dictionary (keyed by listener FD, sparse, typically 1-2)
     private readonly Dictionary<nint, PendingOp> _pendingAccepts = new();
 
-    // Listener fds whose ONESHOT read filter is currently registered. Delivery removes the fd
-    // (the kernel deleted the filter), so Submit() re-adds only unarmed listeners instead of
-    // queueing a kevent change for every listener on every call.
+    // Listener fds whose ONESHOT read filter is currently registered; delivery removes the fd.
     private readonly HashSet<nint> _acceptsSubmitted = new();
 
-    // Directions currently armed in the kqueue per connection. ONESHOT filters delete
-    // themselves on delivery, so the bit is cleared when the event is dispatched; a filter left
-    // behind by a cancelled op stays armed (the kernel still holds it) and is reused by the next
-    // op on that connection. Submit() adds only what is wanted but not armed.
+    // Directions currently armed in the kqueue per connection. ONESHOT filters die on delivery
+    // (which clears the bit); a cancelled op's filter stays armed and is reused by the next op.
     private const byte ArmedRead = 1;
     private const byte ArmedWrite = 2;
     private readonly byte[] _armedIo;
 
-    // Dirty-connection queue: every write to _hasRecv/_hasSend/_armedIo/_connIdToFd calls
-    // MarkDirty, so Submit() re-examines only connections whose arming inputs changed since the
-    // last call — O(changed), not O(maxConnections) per event-loop iteration. _isDirty
-    // deduplicates, which also bounds the queue at _maxConnections entries. The invariant that
-    // makes the shortcut sound: a connection with wanted-but-unarmed work is always in this queue.
+    // Dirty-connection queue: Submit() re-examines only connections whose arming inputs changed
+    // (O(changed), not O(maxConnections)). Invariant: a connection with wanted-but-unarmed work
+    // is always queued. _isDirty deduplicates, bounding the queue at _maxConnections.
     private readonly int[] _dirtyQueue;
     private readonly bool[] _isDirty;
     private int _dirtyCount;
@@ -70,21 +64,18 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private int _changeCount;
     private readonly kevent[] _resultEvents;
 
-    // EVFILT_USER identity for Wake(). Idents only need to be unique within a filter, and this is
-    // the only EVFILT_USER registration, so a fixed value is safe.
+    // EVFILT_USER identity for Wake(); the only registration in that filter, so a fixed value.
     private const nint WakeIdent = 1;
     private const uint NOTE_TRIGGER = 0x01000000;
 
-    // Prebuilt change list for Wake(). kevent treats the change list as input only and the
-    // contents never vary, so sharing one array across threads is safe and avoids allocating
-    // on every wake.
+    // Prebuilt change list for Wake(); kevent treats it as input only, so cross-thread sharing
+    // is safe.
     private readonly kevent[] _wakeTrigger;
     private bool _wakeRegistered = true;
     private volatile bool _loggedWakeFailure;
 
-    // Counts Wake() calls that are past the _disposed check but not yet done with the kqueue fd.
-    // Dispose waits for it to reach zero before closing it, closing the window where a concurrent
-    // Wake could issue a kevent on a freshly closed (and possibly recycled) fd number.
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing the
+    // kqueue fd.
     private int _wakeGuard;
 
     private volatile bool _disposed;
@@ -152,8 +143,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             throw new InvalidOperationException($"kqueue() failed: errno {errno}");
         }
 
-        // Register the user event used by Wake(). EV_CLEAR makes it latch until it is delivered
-        // once, so a Wake() landing before the caller blocks is reported rather than lost.
+        // Register the user event used by Wake(). EV_CLEAR latches it until delivered once, so a
+        // Wake() landing before the caller blocks is not lost.
         _wakeTrigger =
         [
             new kevent
@@ -174,9 +165,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             }
         ];
 
-        // A failure here is not fatal -- a caller that cannot be woken falls back to its own
-        // timeout -- but it must not be silent, or cross-thread work would appear to arrive late
-        // for no discoverable reason.
+        // Not fatal (callers fall back to their timeout) but must not be silent.
         if (Darwin.kevent(_kqueueFd, register, 1, null, 0, nint.Zero) < 0)
         {
             _wakeRegistered = false;
@@ -362,11 +351,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
         if (toRemove.HasValue)
         {
+            // Forget the armed state too: a stale entry would make Submit skip arming a new
+            // listener that recycles this fd, and a redundant re-ADD is a harmless update.
             _pendingAccepts.Remove(toRemove.Value);
-
-            // Forget the armed state too. The kernel filter may well still exist, but if the
-            // listener is closed and its fd recycled, a stale entry here would make Submit skip
-            // arming the new listener -- and a redundant re-ADD is a harmless update.
             _acceptsSubmitted.Remove(toRemove.Value);
         }
 
@@ -382,8 +369,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         AddCompletion(userData, result == 0 ? 0 : -Marshal.GetLastPInvokeError());
     }
 
-    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with a call to this,
-    // or Submit() will never re-examine the connection. Idempotent between Submits.
+    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with this, or Submit()
+    // will never re-examine the connection.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void MarkDirty(int connId)
     {
@@ -399,10 +386,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         var submitted = 0;
 
-        // Register kqueue interest for pending accepts not already armed. Delivery removes the
-        // listener from _acceptsSubmitted (the ONESHOT filter deleted itself), so an armed
-        // listener costs nothing here — without this, every Submit queued a change per listener
-        // and the flush syscall below ran on every event-loop iteration, even idle ones.
+        // Arm only listeners not already armed; delivery removes them from _acceptsSubmitted.
         foreach (var kvp in _pendingAccepts)
         {
             if (_acceptsSubmitted.Add(kvp.Key))
@@ -412,10 +396,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             }
         }
 
-        // Arm only connections whose arming inputs changed since the last Submit — O(changed),
-        // not O(maxConnections). A direction that is wanted and already armed keeps its live
-        // kernel filter (ONESHOT only dies on delivery, and delivery clears the armed bit), so
-        // only the wanted-but-unarmed ones need a change queued.
+        // Arm only dirty connections. A wanted-and-armed direction keeps its live kernel filter
+        // (ONESHOT dies on delivery, where the bit is cleared), so it queues no change.
         var dirty = _dirtyCount;
         _dirtyCount = 0;
         for (var d = 0; d < dirty; d++)
@@ -454,9 +436,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 // Log error but don't throw - some changes may have succeeded
                 Console.Error.WriteLine($"[DarwinIORingGroup] kevent submit failed: errno {errno}");
 
-                // The full scan used to retry everything on the next Submit; restore that by
-                // forgetting what this round claimed to arm. Re-ADDing a filter that did make
-                // it into the kqueue is a harmless update, so over-retrying is safe.
+                // Forget what this round claimed to arm so the next Submit retries everything;
+                // re-ADDing a filter that did land is a harmless update.
                 for (var d = 0; d < dirty; d++)
                 {
                     var i = _dirtyQueue[d];
@@ -562,8 +543,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             // Check for accept events first (by checking the accept dictionary)
             if (_pendingAccepts.Remove(fd, out var acceptOp))
             {
-                // The ONESHOT filter deleted itself on this delivery; a re-posted accept must be
-                // re-armed by the next Submit.
+                // The ONESHOT filter died on delivery; a re-posted accept must be re-armed.
                 _acceptsSubmitted.Remove(fd);
 
                 // Check for errors on accept
@@ -584,10 +564,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 continue;
             }
 
-            // The delivered ONESHOT filter deleted itself, so it is no longer armed -- cleared
-            // unconditionally, before the guards below decide whether the event is stale. The
-            // dirty mark makes the next Submit re-arm whatever the handlers leave pending, and
-            // covers every flag write those handlers perform.
+            // The delivered ONESHOT filter died, so clear its armed bit unconditionally -- before
+            // the staleness guards below. The dirty mark makes the next Submit re-arm whatever
+            // the handlers leave pending (and covers their flag writes).
             if (ev.filter == (short)kqueue_filter.READ)
             {
                 _armedIo[connId] &= unchecked((byte)~ArmedRead);
@@ -643,8 +622,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // No connection ready yet - re-queue the accept. The change queued here re-arms
-                // the filter directly, so record it as submitted or Submit would queue a second.
+                // No connection ready yet; re-queue and re-arm directly, recorded as submitted.
                 _pendingAccepts[op.Fd] = op;
                 _acceptsSubmitted.Add(op.Fd);
                 AddKqueueChange(op.Fd, (short)kqueue_filter.READ, kqueue_flags.ADD | kqueue_flags.ONESHOT, op.Fd);
@@ -764,18 +742,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// kevent takes its timeout as a timespec with nanosecond granularity, so short waits are
-    /// honoured. There is no equivalent of the Windows timer-resolution problem.
-    /// </remarks>
+    /// <remarks>kevent takes a timespec with nanosecond granularity.</remarks>
     public bool SupportsHighResolutionWait => true;
 
     /// <inheritdoc/>
     public void Wake()
     {
-        // The guard makes the fd use visible to Dispose, which waits for it to drain before
-        // closing the kqueue fd -- otherwise this kevent could land on a closed, kernel-recycled
-        // fd number.
+        // Guarded so Dispose can drain in-flight calls before closing the kqueue fd.
         Interlocked.Increment(ref _wakeGuard);
         try
         {
@@ -784,13 +757,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
                 return;
             }
 
-            // Goes straight to kevent rather than through AddKqueueChange: this is called from
-            // other threads, and the batched change list is not thread-safe.
+            // Straight to kevent: the batched change list is not thread-safe, and this is called
+            // from other threads.
             if (Darwin.kevent(_kqueueFd, _wakeTrigger, 1, null, 0, nint.Zero) < 0 && !_loggedWakeFailure)
             {
-                // A silently lost wake means cross-thread work arrives late with nothing to point
-                // at -- the same reason a registration failure is surfaced. Logged once so a
-                // persistent failure cannot flood.
+                // Logged once; a silently lost wake leaves nothing to point at.
                 _loggedWakeFailure = true;
                 Console.Error.WriteLine(
                     $"IORingGroup: wake kevent failed (errno {Marshal.GetLastPInvokeError()}); " +
@@ -866,9 +837,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         if (listener >= 0)
         {
-            // Remove any pending accepts for this listener. The armed entry must go too: the
-            // filter dies with the fd, and a stale entry would make Submit skip arming a new
-            // listener that recycles this fd number.
+            // The armed entry must go too: the filter dies with the fd, and a stale entry would
+            // make Submit skip arming a new listener that recycles this fd number.
             _pendingAccepts.Remove(listener);
             _acceptsSubmitted.Remove(listener);
             Darwin.close((int)listener);
@@ -908,8 +878,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         var connId = _freeSlots[--_freeSlotCount];
         _connIdToFd[connId] = (int)socket;
 
-        // A recycled slot may carry armed bits from a previous socket whose filters died with
-        // its fd. Reset so Submit arms the new socket's ops from scratch.
+        // A recycled slot may carry armed bits from a socket whose filters died with its fd.
         _armedIo[connId] = 0;
         MarkDirty(connId);
 
@@ -1105,9 +1074,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
 
         _disposed = true;
 
-        // A Wake() that passed its _disposed check before the flag was set may still be inside
-        // its kevent(). Wait it out before the kqueue fd is closed, or the call could land on a
-        // closed -- and possibly already recycled -- fd number.
+        // Drain in-flight Wake() calls before closing the kqueue fd.
         var spinner = new SpinWait();
         while (Volatile.Read(ref _wakeGuard) != 0)
         {

@@ -128,26 +128,20 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private readonly nint _completionEvent;
 
-    // Auto-reset, and part of the WaitForCompletion wait set. Auto-reset is what makes Wake()
-    // sticky: a SetEvent landing before the wait is consumed by that wait rather than lost.
+    // Auto-reset, so a SetEvent landing before the wait latches instead of being lost.
     private readonly nint _wakeEvent;
 
-    // High-resolution waitable timer, used instead of the WaitForMultipleObjects timeout so that
-    // sub-millisecond waits are honoured. The plain timeout argument is quantised to the system
-    // timer resolution (15.625 ms by default), which is far coarser than the loop needs.
+    // High-resolution waitable timer; the plain wait timeout quantises to the system timer
+    // resolution (15.625ms default).
     private readonly nint _idleTimer;
 
-    // Signalled by the OS when any pending AcceptEx completes; see the pool setup for why one
-    // shared handle suffices.
+    // One shared manual-reset event signalled when any pending AcceptEx completes.
     private readonly nint _acceptEvent;
 
-    // True when the high-resolution timer was unavailable and timeBeginPeriod(1) succeeded
-    // instead: the plain wait timeout then quantises to ~1ms, and Dispose owes a timeEndPeriod.
+    // High-res timer unavailable but timeBeginPeriod(1) succeeded; Dispose owes timeEndPeriod.
     private readonly bool _timerPeriodRaised;
 
-    // Counts Wake() calls that are past the _disposed check but not yet done with the handle.
-    // Dispose waits for it to reach zero before closing handles, closing the window where a
-    // concurrent Wake could touch a freshly closed (and possibly recycled) handle.
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing handles.
     private int _wakeGuard;
 
     private bool _loggedWaitFailure;
@@ -227,16 +221,12 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             throw new InvalidOperationException("Failed to create wake event");
         }
 
-        // Requires Windows 10 1803 / Server 2019. Preferred because it honours short waits without
-        // touching the system timer resolution at all.
+        // High-res timer requires Windows 10 1803 / Server 2019; preferred because it does not
+        // touch the system timer resolution. Older hosts fall back to timeBeginPeriod(1), which
+        // makes the plain wait timeout ~1ms accurate at the cost of a raised interrupt rate.
         _idleTimer = CreateWaitableTimerExW(null, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (_idleTimer == 0)
         {
-            // Server 2012 R2 / 2016 path: no high-resolution timer exists, so raise the system
-            // timer resolution to 1ms instead -- then the plain WaitForMultipleObjects timeout is
-            // quantised to ~1ms and no timer handle is needed. This raises the interrupt rate
-            // (process-wide on Windows 10 2004+, system-wide before that), which is why it is the
-            // fallback and not the default. Dispose pairs it with timeEndPeriod.
             _timerPeriodRaised = timeBeginPeriod(1) == 0;
         }
 
@@ -277,10 +267,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             _acceptPool[i].ConnSlot = -1;
         }
 
-        // One event shared by every pending AcceptEx, rather than one each. It exists only to wake
-        // a blocked WaitForCompletion -- completion is detected by reading OVERLAPPED.Internal,
-        // which needs no handle at all -- so a single signal meaning "some accept finished" is
-        // enough, and the scan that follows finds all of them.
+        // Shared by every pending AcceptEx: it only wakes a blocked WaitForCompletion; completion
+        // itself is detected by reading OVERLAPPED.Internal, so one signal is enough.
         _acceptEvent = CreateEventW(null, 1, 0, null); // Manual reset
         if (_acceptEvent == 0)
         {
@@ -296,8 +284,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         _ownedListeners = (nint*)NativeMemory.AllocZeroed(16, (nuint)sizeof(nint));
     }
 
-    // Undo every kernel resource the constructor acquired before the failing step, so a caller
-    // that catches the exception and retries does not leak handles (or a raised timer period).
+    // Releases ctor-acquired kernel resources on a failed construction step.
     private void CloseCtorHandles()
     {
         if (_completionEvent != 0)
@@ -547,9 +534,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         var waitMs = (uint)timeoutMs;
 
-        // Prefer the high-resolution timer over the wait's own timeout. WaitForMultipleObjects
-        // quantises dwMilliseconds to the system timer resolution (15.625 ms unless something
-        // raised it), so a 2 ms request would routinely sleep 8x longer than asked.
+        // Prefer the high-resolution timer; the wait's own timeout quantises to the system timer
+        // resolution.
         if (_idleTimer != 0 && timeoutMs > 0)
         {
             // Negative means relative, in 100ns units.
@@ -565,18 +551,14 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         if (result == WAIT_OBJECT_0 + 2 && _pendingAcceptCount == 0)
         {
-            // The manual-reset accept event fired with no accept outstanding: the kernel's
-            // SetEvent landed after the scan had already consumed the completion via the
-            // Internal read and the count reached zero. The scan's own reset is gated on the
-            // count, so without this the stale signal would make every subsequent wait return
-            // immediately -- a busy-spin. Runs only on this wake reason, so it costs nothing
-            // on the normal paths.
+            // Stale accept signal: the kernel's SetEvent landed after the scan consumed the
+            // completion via the Internal read. The scan's reset is gated on the count, so
+            // without this every subsequent wait would return immediately.
             ResetEvent(_acceptEvent);
         }
         else if (result == WAIT_FAILED && !_loggedWaitFailure)
         {
-            // Degrades to the caller spinning, which is the pre-existing behaviour, but it should
-            // not do so silently. Logged once so a persistent failure cannot flood.
+            // Degrades to spinning; logged once so it is not silent and cannot flood.
             _loggedWaitFailure = true;
             Console.Error.WriteLine(
                 $"IORingGroup: WaitForMultipleObjects failed (error {Marshal.GetLastPInvokeError()}); the event loop will spin instead of sleeping."
@@ -586,18 +568,15 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The high-resolution waitable timer requires Windows 10 1803 / Server 2019. Older hosts
-    /// (Server 2012 R2 / 2016) fall back to raising the system timer resolution to 1ms via
-    /// timeBeginPeriod, which makes the plain wait timeout accurate enough. Only when both are
-    /// unavailable do short waits quantise to the 15.625ms default.
+    /// True with the high-resolution waitable timer (Windows 10 1803 / Server 2019) or the
+    /// timeBeginPeriod(1) fallback; false only when both are unavailable.
     /// </remarks>
     public bool SupportsHighResolutionWait => _idleTimer != 0 || _timerPeriodRaised;
 
     /// <inheritdoc/>
     public void Wake()
     {
-        // The guard makes the handle use visible to Dispose, which waits for it to drain before
-        // closing handles -- otherwise this SetEvent could land on a closed (recycled) handle.
+        // Guarded so Dispose can drain in-flight calls before closing the handle.
         Interlocked.Increment(ref _wakeGuard);
         try
         {
@@ -606,8 +585,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 return;
             }
 
-            // Auto-reset, so this latches: if it lands between the caller's idle check and its
-            // WaitForCompletion, that wait returns immediately rather than losing the signal.
             SetEvent(_wakeEvent);
         }
         finally
@@ -787,10 +764,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private void DequeueRioCompletions()
     {
-        // Unthrottled on purpose. The scan is a plain memory read per pending slot (no syscalls),
-        // so the every-32-calls throttle that once amortised a WaitForSingleObject per slot would
-        // now only add latency: with the accept event in the WaitForCompletion wait set, a skipped
-        // scan leaves the event signaled and every wait returns immediately until the scan runs.
+        // Unthrottled: the scan is a plain memory read per pending slot, and a skipped scan
+        // leaves the accept event signaled, turning every wait into an immediate return.
         CheckAcceptExCompletions();
 
         if (_rioCq == RIO_INVALID_CQ)
@@ -1272,8 +1247,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         ctx->Pending = true;
         _pendingAcceptCount++;
 
-        // Zeroing sets Internal to 0, not STATUS_PENDING, so mark it pending explicitly. The scan
-        // reads this field to detect completion, and a zero here would look like "finished".
+        // Zeroing leaves Internal at 0, which the completion scan would read as "finished".
         Unsafe.InitBlock(&ctx->Overlapped, 0, (uint)sizeof(OVERLAPPED));
         ctx->Overlapped.Internal = STATUS_PENDING;
         ctx->Overlapped.hEvent = _acceptEvent;
@@ -1317,8 +1291,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             return;
         }
 
-        // Reset before scanning, not after: a completion landing mid-scan re-signals the event, so
-        // the next wait returns immediately and rescans. Resetting afterwards would swallow it.
+        // Reset before scanning: a completion landing mid-scan re-signals and forces a rescan;
+        // resetting afterwards would swallow it.
         ResetEvent(_acceptEvent);
 
         uint found = 0;
@@ -1330,10 +1304,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 continue;
             }
 
-            // The kernel writes the final status into Internal, so completion is a plain memory
-            // read -- this is what the Win32 HasOverlappedIoCompleted macro expands to. It replaces
-            // one WaitForSingleObject per pending slot, which measured 794ns on a desktop and
-            // accounted for nearly all of an idle loop iteration's cost.
+            // Plain memory read of the kernel-written status -- what HasOverlappedIoCompleted
+            // expands to. Replaces a WaitForSingleObject syscall per pending slot.
             if (ctx->Overlapped.Internal == STATUS_PENDING)
             {
                 // Early exit: if we've checked all pending slots, stop scanning
@@ -1408,9 +1380,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         _disposed = true;
 
-        // A Wake() that passed its _disposed check before the flag was set may still be inside a
-        // handle-touching syscall. Wait it out before any handle is closed, or the SetEvent could
-        // land on a closed -- and possibly already recycled -- handle.
+        // Drain in-flight Wake() calls before closing any handle they may touch.
         var spinner = new SpinWait();
         while (Volatile.Read(ref _wakeGuard) != 0)
         {
@@ -1431,11 +1401,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 }
             }
 
-            // CancelIoEx only *requests* cancellation: the kernel still writes the final status
-            // into each OVERLAPPED (which lives inside _acceptPool) when the cancel completes.
-            // Freeing the pool before that write lands is a use-after-free of native memory, so
-            // wait for every pending slot to reach a final state first. Cancellation completes in
-            // microseconds; the deadline only bounds a pathological driver.
+            // CancelIoEx is asynchronous: the kernel writes the final status into each OVERLAPPED
+            // (inside _acceptPool) when the cancel completes, so the pool cannot be freed until
+            // every pending slot reaches a final state.
             var safeToFree = true;
             if (pendingCancels)
             {
@@ -1471,7 +1439,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             }
             else
             {
-                // Deliberately leak the pool rather than free memory the kernel may still write to.
+                // Leak rather than free memory the kernel may still write to.
                 Console.Error.WriteLine(
                     "IORingGroup: a cancelled AcceptEx did not complete in time; leaking the accept pool instead of freeing it."
                 );
@@ -1511,9 +1479,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             _rio.RIOCloseCompletionQueue(_rioCq);
         }
 
-        // Close completion notification event. Safe against a concurrent Wake(): _disposed was
-        // set at the top of Dispose and the _wakeGuard drain above waited out any Wake that had
-        // already passed its check.
         if (_completionEvent != 0)
         {
             CloseHandle(_completionEvent);

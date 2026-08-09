@@ -265,17 +265,13 @@ public interface IIORingGroup : IDisposable
     /// Wakes a thread blocked in <see cref="WaitForCompletion"/>.
     /// </summary>
     /// <remarks>
-    /// Thread-safe, idempotent, and sticky: a call that lands between a caller's idle check and
-    /// its <see cref="WaitForCompletion"/> makes that wait return immediately rather than being
-    /// lost. That is what lets a caller decide it is idle and then block, with no lock and no
-    /// risk of a missed wakeup.
+    /// Thread-safe and sticky: a call landing between an idle check and the subsequent
+    /// <see cref="WaitForCompletion"/> makes that wait return immediately instead of being lost.
     /// <para>
     /// Platform implementations:
     /// <list type="bullet">
     /// <item>Windows RIO: SetEvent on an auto-reset wake event in the wait set</item>
-    /// <item>Linux io_uring: writes a dedicated wake eventfd in the poll set (the ring's own
-    /// completion eventfd is drained on entry to <see cref="WaitForCompletion"/>, which would
-    /// swallow a wake)</item>
+    /// <item>Linux io_uring: writes a dedicated wake eventfd in the poll set</item>
     /// <item>Linux epoll: writes a dedicated eventfd registered in the epoll set</item>
     /// <item>macOS kqueue: triggers an EVFILT_USER event</item>
     /// </list>
@@ -288,11 +284,8 @@ public interface IIORingGroup : IDisposable
     /// Whether <see cref="WaitForCompletion"/> can honour a timeout of a few milliseconds.
     /// </summary>
     /// <remarks>
-    /// False means short waits are quantised to something far coarser -- on Windows with neither
-    /// a high-resolution waitable timer nor a raised system timer resolution, the default
-    /// 15.625ms -- so a caller asking for 2ms will routinely block for eight times that. A caller
-    /// that cares about sub-frame timing should not sleep at all on such a host, and should say
-    /// so loudly rather than silently running an order of magnitude behind what it asked for.
+    /// False means short waits quantise to the system timer resolution (15.625ms Windows
+    /// default). Callers that need sub-frame timing should not sleep on such a host.
     /// </remarks>
     bool SupportsHighResolutionWait { get; }
 }

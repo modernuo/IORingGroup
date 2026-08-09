@@ -41,11 +41,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     // Submit() re-arms whatever direction is still pending.
     private readonly uint[] _armedIo;
 
-    // Dirty-connection queue: every write to _hasRecv/_hasSend/_armedIo/_connIdToFd calls
-    // MarkDirty, so Submit() re-examines only connections whose arming inputs changed since the
-    // last call — O(changed), not O(maxConnections) per event-loop iteration. _isDirty
-    // deduplicates, which also bounds the queue at _maxConnections entries. The invariant that
-    // makes the shortcut sound: a connection with wanted != armed is always in this queue.
+    // Dirty-connection queue: Submit() re-examines only connections whose arming inputs changed
+    // (O(changed), not O(maxConnections)). Invariant: a connection with wanted != armed is always
+    // queued. _isDirty deduplicates, bounding the queue at _maxConnections.
     private readonly int[] _dirtyQueue;
     private readonly bool[] _isDirty;
     private int _dirtyCount;
@@ -71,17 +69,14 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
 
-    // Wake eventfd, registered level-triggered in the epoll set. Its counter latches, so a Wake()
-    // landing before the caller blocks makes epoll_wait return immediately instead of losing it.
+    // Wake eventfd, registered level-triggered; the latched counter makes a wake sticky.
     private readonly int _wakeFd = -1;
 
-    // Counts Wake() calls that are past the _disposed check but not yet done with the fd. Dispose
-    // waits for it to reach zero before closing fds, closing the window where a concurrent Wake
-    // could write to a freshly closed (and possibly recycled) fd number.
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing fds.
     private int _wakeGuard;
 
-    // Sentinel epoll data for the wake fd. The high bit is clear so IsAcceptData never matches it,
-    // and it is checked before the connId path, so it cannot collide with a real connection.
+    // Sentinel epoll data for the wake fd; high bit clear so IsAcceptData never matches, checked
+    // before the connId path.
     private const long WakeEventData = long.MaxValue;
 
     private volatile bool _disposed;
@@ -149,12 +144,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             throw new InvalidOperationException($"epoll_create1() failed: errno {errno}");
         }
 
-        // Register the wake eventfd. Level-triggered on purpose: the counter stays readable until
-        // drained, so a wake cannot be missed between epoll_wait calls. A failure here is not
-        // fatal — Wake() becomes a no-op and callers fall back to their own timeout — but it must
-        // not be silent, or cross-thread work would appear to arrive late with nothing to point
-        // at. Both steps must succeed: an eventfd that never made it into the epoll set would let
-        // Wake() write signals nobody is watching.
+        // Register the wake eventfd, level-triggered so the counter stays readable until drained.
+        // Both steps must succeed or Wake() is disabled with a log: an eventfd outside the epoll
+        // set would receive signals nobody is watching.
         _wakeFd = Syscalls.eventfd(0, EFD_NONBLOCK);
         if (_wakeFd < 0)
         {
@@ -432,8 +424,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     // Submit / Wait / Peek
     // =============================================================================
 
-    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with a call to this,
-    // or Submit() will never re-examine the connection. Idempotent between Submits.
+    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with this, or Submit()
+    // will never re-examine the connection.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void MarkDirty(int connId)
     {
@@ -449,22 +441,18 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     {
         var submitted = 0;
 
-        // Arm each dirty connection for the full set of directions it currently wants.
-        // Recv and send share one fd, so we always MOD the combined mask — arming
-        // one direction must never drop interest in the other. EPOLLONESHOT means
-        // the kernel disarms the fd after a single event, so _armedIo is reset to 0
-        // on delivery (which marks the connection dirty) and the still-pending
-        // direction is re-armed here next time. Only dirty connections are examined:
-        // idle iterations cost nothing regardless of how many connections exist.
+        // Arm each dirty connection for the full set of directions it wants. Recv and send share
+        // one fd, so always MOD the combined mask — arming one direction must never drop the
+        // other. EPOLLONESHOT disarms the fd on delivery, which marks the connection dirty for
+        // re-arming here.
         var dirty = _dirtyCount;
         _dirtyCount = 0;
         for (var d = 0; d < dirty; d++)
         {
             var i = _dirtyQueue[d];
 
-            // Clear before processing so a failed MOD can re-mark for the next Submit.
-            // A re-mark appends at an index no greater than the one being read (at most
-            // one append per processed entry), so it never overwrites an unread entry.
+            // Cleared before processing so a failed MOD can re-mark. A re-mark appends at an
+            // index <= the one being read, so it never overwrites an unread entry.
             _isDirty[i] = false;
 
             var fd = _connIdToFd[i];
@@ -500,7 +488,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             }
             else
             {
-                // The full scan retried failed arms every Submit; keep that behaviour.
+                // Retry on the next Submit.
                 MarkDirty(i);
             }
         }
@@ -555,19 +543,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     }
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// epoll_wait takes its timeout at millisecond granularity backed by a high-resolution kernel
-    /// timer, so short waits are honoured. There is no equivalent of the Windows timer-resolution
-    /// problem.
-    /// </remarks>
+    /// <remarks>epoll_wait's timeout is backed by a high-resolution kernel timer.</remarks>
     public bool SupportsHighResolutionWait => true;
 
     /// <inheritdoc/>
     public void Wake()
     {
-        // The guard makes the fd use visible to Dispose, which waits for it to drain before
-        // closing fds -- otherwise this write could land on a closed, kernel-recycled fd number
-        // and deposit 8 bytes into an unrelated file.
+        // Guarded so Dispose can drain in-flight calls before closing the fd.
         Interlocked.Increment(ref _wakeGuard);
         try
         {
@@ -576,9 +558,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                 return;
             }
 
-            // The eventfd counter latches, so this cannot be lost if it lands between the caller's
-            // idle check and its epoll_wait. EAGAIN means the counter is already saturated, which
-            // still counts as signalled.
+            // The counter latches, so a wake landing before the caller blocks is not lost.
             ulong one = 1;
             Syscalls.write(_wakeFd, (nint)(&one), 8);
         }
@@ -700,11 +680,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         continue;
                     }
 
-                    // EPOLLONESHOT disarmed the whole fd on this delivery, so clear
-                    // the armed mask for both directions. Whatever remains pending
-                    // (after the handlers below run) is re-armed by the next Submit(),
-                    // which the dirty mark guarantees will re-examine this connection.
-                    // The flag writes in the handlers below are covered by this mark.
+                    // EPOLLONESHOT disarmed the fd; the dirty mark makes the next Submit re-arm
+                    // whatever the handlers below leave pending (and covers their flag writes).
                     _armedIo[connId] = 0;
                     MarkDirty(connId);
 
@@ -1249,9 +1226,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         _disposed = true;
 
-        // A Wake() that passed its _disposed check before the flag was set may still be inside
-        // its write(). Wait it out before any fd is closed, or the write could land on a closed
-        // -- and possibly already recycled -- fd number.
+        // Drain in-flight Wake() calls before closing any fd they may touch.
         var spinner = new SpinWait();
         while (Volatile.Read(ref _wakeGuard) != 0)
         {

@@ -7,9 +7,8 @@ using System.Network;
 namespace IORingGroup.Tests;
 
 /// <summary>
-/// Wake() contract. The load-bearing guarantee is stickiness: a caller decides it is idle and then
-/// blocks, so a Wake() arriving in that window must make the wait return rather than be lost.
-/// Without that, a sleeping event loop can miss cross-thread work until its timeout expires.
+/// Wake() contract. The load-bearing guarantee is stickiness: a Wake() arriving between an idle
+/// check and the subsequent wait must make that wait return rather than be lost.
 /// </summary>
 public class WakeTests
 {
@@ -75,8 +74,8 @@ public class WakeTests
         // Drain whatever the wakes queued.
         ring.WaitForCompletion(1);
 
-        // A second wait with no pending wake should actually wait rather than return instantly,
-        // which is what proves the signal is edge-like and not a counter that keeps firing.
+        // A second wait with no pending wake must actually wait, proving the signal does not
+        // accumulate.
         var sw = Stopwatch.StartNew();
         ring.WaitForCompletion(60);
         sw.Stop();
@@ -96,9 +95,7 @@ public class WakeTests
         ring.Wake();
     }
 
-    // SkippableFact, not Fact: Skip.IfNot throws a SkipException, which xunit only understands as
-    // a skip on a skippable test. Under a plain Fact it surfaces as a failure on every
-    // non-Windows platform, which is exactly where this is meant to be quietly ignored.
+    // SkippableFact: under a plain Fact, Skip.IfNot surfaces as a failure on non-Windows.
     [SkippableFact]
     public void ShortWaitBeatsDefaultTimerResolution()
     {
@@ -106,9 +103,7 @@ public class WakeTests
 
         using var ring = CreateRing();
 
-        // A host that reports no high-resolution wait (pre-1803 without a working timeBeginPeriod)
-        // is documented to quantise short waits to 15.625ms -- failing there would punish the
-        // library for behaving exactly as designed.
+        // A host without high-resolution waits quantises to 15.625ms by design.
         Skip.IfNot(ring.SupportsHighResolutionWait, "This host cannot honour short waits, by design.");
 
         // Warm up so first-call costs stay out of the measurement.
@@ -125,9 +120,7 @@ public class WakeTests
 
         var average = sw.Elapsed.TotalMilliseconds / iterations;
 
-        // The Windows default timer resolution is 15.625ms, so without the high-resolution
-        // waitable timer a 2ms request routinely sleeps ~15ms. Threshold is deliberately loose
-        // so a loaded CI agent does not make this flaky.
+        // Loose threshold (well under the 15.625ms default resolution) to stay CI-stable.
         Assert.True(
             average < 10,
             $"A 2ms wait averaged {average:F2}ms; the high-resolution timer is not in effect."

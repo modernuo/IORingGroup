@@ -60,16 +60,14 @@ internal static unsafe class RIOInterop
     public const uint WAIT_FAILED = 0xFFFFFFFF;
     public const uint INFINITE = 0xFFFFFFFF;
 
-    // CreateWaitableTimerExW. The high-resolution flag requires Windows 10 1803 / Server 2019 and
-    // is what lets a sub-millisecond wait be honoured without raising the system timer resolution
-    // process-wide via timeBeginPeriod.
+    // Requires Windows 10 1803 / Server 2019.
     public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
     public const uint TIMER_ALL_ACCESS = 0x1F0003;
 
     public const int ERROR_IO_INCOMPLETE = 996;
 
-    // OVERLAPPED.Internal holds this while an operation is outstanding; the kernel overwrites it
-    // with the final NTSTATUS on completion. Polling it is what HasOverlappedIoCompleted does.
+    // OVERLAPPED.Internal value while an operation is outstanding; the kernel overwrites it with
+    // the final NTSTATUS on completion.
     public const nuint STATUS_PENDING = 0x103;
 
     // Linux-style poll masks (used by IIORingGroup interface)
@@ -467,9 +465,7 @@ internal static unsafe class RIOInterop
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint WaitForMultipleObjects(uint nCount, nint* lpHandles, int bWaitAll, uint dwMilliseconds);
 
-    // Pre-1803 fallback for the high-resolution waitable timer: raise the system timer resolution
-    // itself, which makes the plain wait timeout quantise to ~1ms instead of 15.625ms. Returns 0
-    // (TIMERR_NOERROR) on success, and every successful call must be paired with timeEndPeriod.
+    // Returns 0 (TIMERR_NOERROR) on success; must be paired with timeEndPeriod.
     [DllImport("winmm.dll")]
     public static extern uint timeBeginPeriod(uint uPeriod);
 

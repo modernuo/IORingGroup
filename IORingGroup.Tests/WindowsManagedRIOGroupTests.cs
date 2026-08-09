@@ -71,11 +71,8 @@ public class WindowsManagedRIOGroupTests
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
 
-        // A pre-posted AcceptEx that never receives a connection forces Dispose down its
-        // CancelIoEx path. Cancellation is asynchronous: the kernel writes the final status into
-        // the OVERLAPPED afterwards, so Dispose must wait for that write before freeing the
-        // accept pool. The corruption this guards against is intermittent, so this is a smoke
-        // test of the wait-then-free ordering, not a deterministic reproduction.
+        // A pre-posted AcceptEx that never completes forces Dispose down its CancelIoEx path,
+        // which must wait for the kernel's final OVERLAPPED write before freeing the pool.
         var ring = new WindowsManagedRIOGroup(MaxConnections);
         var listener = ring.CreateListener("127.0.0.1", 0, 128);
         Skip.If(listener == -1, "CreateListener failed");
