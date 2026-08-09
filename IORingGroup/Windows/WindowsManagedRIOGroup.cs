@@ -36,7 +36,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         public nint ListenSocket;
         public fixed byte Buffer[AcceptExBufferSize];
         public OVERLAPPED Overlapped;
-        public nint Event;
         public ulong UserData;
         public bool Pending;
         public int ConnSlot;
@@ -114,8 +113,6 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private readonly AcceptExContext* _acceptPool;
     private readonly uint _acceptPoolSize;
     private uint _pendingAcceptCount;
-    private uint _acceptCheckCounter;
-    private bool _acceptsFoundLastCheck;
 
     // Pending operations (for poll, legacy accept)
     private readonly PendingOp* _pendingOps;
@@ -130,7 +127,25 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private uint _externalBufferCount;
 
     private readonly nint _completionEvent;
-    private bool _disposed;
+
+    // Auto-reset, so a SetEvent landing before the wait latches instead of being lost.
+    private readonly nint _wakeEvent;
+
+    // High-resolution waitable timer; the plain wait timeout quantises to the system timer
+    // resolution (15.625ms default).
+    private readonly nint _idleTimer;
+
+    // One shared manual-reset event signalled when any pending AcceptEx completes.
+    private readonly nint _acceptEvent;
+
+    // High-res timer unavailable but timeBeginPeriod(1) succeeded; Dispose owes timeEndPeriod.
+    private readonly bool _timerPeriodRaised;
+
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing handles.
+    private int _wakeGuard;
+
+    private bool _loggedWaitFailure;
+    private volatile bool _disposed;
 
     // =========================================================================
     // Constructor
@@ -198,6 +213,23 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             throw new InvalidOperationException("Failed to create completion notification event");
         }
 
+        _wakeEvent = CreateEventW(null, 0, 0, null); // Auto reset event
+        if (_wakeEvent == 0)
+        {
+            CloseHandle(_completionEvent);
+            FreeAllMemory();
+            throw new InvalidOperationException("Failed to create wake event");
+        }
+
+        // High-res timer requires Windows 10 1803 / Server 2019; preferred because it does not
+        // touch the system timer resolution. Older hosts fall back to timeBeginPeriod(1), which
+        // makes the plain wait timeout ~1ms accurate at the cost of a raised interrupt rate.
+        _idleTimer = CreateWaitableTimerExW(null, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (_idleTimer == 0)
+        {
+            _timerPeriodRaised = timeBeginPeriod(1) == 0;
+        }
+
         // Must cover every socket holding its full complement of recv + send ops: RIO corrupts a
         // full completion queue (RIO_CORRUPT_CQ) rather than back-pressuring.
         var rioCqSize = mc * (RIO_OUTSTANDING_RECV_PER_SOCKET + _outstandingSendsPerSocket);
@@ -219,7 +251,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         _rioCq = _rio.RIOCreateCompletionQueue(rioCqSize, &notificationCompletion);
         if (_rioCq == RIO_INVALID_CQ)
         {
-            CloseHandle(_completionEvent);
+            CloseCtorHandles();
             FreeAllMemory();
             throw new InvalidOperationException("Failed to create RIO completion queue");
         }
@@ -233,27 +265,47 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         {
             _acceptPool[i].AcceptSocket = INVALID_SOCKET;
             _acceptPool[i].ConnSlot = -1;
-            _acceptPool[i].Event = CreateEventW(null, 1, 0, null); // Manual reset
-            if (_acceptPool[i].Event == 0)
-            {
-                // Cleanup previously created events
-                for (uint j = 0; j < i; j++)
-                {
-                    if (_acceptPool[j].Event != 0)
-                    {
-                        CloseHandle(_acceptPool[j].Event);
-                    }
-                }
-                _rio.RIOCloseCompletionQueue(_rioCq);
-                NativeMemory.Free(_acceptPool);
-                FreeAllMemory();
-                throw new InvalidOperationException("Failed to create event for AcceptEx pool");
-            }
+        }
+
+        // Shared by every pending AcceptEx: it only wakes a blocked WaitForCompletion; completion
+        // itself is detected by reading OVERLAPPED.Internal, so one signal is enough.
+        _acceptEvent = CreateEventW(null, 1, 0, null); // Manual reset
+        if (_acceptEvent == 0)
+        {
+            _rio.RIOCloseCompletionQueue(_rioCq);
+            NativeMemory.Free(_acceptPool);
+            CloseCtorHandles();
+            FreeAllMemory();
+            throw new InvalidOperationException("Failed to create AcceptEx completion event");
         }
 
         // Step 8: Initialize owned listeners array
         _ownedListenerCapacity = 16;
         _ownedListeners = (nint*)NativeMemory.AllocZeroed(16, (nuint)sizeof(nint));
+    }
+
+    // Releases ctor-acquired kernel resources on a failed construction step.
+    private void CloseCtorHandles()
+    {
+        if (_completionEvent != 0)
+        {
+            CloseHandle(_completionEvent);
+        }
+
+        if (_wakeEvent != 0)
+        {
+            CloseHandle(_wakeEvent);
+        }
+
+        if (_idleTimer != 0)
+        {
+            CloseHandle(_idleTimer);
+        }
+
+        if (_timerPeriodRaised)
+        {
+            timeEndPeriod(1);
+        }
     }
 
     // =========================================================================
@@ -466,11 +518,79 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     /// <inheritdoc/>
     public void WaitForCompletion(int timeoutMs)
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         // Arm notification: resets event (NotifyReset=1) and arms CQ
         _rio.RIONotify(_rioCq);
 
-        // Wait for completion or timeout
-        WaitForSingleObject(_completionEvent, (uint)timeoutMs);
+        var handles = stackalloc nint[4];
+        handles[0] = _completionEvent;
+        handles[1] = _wakeEvent;
+        handles[2] = _acceptEvent;
+        var count = 3u;
+
+        var waitMs = (uint)timeoutMs;
+
+        // Prefer the high-resolution timer; the wait's own timeout quantises to the system timer
+        // resolution.
+        if (_idleTimer != 0 && timeoutMs > 0)
+        {
+            // Negative means relative, in 100ns units.
+            var dueTime = -(long)timeoutMs * 10_000L;
+            if (SetWaitableTimer(_idleTimer, &dueTime, 0, null, null, 0) != 0)
+            {
+                handles[count++] = _idleTimer;
+                waitMs = INFINITE;
+            }
+        }
+
+        var result = WaitForMultipleObjects(count, handles, 0, waitMs);
+
+        if (result == WAIT_OBJECT_0 + 2 && _pendingAcceptCount == 0)
+        {
+            // Stale accept signal: the kernel's SetEvent landed after the scan consumed the
+            // completion via the Internal read. The scan's reset is gated on the count, so
+            // without this every subsequent wait would return immediately.
+            ResetEvent(_acceptEvent);
+        }
+        else if (result == WAIT_FAILED && !_loggedWaitFailure)
+        {
+            // Degrades to spinning; logged once so it is not silent and cannot flood.
+            _loggedWaitFailure = true;
+            Console.Error.WriteLine(
+                $"IORingGroup: WaitForMultipleObjects failed (error {Marshal.GetLastPInvokeError()}); the event loop will spin instead of sleeping."
+            );
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// True with the high-resolution waitable timer (Windows 10 1803 / Server 2019) or the
+    /// timeBeginPeriod(1) fallback; false only when both are unavailable.
+    /// </remarks>
+    public bool SupportsHighResolutionWait => _idleTimer != 0 || _timerPeriodRaised;
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        // Guarded so Dispose can drain in-flight calls before closing the handle.
+        Interlocked.Increment(ref _wakeGuard);
+        try
+        {
+            if (_disposed || _wakeEvent == 0)
+            {
+                return;
+            }
+
+            SetEvent(_wakeEvent);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     // =========================================================================
@@ -644,16 +764,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
     private void DequeueRioCompletions()
     {
-        // AcceptEx scan calls WaitForSingleObject per pending slot.
-        // Adaptive throttle: always check if last scan found completions (active accept traffic,
-        // e.g. DDoS or connection burst). Only throttle (every 32 calls) when last scan found nothing
-        // (steady state with pre-posted accepts sitting idle).
-        if (_pendingAcceptCount > 0 && (_acceptsFoundLastCheck || (_acceptCheckCounter++ & 31) == 0))
-        {
-            var oldCount = _pendingAcceptCount;
-            CheckAcceptExCompletions();
-            _acceptsFoundLastCheck = _pendingAcceptCount < oldCount;
-        }
+        // Unthrottled: the scan is a plain memory read per pending slot, and a skipped scan
+        // leaves the accept event signaled, turning every wait into an immediate return.
+        CheckAcceptExCompletions();
 
         if (_rioCq == RIO_INVALID_CQ)
         {
@@ -1134,10 +1247,10 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         ctx->Pending = true;
         _pendingAcceptCount++;
 
-        // Initialize overlapped with event
+        // Zeroing leaves Internal at 0, which the completion scan would read as "finished".
         Unsafe.InitBlock(&ctx->Overlapped, 0, (uint)sizeof(OVERLAPPED));
-        ResetEvent(ctx->Event);
-        ctx->Overlapped.hEvent = ctx->Event;
+        ctx->Overlapped.Internal = STATUS_PENDING;
+        ctx->Overlapped.hEvent = _acceptEvent;
 
         // Post AcceptEx
         uint bytesReceived = 0;
@@ -1178,6 +1291,10 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             return;
         }
 
+        // Reset before scanning: a completion landing mid-scan re-signals and forces a rescan;
+        // resetting afterwards would swallow it.
+        ResetEvent(_acceptEvent);
+
         uint found = 0;
         for (uint i = 0; i < _acceptPoolSize; i++)
         {
@@ -1187,8 +1304,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
                 continue;
             }
 
-            // Check if event is signaled (non-blocking)
-            if (WaitForSingleObject(ctx->Event, 0) != WAIT_OBJECT_0)
+            // Plain memory read of the kernel-written status -- what HasOverlappedIoCompleted
+            // expands to. Replaces a WaitForSingleObject syscall per pending slot.
+            if (ctx->Overlapped.Internal == STATUS_PENDING)
             {
                 // Early exit: if we've checked all pending slots, stop scanning
                 if (++found >= _pendingAcceptCount)
@@ -1262,26 +1380,70 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         _disposed = true;
 
+        // Drain in-flight Wake() calls before closing any handle they may touch.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
+
         // Cancel pending AcceptEx and cleanup pool
         if (_acceptPool != null)
         {
+            var pendingCancels = false;
             for (uint i = 0; i < _acceptPoolSize; i++)
             {
                 var ctx = &_acceptPool[i];
                 if (ctx->Pending && ctx->ListenSocket != INVALID_SOCKET)
                 {
                     CancelIoEx(ctx->ListenSocket, &ctx->Overlapped);
+                    pendingCancels = true;
                 }
+            }
+
+            // CancelIoEx is asynchronous: the kernel writes the final status into each OVERLAPPED
+            // (inside _acceptPool) when the cancel completes, so the pool cannot be freed until
+            // every pending slot reaches a final state.
+            var safeToFree = true;
+            if (pendingCancels)
+            {
+                var deadline = Environment.TickCount64 + 2000;
+                for (uint i = 0; i < _acceptPoolSize && safeToFree; i++)
+                {
+                    var ctx = &_acceptPool[i];
+                    while (ctx->Pending && ctx->Overlapped.Internal == STATUS_PENDING)
+                    {
+                        if (Environment.TickCount64 >= deadline)
+                        {
+                            safeToFree = false;
+                            break;
+                        }
+
+                        Thread.Yield();
+                    }
+                }
+            }
+
+            for (uint i = 0; i < _acceptPoolSize; i++)
+            {
+                var ctx = &_acceptPool[i];
                 if (ctx->AcceptSocket != INVALID_SOCKET)
                 {
                     closesocket(ctx->AcceptSocket);
                 }
-                if (ctx->Event != 0)
-                {
-                    CloseHandle(ctx->Event);
-                }
             }
-            NativeMemory.Free(_acceptPool);
+
+            if (safeToFree)
+            {
+                NativeMemory.Free(_acceptPool);
+            }
+            else
+            {
+                // Leak rather than free memory the kernel may still write to.
+                Console.Error.WriteLine(
+                    "IORingGroup: a cancelled AcceptEx did not complete in time; leaking the accept pool instead of freeing it."
+                );
+            }
         }
 
         // Cleanup owned listeners
@@ -1317,10 +1479,29 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             _rio.RIOCloseCompletionQueue(_rioCq);
         }
 
-        // Close completion notification event
         if (_completionEvent != 0)
         {
             CloseHandle(_completionEvent);
+        }
+
+        if (_wakeEvent != 0)
+        {
+            CloseHandle(_wakeEvent);
+        }
+
+        if (_idleTimer != 0)
+        {
+            CloseHandle(_idleTimer);
+        }
+
+        if (_timerPeriodRaised)
+        {
+            timeEndPeriod(1);
+        }
+
+        if (_acceptEvent != 0)
+        {
+            CloseHandle(_acceptEvent);
         }
 
         // Deregister external buffers

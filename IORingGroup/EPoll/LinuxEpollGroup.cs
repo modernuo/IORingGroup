@@ -41,6 +41,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     // Submit() re-arms whatever direction is still pending.
     private readonly uint[] _armedIo;
 
+    // Dirty-connection queue: Submit() re-examines only connections whose arming inputs changed
+    // (O(changed), not O(maxConnections)). Invariant: a connection with wanted != armed is always
+    // queued. _isDirty deduplicates, bounding the queue at _maxConnections.
+    private readonly int[] _dirtyQueue;
+    private readonly bool[] _isDirty;
+    private int _dirtyCount;
+
     // Accept operations (dictionary keyed by listener FD — typically 1-2 listeners)
     private readonly Dictionary<int, PendingOp> _pendingAccepts = new();
     private readonly HashSet<int> _acceptsSubmitted = new();
@@ -62,7 +69,17 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     private readonly int[] _externalBufferLengths;
     private int _externalBufferCount;
 
-    private bool _disposed;
+    // Wake eventfd, registered level-triggered; the latched counter makes a wake sticky.
+    private readonly int _wakeFd = -1;
+
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing fds.
+    private int _wakeGuard;
+
+    // Sentinel epoll data for the wake fd; high bit clear so IsAcceptData never matches, checked
+    // before the connId path.
+    private const long WakeEventData = long.MaxValue;
+
+    private volatile bool _disposed;
 
     private struct PendingOp
     {
@@ -103,6 +120,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         _hasRecv = new bool[maxConnections];
         _hasSend = new bool[maxConnections];
         _armedIo = new uint[maxConnections];
+        _dirtyQueue = new int[maxConnections];
+        _isDirty = new bool[maxConnections];
 
         // Initialize free stack (all slots available, lowest first for pop order)
         for (var i = 0; i < maxConnections; i++)
@@ -123,6 +142,46 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         {
             var errno = Marshal.GetLastPInvokeError();
             throw new InvalidOperationException($"epoll_create1() failed: errno {errno}");
+        }
+
+        // Register the wake eventfd, level-triggered so the counter stays readable until drained.
+        // Both steps must succeed or Wake() is disabled with a log: an eventfd outside the epoll
+        // set would receive signals nobody is watching.
+        _wakeFd = Syscalls.eventfd(0, EFD_NONBLOCK);
+        if (_wakeFd < 0)
+        {
+            Console.Error.WriteLine(
+                $"IORingGroup: failed to create wake eventfd (errno {Marshal.GetLastPInvokeError()}); " +
+                "callers will only wake on I/O or timeout."
+            );
+        }
+        else
+        {
+            var evBuf = stackalloc byte[16];
+
+            // Zero explicitly — see EpollCtlMod for why the padding cannot be left to chance.
+            *(ulong*)evBuf = 0;
+            *(ulong*)(evBuf + 8) = 0;
+
+            *(uint*)evBuf = (uint)epoll_events.EPOLLIN;
+            if (_epollEventSize == 12)
+            {
+                *(long*)(evBuf + 4) = WakeEventData;
+            }
+            else
+            {
+                *(long*)(evBuf + 8) = WakeEventData;
+            }
+
+            if (Syscalls.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_ADD, _wakeFd, (nint)evBuf) < 0)
+            {
+                Console.Error.WriteLine(
+                    $"IORingGroup: failed to register wake eventfd with epoll (errno {Marshal.GetLastPInvokeError()}); " +
+                    "callers will only wake on I/O or timeout."
+                );
+                Syscalls.close(_wakeFd);
+                _wakeFd = -1;
+            }
         }
     }
 
@@ -255,6 +314,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         UserData = userData
                     };
                     _hasSend[connId] = true;
+                    MarkDirty(connId);
                 }
                 else
                 {
@@ -287,11 +347,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             if (_hasRecv[i] && _pendingRecvs[i].UserData == targetUserData)
             {
                 _hasRecv[i] = false;
+                MarkDirty(i);
             }
 
             if (_hasSend[i] && _pendingSends[i].UserData == targetUserData)
             {
                 _hasSend[i] = false;
+                MarkDirty(i);
             }
         }
 
@@ -339,6 +401,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasSend[connId] = true;
+        MarkDirty(connId);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -354,24 +417,44 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             UserData = userData
         };
         _hasRecv[connId] = true;
+        MarkDirty(connId);
     }
 
     // =============================================================================
     // Submit / Wait / Peek
     // =============================================================================
 
+    // Every write to _hasRecv/_hasSend/_armedIo/_connIdToFd must be paired with this, or Submit()
+    // will never re-examine the connection.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkDirty(int connId)
+    {
+        if (!_isDirty[connId])
+        {
+            _isDirty[connId] = true;
+            _dirtyQueue[_dirtyCount++] = connId;
+        }
+    }
+
     /// <inheritdoc/>
     public int Submit()
     {
         var submitted = 0;
 
-        // Arm each connection for the full set of directions it currently wants.
-        // Recv and send share one fd, so we always MOD the combined mask — arming
-        // one direction must never drop interest in the other. EPOLLONESHOT means
-        // the kernel disarms the fd after a single event, so _armedIo is reset to 0
-        // on delivery and the still-pending direction is re-armed here next time.
-        for (var i = 0; i < _maxConnections; i++)
+        // Arm each dirty connection for the full set of directions it wants. Recv and send share
+        // one fd, so always MOD the combined mask — arming one direction must never drop the
+        // other. EPOLLONESHOT disarms the fd on delivery, which marks the connection dirty for
+        // re-arming here.
+        var dirty = _dirtyCount;
+        _dirtyCount = 0;
+        for (var d = 0; d < dirty; d++)
         {
+            var i = _dirtyQueue[d];
+
+            // Cleared before processing so a failed MOD can re-mark. A re-mark appends at an
+            // index <= the one being read, so it never overwrites an unread entry.
+            _isDirty[i] = false;
+
             var fd = _connIdToFd[i];
             if (fd < 0)
             {
@@ -402,6 +485,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             {
                 _armedIo[i] = want;
                 submitted++;
+            }
+            else
+            {
+                // Retry on the next Submit.
+                MarkDirty(i);
             }
         }
 
@@ -452,6 +540,32 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Block up to timeoutMs for readiness, executing any ready I/O into completions.
         // Lets the caller sleep instead of busy-polling PeekCompletions.
         PollAndExecute(timeoutMs);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>epoll_wait's timeout is backed by a high-resolution kernel timer.</remarks>
+    public bool SupportsHighResolutionWait => true;
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        // Guarded so Dispose can drain in-flight calls before closing the fd.
+        Interlocked.Increment(ref _wakeGuard);
+        try
+        {
+            if (_disposed || _wakeFd < 0)
+            {
+                return;
+            }
+
+            // The counter latches, so a wake landing before the caller blocks is not lost.
+            ulong one = 1;
+            Syscalls.write(_wakeFd, (nint)(&one), 8);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     /// <inheritdoc/>
@@ -537,6 +651,14 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                     data = *(long*)(ptr + 8);
                 }
 
+                if (data == WakeEventData)
+                {
+                    // Drain the counter so the level-triggered fd stops reporting ready.
+                    ulong drain;
+                    Syscalls.read(_wakeFd, (nint)(&drain), 8);
+                    continue;
+                }
+
                 if (IsAcceptData(data))
                 {
                     // Accept event
@@ -558,10 +680,10 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                         continue;
                     }
 
-                    // EPOLLONESHOT disarmed the whole fd on this delivery, so clear
-                    // the armed mask for both directions. Whatever remains pending
-                    // (after the handlers below run) is re-armed by the next Submit().
+                    // EPOLLONESHOT disarmed the fd; the dirty mark makes the next Submit re-arm
+                    // whatever the handlers below leave pending (and covers their flag writes).
                     _armedIo[connId] = 0;
+                    MarkDirty(connId);
 
                     // Handle error conditions
                     if ((events & ((uint)epoll_events.EPOLLERR | (uint)epoll_events.EPOLLHUP)) != 0)
@@ -901,6 +1023,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         var connId = _freeSlots[--_freeSlotCount];
         _connIdToFd[connId] = fd;
         _armedIo[connId] = 0;
+        MarkDirty(connId);
 
         // Add to epoll with EPOLLET|EPOLLONESHOT but no initial event mask
         // This registers the fd; actual interest will be set by Submit()
@@ -950,6 +1073,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         // Return slot to free stack
         _connIdToFd[connId] = -1;
         _freeSlots[_freeSlotCount++] = connId;
+        MarkDirty(connId);
     }
 
     /// <inheritdoc/>
@@ -1102,6 +1226,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         _disposed = true;
 
+        // Drain in-flight Wake() calls before closing any fd they may touch.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
+
         // Clear pending ops
         for (var i = 0; i < _maxConnections; i++)
         {
@@ -1112,6 +1243,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         _pendingAccepts.Clear();
         _acceptsSubmitted.Clear();
+
+        // _disposed was set at the top of Dispose, so a concurrent Wake() observes it and returns
+        // before touching this fd.
+        if (_wakeFd >= 0)
+        {
+            Syscalls.close(_wakeFd);
+        }
 
         if (_epollFd >= 0)
         {

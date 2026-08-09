@@ -67,6 +67,23 @@ public class WindowsManagedRIOGroupTests
     private const int MaxConnections = 128;
 
     [SkippableFact]
+    public void Dispose_WithPendingAccepts_DoesNotTouchFreedMemory()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        // A pre-posted AcceptEx that never completes forces Dispose down its CancelIoEx path,
+        // which must wait for the kernel's final OVERLAPPED write before freeing the pool.
+        var ring = new WindowsManagedRIOGroup(MaxConnections);
+        var listener = ring.CreateListener("127.0.0.1", 0, 128);
+        Skip.If(listener == -1, "CreateListener failed");
+
+        ring.PrepareAccept(listener, 0, 0, 100);
+        ring.Submit();
+
+        ring.Dispose();
+    }
+
+    [SkippableFact]
     public void Create_ReturnsValidInstance()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");

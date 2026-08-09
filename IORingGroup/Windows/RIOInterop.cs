@@ -56,6 +56,19 @@ internal static unsafe class RIOInterop
     public const uint SIO_GET_EXTENSION_FUNCTION_POINTER = 0xC8000006;
 
     public const uint WAIT_OBJECT_0 = 0;
+    public const uint WAIT_TIMEOUT = 258;
+    public const uint WAIT_FAILED = 0xFFFFFFFF;
+    public const uint INFINITE = 0xFFFFFFFF;
+
+    // Requires Windows 10 1803 / Server 2019.
+    public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+    public const uint TIMER_ALL_ACCESS = 0x1F0003;
+
+    public const int ERROR_IO_INCOMPLETE = 996;
+
+    // OVERLAPPED.Internal value while an operation is outstanding; the kernel overwrites it with
+    // the final NTSTATUS on completion.
+    public const nuint STATUS_PENDING = 0x103;
 
     // Linux-style poll masks (used by IIORingGroup interface)
     public const short POLLRDNORM = 0x0100;
@@ -445,6 +458,32 @@ internal static unsafe class RIOInterop
 
     [DllImport("kernel32.dll")]
     public static extern uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll")]
+    public static extern int SetEvent(nint hEvent);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForMultipleObjects(uint nCount, nint* lpHandles, int bWaitAll, uint dwMilliseconds);
+
+    // Returns 0 (TIMERR_NOERROR) on success; must be paired with timeEndPeriod.
+    [DllImport("winmm.dll")]
+    public static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll")]
+    public static extern uint timeEndPeriod(uint uPeriod);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern nint CreateWaitableTimerExW(void* lpTimerAttributes, void* lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [DllImport("kernel32.dll")]
+    public static extern int SetWaitableTimer(
+        nint hTimer,
+        long* lpDueTime,
+        int lPeriod,
+        void* pfnCompletionRoutine,
+        void* lpArgToCompletionRoutine,
+        int fResume
+    );
 
     [DllImport("kernel32.dll")]
     public static extern int GetOverlappedResult(nint hFile, OVERLAPPED* lpOverlapped, uint* lpNumberOfBytesTransferred, int bWait);

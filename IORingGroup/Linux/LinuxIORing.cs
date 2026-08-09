@@ -102,6 +102,9 @@ public static partial class LinuxIORing
     [LibraryImport("libc", SetLastError = true)]
     public static partial long read(int fd, nint buf, nuint count);
 
+    [LibraryImport("libc", SetLastError = true)]
+    public static partial long write(int fd, nint buf, nuint count);
+
     /// <summary>
     /// io_uring_setup syscall wrapper.
     /// </summary>

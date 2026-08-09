@@ -60,7 +60,15 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     private readonly io_uring_cqe* _cqes;
 
     private readonly int _eventFd = -1;
-    private bool _disposed;
+
+    // Dedicated wake eventfd: WaitForCompletion drains _eventFd on entry, which would swallow a
+    // shared wake.
+    private readonly int _wakeFd = -1;
+
+    // Wake() calls in flight past the _disposed check; Dispose drains to zero before closing fds.
+    private int _wakeGuard;
+
+    private volatile bool _disposed;
 
     public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
     {
@@ -174,6 +182,16 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
             LinuxIORing.close(_ringFd);
             throw new InvalidOperationException("Failed to register eventfd with io_uring");
+        }
+
+        _wakeFd = LinuxIORing.eventfd(0, LinuxIORing.EFD_NONBLOCK);
+        if (_wakeFd < 0)
+        {
+            // Not fatal (callers fall back to their timeout) but must not be silent.
+            Console.Error.WriteLine(
+                $"IORingGroup: failed to create wake eventfd (errno {Marshal.GetLastPInvokeError()}); " +
+                "callers will only wake on I/O or timeout."
+            );
         }
 
         // Initialize local tail from shared memory
@@ -436,7 +454,8 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public void WaitForCompletion(int timeoutMs)
     {
-        // Clear any pending eventfd notifications from already-processed completions
+        // Clear stale eventfd notifications from already-processed completions. This drain is why
+        // Wake() needs its own fd.
         ulong val;
         LinuxIORing.read(_eventFd, (nint)(&val), 8); // Non-blocking: returns EAGAIN if counter=0
 
@@ -446,9 +465,52 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             return;
         }
 
-        // Wait for new completions or timeout
-        var pfd = new LinuxIORing.pollfd { fd = _eventFd, events = LinuxIORing.POLLIN };
-        LinuxIORing.poll((nint)(&pfd), 1, timeoutMs);
+        // Wait for new completions, an explicit wake, or timeout.
+        var pfds = stackalloc LinuxIORing.pollfd[2];
+        pfds[0] = new LinuxIORing.pollfd { fd = _eventFd, events = LinuxIORing.POLLIN };
+        var count = 1u;
+
+        if (_wakeFd >= 0)
+        {
+            pfds[1] = new LinuxIORing.pollfd { fd = _wakeFd, events = LinuxIORing.POLLIN };
+            count = 2;
+        }
+
+        LinuxIORing.poll((nint)pfds, count, timeoutMs);
+
+        // Drain after the poll, never before (the latched counter is what makes a wake sticky),
+        // and only when the wake fd actually fired -- the common case skips the read() syscall.
+        if (count == 2 && (pfds[1].revents & LinuxIORing.POLLIN) != 0)
+        {
+            ulong drain;
+            LinuxIORing.read(_wakeFd, (nint)(&drain), 8);
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>poll's timeout is backed by a high-resolution kernel timer.</remarks>
+    public bool SupportsHighResolutionWait => true;
+
+    /// <inheritdoc/>
+    public void Wake()
+    {
+        // Guarded so Dispose can drain in-flight calls before closing the fd.
+        Interlocked.Increment(ref _wakeGuard);
+        try
+        {
+            if (_disposed || _wakeFd < 0)
+            {
+                return;
+            }
+
+            // The counter latches, so a wake landing before the caller blocks is not lost.
+            ulong one = 1;
+            LinuxIORing.write(_wakeFd, (nint)(&one), 8);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     // =============================================================================
@@ -725,6 +787,13 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         _disposed = true;
 
+        // Drain in-flight Wake() calls before closing any fd they may touch.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
+
         if (_sqesPtr != 0 && _sqesPtr != -1)
         {
             LinuxIORing.munmap(_sqesPtr, _sqesSize);
@@ -738,6 +807,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         if (_sqRingPtr != 0 && _sqRingPtr != -1)
         {
             LinuxIORing.munmap(_sqRingPtr, _sqRingSize);
+        }
+
+        if (_wakeFd >= 0)
+        {
+            LinuxIORing.close(_wakeFd);
         }
 
         if (_eventFd >= 0)

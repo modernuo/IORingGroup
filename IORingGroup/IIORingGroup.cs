@@ -260,4 +260,32 @@ public interface IIORingGroup : IDisposable
     /// This method has zero overhead when not called (under load, the caller skips it).
     /// </remarks>
     void WaitForCompletion(int timeoutMs);
+
+    /// <summary>
+    /// Wakes a thread blocked in <see cref="WaitForCompletion"/>.
+    /// </summary>
+    /// <remarks>
+    /// Thread-safe and sticky: a call landing between an idle check and the subsequent
+    /// <see cref="WaitForCompletion"/> makes that wait return immediately instead of being lost.
+    /// <para>
+    /// Platform implementations:
+    /// <list type="bullet">
+    /// <item>Windows RIO: SetEvent on an auto-reset wake event in the wait set</item>
+    /// <item>Linux io_uring: writes a dedicated wake eventfd in the poll set</item>
+    /// <item>Linux epoll: writes a dedicated eventfd registered in the epoll set</item>
+    /// <item>macOS kqueue: triggers an EVFILT_USER event</item>
+    /// </list>
+    /// </para>
+    /// Safe to call after <see cref="IDisposable.Dispose"/>, where it is a no-op.
+    /// </remarks>
+    void Wake();
+
+    /// <summary>
+    /// Whether <see cref="WaitForCompletion"/> can honour a timeout of a few milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// False means short waits quantise to the system timer resolution (15.625ms Windows
+    /// default). Callers that need sub-frame timing should not sleep on such a host.
+    /// </remarks>
+    bool SupportsHighResolutionWait { get; }
 }
