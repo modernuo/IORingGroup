@@ -66,6 +66,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     // landing before the caller blocks makes epoll_wait return immediately instead of losing it.
     private readonly int _wakeFd = -1;
 
+    // Counts Wake() calls that are past the _disposed check but not yet done with the fd. Dispose
+    // waits for it to reach zero before closing fds, closing the window where a concurrent Wake
+    // could write to a freshly closed (and possibly recycled) fd number.
+    private int _wakeGuard;
+
     // Sentinel epoll data for the wake fd. The high bit is clear so IsAcceptData never matches it,
     // and it is checked before the connId path, so it cannot collide with a real connection.
     private const long WakeEventData = long.MaxValue;
@@ -135,9 +140,19 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
         // Register the wake eventfd. Level-triggered on purpose: the counter stays readable until
         // drained, so a wake cannot be missed between epoll_wait calls. A failure here is not
-        // fatal — Wake() becomes a no-op and callers fall back to their own timeout.
+        // fatal — Wake() becomes a no-op and callers fall back to their own timeout — but it must
+        // not be silent, or cross-thread work would appear to arrive late with nothing to point
+        // at. Both steps must succeed: an eventfd that never made it into the epoll set would let
+        // Wake() write signals nobody is watching.
         _wakeFd = Syscalls.eventfd(0, EFD_NONBLOCK);
-        if (_wakeFd >= 0)
+        if (_wakeFd < 0)
+        {
+            Console.Error.WriteLine(
+                $"IORingGroup: failed to create wake eventfd (errno {Marshal.GetLastPInvokeError()}); " +
+                "callers will only wake on I/O or timeout."
+            );
+        }
+        else
         {
             var evBuf = stackalloc byte[16];
 
@@ -155,7 +170,15 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                 *(long*)(evBuf + 8) = WakeEventData;
             }
 
-            Syscalls.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_ADD, _wakeFd, (nint)evBuf);
+            if (Syscalls.epoll_ctl(_epollFd, (int)epoll_op.EPOLL_CTL_ADD, _wakeFd, (nint)evBuf) < 0)
+            {
+                Console.Error.WriteLine(
+                    $"IORingGroup: failed to register wake eventfd with epoll (errno {Marshal.GetLastPInvokeError()}); " +
+                    "callers will only wake on I/O or timeout."
+                );
+                Syscalls.close(_wakeFd);
+                _wakeFd = -1;
+            }
         }
     }
 
@@ -498,16 +521,27 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// <inheritdoc/>
     public void Wake()
     {
-        if (_disposed || _wakeFd < 0)
+        // The guard makes the fd use visible to Dispose, which waits for it to drain before
+        // closing fds -- otherwise this write could land on a closed, kernel-recycled fd number
+        // and deposit 8 bytes into an unrelated file.
+        Interlocked.Increment(ref _wakeGuard);
+        try
         {
-            return;
-        }
+            if (_disposed || _wakeFd < 0)
+            {
+                return;
+            }
 
-        // The eventfd counter latches, so this cannot be lost if it lands between the caller's
-        // idle check and its epoll_wait. EAGAIN means the counter is already saturated, which
-        // still counts as signalled.
-        ulong one = 1;
-        Syscalls.write(_wakeFd, (nint)(&one), 8);
+            // The eventfd counter latches, so this cannot be lost if it lands between the caller's
+            // idle check and its epoll_wait. EAGAIN means the counter is already saturated, which
+            // still counts as signalled.
+            ulong one = 1;
+            Syscalls.write(_wakeFd, (nint)(&one), 8);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     /// <inheritdoc/>
@@ -1165,6 +1199,15 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         }
 
         _disposed = true;
+
+        // A Wake() that passed its _disposed check before the flag was set may still be inside
+        // its write(). Wait it out before any fd is closed, or the write could land on a closed
+        // -- and possibly already recycled -- fd number.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
 
         // Clear pending ops
         for (var i = 0; i < _maxConnections; i++)

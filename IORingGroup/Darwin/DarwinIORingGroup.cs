@@ -58,6 +58,12 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     // on every wake.
     private readonly kevent[] _wakeTrigger;
     private bool _wakeRegistered = true;
+    private volatile bool _loggedWakeFailure;
+
+    // Counts Wake() calls that are past the _disposed check but not yet done with the kqueue fd.
+    // Dispose waits for it to reach zero before closing it, closing the window where a concurrent
+    // Wake could issue a kevent on a freshly closed (and possibly recycled) fd number.
+    private int _wakeGuard;
 
     private volatile bool _disposed;
 
@@ -673,14 +679,35 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public void Wake()
     {
-        if (_disposed || !_wakeRegistered)
+        // The guard makes the fd use visible to Dispose, which waits for it to drain before
+        // closing the kqueue fd -- otherwise this kevent could land on a closed, kernel-recycled
+        // fd number.
+        Interlocked.Increment(ref _wakeGuard);
+        try
         {
-            return;
-        }
+            if (_disposed || !_wakeRegistered)
+            {
+                return;
+            }
 
-        // Goes straight to kevent rather than through AddKqueueChange: this is called from other
-        // threads, and the batched change list is not thread-safe.
-        Darwin.kevent(_kqueueFd, _wakeTrigger, 1, null, 0, nint.Zero);
+            // Goes straight to kevent rather than through AddKqueueChange: this is called from
+            // other threads, and the batched change list is not thread-safe.
+            if (Darwin.kevent(_kqueueFd, _wakeTrigger, 1, null, 0, nint.Zero) < 0 && !_loggedWakeFailure)
+            {
+                // A silently lost wake means cross-thread work arrives late with nothing to point
+                // at -- the same reason a registration failure is surfaced. Logged once so a
+                // persistent failure cannot flood.
+                _loggedWakeFailure = true;
+                Console.Error.WriteLine(
+                    $"IORingGroup: wake kevent failed (errno {Marshal.GetLastPInvokeError()}); " +
+                    "callers will only wake on I/O or timeout."
+                );
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     // =============================================================================
@@ -973,6 +1000,15 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
 
         _disposed = true;
+
+        // A Wake() that passed its _disposed check before the flag was set may still be inside
+        // its kevent(). Wait it out before the kqueue fd is closed, or the call could land on a
+        // closed -- and possibly already recycled -- fd number.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
 
         // Clear pending ops
         for (var i = 0; i < _maxConnections; i++)

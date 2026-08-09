@@ -273,7 +273,9 @@ public interface IIORingGroup : IDisposable
     /// Platform implementations:
     /// <list type="bullet">
     /// <item>Windows RIO: SetEvent on an auto-reset wake event in the wait set</item>
-    /// <item>Linux io_uring: writes the eventfd already registered with the ring</item>
+    /// <item>Linux io_uring: writes a dedicated wake eventfd in the poll set (the ring's own
+    /// completion eventfd is drained on entry to <see cref="WaitForCompletion"/>, which would
+    /// swallow a wake)</item>
     /// <item>Linux epoll: writes a dedicated eventfd registered in the epoll set</item>
     /// <item>macOS kqueue: triggers an EVFILT_USER event</item>
     /// </list>
@@ -286,11 +288,11 @@ public interface IIORingGroup : IDisposable
     /// Whether <see cref="WaitForCompletion"/> can honour a timeout of a few milliseconds.
     /// </summary>
     /// <remarks>
-    /// False means short waits are quantised to something far coarser -- on Windows without a
-    /// high-resolution waitable timer, the system timer resolution of 15.625ms -- so a caller
-    /// asking for 2ms will routinely block for eight times that. A caller that cares about
-    /// sub-frame timing should not sleep at all on such a host, and should say so loudly rather
-    /// than silently running an order of magnitude behind what it asked for.
+    /// False means short waits are quantised to something far coarser -- on Windows with neither
+    /// a high-resolution waitable timer nor a raised system timer resolution, the default
+    /// 15.625ms -- so a caller asking for 2ms will routinely block for eight times that. A caller
+    /// that cares about sub-frame timing should not sleep at all on such a host, and should say
+    /// so loudly rather than silently running an order of magnitude behind what it asked for.
     /// </remarks>
     bool SupportsHighResolutionWait { get; }
 }

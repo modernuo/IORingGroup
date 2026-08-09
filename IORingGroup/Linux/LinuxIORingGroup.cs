@@ -64,6 +64,12 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // Wake() gets its own eventfd rather than sharing _eventFd, because WaitForCompletion drains
     // the completion fd on entry to discard stale notifications -- which would swallow a wake.
     private readonly int _wakeFd = -1;
+
+    // Counts Wake() calls that are past the _disposed check but not yet done with the fd. Dispose
+    // waits for it to reach zero before closing fds, closing the window where a concurrent Wake
+    // could write to a freshly closed (and possibly recycled) fd number.
+    private int _wakeGuard;
+
     private volatile bool _disposed;
 
     public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
@@ -476,9 +482,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
         LinuxIORing.poll((nint)pfds, count, timeoutMs);
 
-        // Drain afterwards, never before. The wake fd's counter is what makes a wake sticky across
-        // the gap between a caller deciding it is idle and actually blocking.
-        if (_wakeFd >= 0)
+        // Drain afterwards, never before -- the wake fd's counter is what makes a wake sticky
+        // across the gap between a caller deciding it is idle and actually blocking. Gated on
+        // revents because poll already reported readiness for free: wakes are rare next to
+        // timeouts and I/O completions, so the common case skips the read() syscall entirely.
+        if (count == 2 && (pfds[1].revents & LinuxIORing.POLLIN) != 0)
         {
             ulong drain;
             LinuxIORing.read(_wakeFd, (nint)(&drain), 8);
@@ -495,16 +503,27 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public void Wake()
     {
-        if (_disposed || _wakeFd < 0)
+        // The guard makes the fd use visible to Dispose, which waits for it to drain before
+        // closing fds -- otherwise this write could land on a closed, kernel-recycled fd number
+        // and deposit 8 bytes into an unrelated file.
+        Interlocked.Increment(ref _wakeGuard);
+        try
         {
-            return;
-        }
+            if (_disposed || _wakeFd < 0)
+            {
+                return;
+            }
 
-        // The counter latches, so a wake landing before the caller blocks makes its poll return
-        // immediately rather than being lost. EAGAIN means the counter is already saturated,
-        // which still counts as signalled.
-        ulong one = 1;
-        LinuxIORing.write(_wakeFd, (nint)(&one), 8);
+            // The counter latches, so a wake landing before the caller blocks makes its poll
+            // return immediately rather than being lost. EAGAIN means the counter is already
+            // saturated, which still counts as signalled.
+            ulong one = 1;
+            LinuxIORing.write(_wakeFd, (nint)(&one), 8);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _wakeGuard);
+        }
     }
 
     // =============================================================================
@@ -780,6 +799,15 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         }
 
         _disposed = true;
+
+        // A Wake() that passed its _disposed check before the flag was set may still be inside
+        // its write(). Wait it out before any fd is closed, or the write could land on a closed
+        // -- and possibly already recycled -- fd number.
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _wakeGuard) != 0)
+        {
+            spinner.SpinOnce();
+        }
 
         if (_sqesPtr != 0 && _sqesPtr != -1)
         {
