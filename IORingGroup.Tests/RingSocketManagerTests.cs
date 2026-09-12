@@ -750,4 +750,52 @@ public class RingSocketManagerTests : IDisposable
             Thread.Sleep(10);
         }
     }
+
+    /// <summary>
+    /// With a retiring buffer attached, nothing is posted from the current buffer until the
+    /// retiring one has fully drained; ordering across the swap is the whole point.
+    /// </summary>
+    [Fact]
+    public void PostSend_DrainsRetiringBufferBeforeCurrent()
+    {
+        var socket = AcceptManaged(out var client);
+
+        var first = "first"u8.ToArray();
+        Write(socket, first);
+        _manager.ProcessSendQueue();
+        _manager.Submit(); // "first" in flight from the original buffer
+
+        // Zero-copy sends read from registered memory, so the stand-in buffer is registered the way
+        // the pool registers its own. Releasing it unregisters and disposes it again.
+        var replacement = IORingBuffer.Create(65536);
+        replacement.BufferId = _ring.RegisterBuffer(replacement);
+
+        var second = "second"u8.ToArray();
+        second.CopyTo(replacement.GetWriteSpan());
+        replacement.CommitWrite(second.Length);
+
+        socket.RetiringSendBuffer = socket.SendBuffer;
+        socket.SendBuffer = replacement;
+        socket.QueueSend();
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+
+        var received = new byte[first.Length + second.Length];
+        var total = 0;
+        for (var i = 0; i < 100 && total < received.Length; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            if (client.Poll(1000, System.Net.Sockets.SelectMode.SelectRead))
+            {
+                total += client.Receive(received, total, received.Length - total, System.Net.Sockets.SocketFlags.None);
+            }
+        }
+
+        Assert.Equal("firstsecond"u8.ToArray(), received);
+        Assert.Null(socket.RetiringSendBuffer);
+
+        client.Close();
+        ProcessUntilAllDisconnected(); // releases (and so disposes) the non-pooled replacement
+    }
 }

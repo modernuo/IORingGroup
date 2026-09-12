@@ -584,7 +584,9 @@ public sealed class RingSocketManager : IDisposable
             return;
         }
 
-        var sendBuffer = socket.SendBuffer;
+        // A retiring buffer is drained before anything is posted from the current one, so the byte
+        // stream stays in order across a swap.
+        var sendBuffer = socket.SendSource;
 
         // Drain everything queued, up to the outstanding limit. Posting from SendOffset rather than
         // ReadOffset allows a second send while the first is still outstanding.
@@ -605,7 +607,7 @@ public sealed class RingSocketManager : IDisposable
             );
 
             sendBuffer.CommitSend(sendLength);
-            socket.PushInFlight(sendLength);
+            socket.PushInFlight(sendLength, sendBuffer);
         }
     }
 
@@ -701,8 +703,8 @@ public sealed class RingSocketManager : IDisposable
     /// </summary>
     private void TrySendFinForPendingDisconnect(RingSocket socket)
     {
-        if (socket is { DisconnectPending: true, SendPending: false,
-                SendBuffer.ReadableBytes: <= 0, RecvPending: true, ShutdownSent: false })
+        if (socket is { DisconnectPending: true, SendPending: false, RecvPending: true, ShutdownSent: false }
+            && socket.SendDrained)
         {
             CloseSocketHandle(socket);
         }
@@ -710,7 +712,8 @@ public sealed class RingSocketManager : IDisposable
 
     private int HandleSendCompletion(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
     {
-        var posted = socket.SendsInFlight > 0 ? socket.PopInFlight() : 0;
+        // The buffer the send was posted from, which may no longer be the socket's current one.
+        var (posted, buffer) = socket.SendsInFlight > 0 ? socket.PopInFlight() : (0, socket.SendBuffer);
 
         if (socket.Aborting)
         {
@@ -739,9 +742,10 @@ public sealed class RingSocketManager : IDisposable
                 return 0;
             }
 
-            socket.SendBuffer.CommitShortSend(result);
+            buffer.CommitShortSend(result);
+            RetireIfDrained(socket, buffer);
 
-            if (socket is { Connected: true, SendBuffer.SendableBytes: > 0 })
+            if (socket.Connected && socket.SendSource.SendableBytes > 0)
             {
                 PostSend(socket);
             }
@@ -758,11 +762,12 @@ public sealed class RingSocketManager : IDisposable
             return eventIndex < events.Length ? EmitSent(socket, result, events, eventIndex) : 0;
         }
 
-        socket.SendBuffer.CommitRead(result);
+        buffer.CommitRead(result);
+        RetireIfDrained(socket, buffer);
 
         // Continue sending if more data (even if DisconnectPending - drain the buffer).
         // SendableBytes, not ReadableBytes: the latter now also counts bytes still in flight.
-        if (socket is { Connected: true, SendBuffer.SendableBytes: > 0 })
+        if (socket.Connected && socket.SendSource.SendableBytes > 0)
         {
             PostSend(socket);
         }
@@ -784,6 +789,24 @@ public sealed class RingSocketManager : IDisposable
 
         return 0;
     }
+
+    /// <summary>
+    /// Returns the retiring send buffer once the last byte posted from it has been sent. From here
+    /// on sends come from the socket's current buffer.
+    /// </summary>
+    private void RetireIfDrained(RingSocket socket, IORingBuffer buffer)
+    {
+        if (buffer == socket.RetiringSendBuffer && buffer.ReadableBytes == 0)
+        {
+            socket.RetiringSendBuffer = null;
+            ReleaseSendBuffer(buffer);
+        }
+    }
+
+    /// <summary>
+    /// Returns a send buffer to the pool it came from.
+    /// </summary>
+    private void ReleaseSendBuffer(IORingBuffer buffer) => _sendBufferPool.Release(buffer);
 
     private static int EmitSent(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
     {
@@ -819,7 +842,15 @@ public sealed class RingSocketManager : IDisposable
         {
             var socket = _releasePending[i];
             _recvBufferPool.Release(socket.RecvBuffer);
-            _sendBufferPool.Release(socket.SendBuffer);
+            ReleaseSendBuffer(socket.SendBuffer);
+
+            // A socket can be finalized mid-swap, with the retiring buffer never drained
+            if (socket.RetiringSendBuffer != null)
+            {
+                ReleaseSendBuffer(socket.RetiringSendBuffer);
+                socket.RetiringSendBuffer = null;
+            }
+
             _sockets[socket.Id] = null;
         }
 

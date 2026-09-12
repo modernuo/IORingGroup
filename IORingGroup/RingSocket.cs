@@ -53,8 +53,21 @@ public sealed class RingSocket
     /// <summary>
     /// Gets the send buffer for outgoing data.
     /// Write data here and call <see cref="QueueSend"/> to transmit.
+    /// Replaced by the manager when the buffer grows or shrinks.
     /// </summary>
-    public IORingBuffer SendBuffer { get; }
+    public IORingBuffer SendBuffer { get; internal set; }
+
+    /// <summary>
+    /// The previous send buffer while sends posted from it are still in flight. Nothing is posted
+    /// from <see cref="SendBuffer"/> until this has drained, which keeps the stream in order.
+    /// </summary>
+    internal IORingBuffer? RetiringSendBuffer { get; set; }
+
+    /// <summary>The buffer sends are posted from.</summary>
+    internal IORingBuffer SendSource => RetiringSendBuffer ?? SendBuffer;
+
+    /// <summary>Nothing left to send in either buffer.</summary>
+    internal bool SendDrained => SendBuffer.ReadableBytes == 0 && RetiringSendBuffer == null;
 
     /// <summary>
     /// Gets whether the socket is connected and operational.
@@ -81,25 +94,32 @@ public sealed class RingSocket
     /// </remarks>
     internal int SendsInFlight { get; private set; }
 
-    // Posted lengths, oldest first. Completions on a request queue arrive in submission order, so
-    // each completion reclaims the length at the head.
+    // Posted lengths and the buffer each was posted from, oldest first. Completions on a request
+    // queue arrive in submission order, so each completion reclaims the entry at the head. The
+    // buffer travels with the length because a send may outlive the buffer it was posted from
+    // being replaced.
     private readonly int[] _inFlightLengths;
+    private readonly IORingBuffer[] _inFlightBuffers;
     private int _inFlightHead;
 
-    /// <summary>Records a posted send of <paramref name="length"/> bytes.</summary>
-    internal void PushInFlight(int length)
+    /// <summary>Records a posted send of <paramref name="length"/> bytes from <paramref name="buffer"/>.</summary>
+    internal void PushInFlight(int length, IORingBuffer buffer)
     {
-        _inFlightLengths[(_inFlightHead + SendsInFlight) % _inFlightLengths.Length] = length;
+        var index = (_inFlightHead + SendsInFlight) % _inFlightLengths.Length;
+        _inFlightLengths[index] = length;
+        _inFlightBuffers[index] = buffer;
         SendsInFlight++;
     }
 
-    /// <summary>Removes and returns the oldest posted send length.</summary>
-    internal int PopInFlight()
+    /// <summary>Removes and returns the oldest posted send length and the buffer it came from.</summary>
+    internal (int Length, IORingBuffer Buffer) PopInFlight()
     {
         var length = _inFlightLengths[_inFlightHead];
+        var buffer = _inFlightBuffers[_inFlightHead];
+        _inFlightBuffers[_inFlightHead] = null!;
         _inFlightHead = (_inFlightHead + 1) % _inFlightLengths.Length;
         SendsInFlight--;
-        return length;
+        return (length, buffer);
     }
 
 
@@ -171,6 +191,7 @@ public sealed class RingSocket
         SendBuffer = sendBuffer;
         Connected = true;
         _inFlightLengths = new int[manager.MaxOutstandingSendsPerSocket];
+        _inFlightBuffers = new IORingBuffer[manager.MaxOutstandingSendsPerSocket];
     }
 
     /// <summary>
@@ -217,7 +238,7 @@ public sealed class RingSocket
         }
 
         // If we have pending sends or unsent data, wait for them to complete first
-        if (SendPending || SendBuffer.ReadableBytes > 0)
+        if (SendPending || !SendDrained)
         {
             DisconnectPending = true;
             return;
@@ -242,9 +263,9 @@ public sealed class RingSocket
     /// <returns>True if disconnect should proceed now.</returns>
     internal bool CheckDisconnect()
     {
-        // Wait for ALL in-flight operations AND send buffer to drain
+        // Wait for ALL in-flight operations AND both send buffers to drain
         // This is critical for zero-copy I/O safety
-        return DisconnectPending && !RecvPending && !SendPending && SendBuffer.ReadableBytes <= 0;
+        return DisconnectPending && !RecvPending && !SendPending && SendDrained;
     }
 
     /// <summary>
