@@ -154,7 +154,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // Constructor
     // =========================================================================
 
-    public WindowsManagedRIOGroup(int maxConnections, int maxOutstandingSends = 1)
+    public WindowsManagedRIOGroup(int maxConnections, int maxOutstandingSends = 1, int maxRegisteredBuffers = 0)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxOutstandingSends, 1);
@@ -190,7 +190,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         _connections = (RioConnection*)NativeMemory.AllocZeroed(mc, (nuint)sizeof(RioConnection));
 
-        _maxExternalBuffers = mc * 2;
+        _maxExternalBuffers = maxRegisteredBuffers > 0 ? (uint)maxRegisteredBuffers : mc * 2;
         _externalBufferIds = (nint*)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(nint));
         _externalBufferPtrs = (byte**)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(byte*));
         _externalBufferLens = (uint*)NativeMemory.AllocZeroed(_maxExternalBuffers, sizeof(uint));
@@ -338,6 +338,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     /// Gets the maximum number of external buffers.
     /// </summary>
     public int MaxExternalBuffers => (int)_maxExternalBuffers;
+
+    /// <inheritdoc />
+    public int MaxRegisteredBuffers => (int)_maxExternalBuffers;
 
     // =========================================================================
     // GetSqe & CompleteOp (private hot-path helpers)
