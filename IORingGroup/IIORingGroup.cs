@@ -35,9 +35,14 @@ public interface IIORingGroup : IDisposable
     /// buffer, more for consumers that swap in larger send buffers.
     /// </summary>
     /// <remarks>
+    /// Implementations in this package default it to
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int)"/> for their connection count,
+    /// which covers a manager's two base pools at the default <c>maxBufferSlabs</c>; slabs round each
+    /// pool up, so it is not always exactly twice the connection count.
     /// 0 means unknown, the default for implementations outside this package.
     /// <see cref="RingSocketManager"/> then skips its cross-check against
-    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/>, failing at first registration instead.
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int)"/>, failing at
+    /// first registration instead.
     /// </remarks>
     int MaxRegisteredBuffers => 0;
 

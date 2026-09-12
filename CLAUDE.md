@@ -44,9 +44,9 @@ IORingGroup is a cross-platform zero-copy async socket I/O library for .NET 10+ 
 
 **Core types**:
 - `IORingBuffer` — Double-mapped circular buffer (physical memory mapped twice in virtual address space to eliminate wrap-around). Platform-specific allocation (VirtualAlloc2 / memfd_create / shm_open).
-- `IORingBufferPool` — Multi-slab buffer pool with on-demand allocation and pre-registration with the ring. Tracks `InUse`/`PeakInUse` and a windowed `RetainFloor`; `Maintain()` rotates the usage window and trims at most one idle slab down to that floor.
+- `IORingBufferPool` — Multi-slab buffer pool with on-demand allocation and pre-registration with the ring. Tracks `InUse`/`PeakInUse` and a windowed `RetainFloor`; `Maintain()` rotates the usage window and trims at most one idle slab down to that floor, never below `MinSlabs`.
 - `RingSocket` — Managed socket wrapping an OS handle with pre-registered send/recv buffers. Tracks in-flight operation flags and generation counter for stale completion detection.
-- `RingSocketManager` — High-level manager providing O(1) slot allocation with generation tracking, flush queue for batched sends, graceful disconnect queue, and event-based API (`RingSocketEvent`: DataReceived, DataSent, Disconnected, Accept). Optionally grows a socket's send buffer through power-of-two tiers under a byte budget via `TryGrowSendBuffer`/`TryShrinkSendBuffer`; `Maintain()` rotates each tier pool's usage window and trims idle slabs.
+- `RingSocketManager` — High-level manager providing O(1) slot allocation with generation tracking, flush queue for batched sends, graceful disconnect queue, and event-based API (`RingSocketEvent`: DataReceived, DataSent, Disconnected, Accept). Optionally grows a socket's send buffer through power-of-two tiers under a byte budget via `TryGrowSendBuffer`/`TryShrinkSendBuffer`; `Maintain()` rotates every pool's usage window and trims idle slabs. Both base pools are sized alike from `BasePoolSlabSize(maxSockets, maxBufferSlabs)` and hold one buffer per socket; they start at `initialBufferSlabs` slabs and never trim below it.
 
 **User data encoding** (`IORingUserData`): 64-bit value packing `[8 opType][16 generation][8 reserved][32 socketId]` to detect stale completions after socket slot reuse.
 

@@ -93,6 +93,9 @@ public sealed class IORingBufferPool : IDisposable
     /// <summary>Number of maintenance windows a peak stays in force.</summary>
     public int RetentionWindows { get; }
 
+    /// <summary>Slabs <see cref="Maintain"/> keeps no matter how low the floor falls.</summary>
+    public int MinSlabs { get; }
+
     /// <summary>
     /// Bytes one slab holds.
     /// </summary>
@@ -125,6 +128,7 @@ public sealed class IORingBufferPool : IDisposable
     /// <param name="initialSlabs">Number of slabs to pre-allocate (default: 1).</param>
     /// <param name="maxSlabs">Maximum number of slabs allowed (default: 16).</param>
     /// <param name="retentionWindows">Number of maintenance windows a peak stays in force (default: 15).</param>
+    /// <param name="minSlabs">Slabs <see cref="Maintain"/> never trims away (default: 0).</param>
     /// <exception cref="ArgumentNullException">If ring is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">If sizes are invalid.</exception>
     public IORingBufferPool(
@@ -133,7 +137,8 @@ public sealed class IORingBufferPool : IDisposable
         int bufferSize,
         int initialSlabs = 1,
         int maxSlabs = 16,
-        int retentionWindows = 15)
+        int retentionWindows = 15,
+        int minSlabs = 0)
     {
         _ring = ring ?? throw new ArgumentNullException(nameof(ring));
 
@@ -142,10 +147,9 @@ public sealed class IORingBufferPool : IDisposable
             throw new ArgumentOutOfRangeException(nameof(slabSize), "Slab size must be positive");
         }
 
-        if (bufferSize <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bufferSize), "Buffer size must be positive");
-        }
+        // Up front, not on the first acquire: slabs are lazy, so a bad size would otherwise surface
+        // as an accept failing long after the pool was configured
+        IORingBuffer.ValidateSize(bufferSize, nameof(bufferSize));
 
         if (initialSlabs < 0)
         {
@@ -167,10 +171,21 @@ public sealed class IORingBufferPool : IDisposable
             throw new ArgumentOutOfRangeException(nameof(retentionWindows), "Retention windows must be at least 1");
         }
 
+        if (minSlabs < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(minSlabs), "Min slabs cannot be negative");
+        }
+
+        if (minSlabs > maxSlabs)
+        {
+            throw new ArgumentOutOfRangeException(nameof(minSlabs), "Min slabs cannot exceed max slabs");
+        }
+
         SlabSize = slabSize;
         BufferSize = bufferSize;
         MaxSlabs = maxSlabs;
         RetentionWindows = retentionWindows;
+        MinSlabs = minSlabs;
         _windows = new int[retentionWindows];
         _slabs = new List<PoolSlab>(maxSlabs);
         _firstNonFullSlab = 0;
@@ -217,6 +232,15 @@ public sealed class IORingBufferPool : IDisposable
             {
                 buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
                 bufferId = _ring.RegisterBuffer(buffer);
+            }
+            catch (ArgumentException)
+            {
+                // A bad size or a rejected argument is the caller's bug, not exhaustion: it must not
+                // reach the manager's soft-fail catch, which would turn it into a silent null accept
+                buffer?.Dispose();
+                UnwindSlab(slab, i);
+
+                throw;
             }
             catch (Exception ex)
             {
@@ -447,7 +471,8 @@ public sealed class IORingBufferPool : IDisposable
 
     /// <summary>
     /// Rotates the usage window, recomputes the retention floor, and returns at most one fully
-    /// free top slab to the OS if the remaining capacity still covers the floor.
+    /// free top slab to the OS if the remaining capacity still covers the floor and
+    /// <see cref="MinSlabs"/>.
     /// </summary>
     /// <returns>Buffers released (0 or <see cref="SlabSize"/>).</returns>
     public int Maintain()
@@ -467,7 +492,7 @@ public sealed class IORingBufferPool : IDisposable
 
         RetainFloor = floor;
 
-        if (_slabs.Count == 0)
+        if (_slabs.Count <= MinSlabs)
         {
             return 0;
         }

@@ -151,19 +151,31 @@ public sealed partial class IORingBuffer : IDisposable
     public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
 
     /// <summary>
-    /// Creates a new double-mapped circular buffer with pool tracking.
+    /// Throws if <paramref name="physicalSize"/> is not a buffer size this platform can double-map.
+    /// Callers that allocate lazily validate up front so a bad size fails where it was configured.
     /// </summary>
-    internal static IORingBuffer Create(int physicalSize, bool isPooled, int poolIndex)
+    /// <param name="physicalSize">Physical size in bytes.</param>
+    /// <param name="paramName">Name reported by the exception; defaults to the caller's argument.</param>
+    public static void ValidateSize(int physicalSize, [CallerArgumentExpression(nameof(physicalSize))] string? paramName = null)
     {
         if (physicalSize <= 0)
         {
-            throw new ArgumentOutOfRangeException(nameof(physicalSize), "Size must be positive");
+            throw new ArgumentOutOfRangeException(paramName, "Size must be positive");
+        }
+
+        // Every platform reserves twice this; a size that does not survive the doubling would wrap
+        if (physicalSize > int.MaxValue / 2)
+        {
+            throw new ArgumentOutOfRangeException(
+                paramName,
+                $"Size must not exceed {int.MaxValue / 2} bytes, since the double mapping reserves twice it"
+            );
         }
 
         // Verify power of 2
         if ((physicalSize & (physicalSize - 1)) != 0)
         {
-            throw new ArgumentException("Size must be a power of 2", nameof(physicalSize));
+            throw new ArgumentException("Size must be a power of 2", paramName);
         }
 
         // Windows places the second mapping at an offset of physicalSize and requires both the
@@ -178,9 +190,17 @@ public sealed partial class IORingBuffer : IDisposable
         {
             throw new ArgumentException(
                 $"Size must be a multiple of the allocation granularity ({alignment} bytes on this platform)",
-                nameof(physicalSize)
+                paramName
             );
         }
+    }
+
+    /// <summary>
+    /// Creates a new double-mapped circular buffer with pool tracking.
+    /// </summary>
+    internal static IORingBuffer Create(int physicalSize, bool isPooled, int poolIndex)
+    {
+        ValidateSize(physicalSize);
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -459,7 +479,9 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == nint.Zero)
         {
+            // Unmapping the first view frees its half; the second half is still a placeholder
             WindowsNative.UnmapViewOfFile(buffer);
+            WindowsNative.VirtualFree(region + physicalSize, 0, WindowsNative.MEM_RELEASE);
             WindowsNative.CloseHandle(handle);
             throw new InvalidOperationException($"MapViewOfFile3 (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -633,7 +655,7 @@ public sealed partial class IORingBuffer : IDisposable
         // Reserve virtual address space for both mappings
         var region = LinuxNative.mmap(
             nint.Zero,
-            (nuint)(physicalSize * 2),
+            (nuint)((long)physicalSize * 2),
             LinuxNative.PROT_NONE,
             LinuxNative.MAP_PRIVATE | LinuxNative.MAP_ANONYMOUS,
             -1,
@@ -658,7 +680,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (buffer == LinuxNative.MAP_FAILED)
         {
-            LinuxNative.munmap(region, (nuint)(physicalSize * 2));
+            LinuxNative.munmap(region, (nuint)((long)physicalSize * 2));
             LinuxNative.close(fd);
             throw new InvalidOperationException($"mmap (first) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -675,7 +697,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == LinuxNative.MAP_FAILED)
         {
-            LinuxNative.munmap(region, (nuint)(physicalSize * 2));
+            LinuxNative.munmap(region, (nuint)((long)physicalSize * 2));
             LinuxNative.close(fd);
             throw new InvalidOperationException($"mmap (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -744,7 +766,7 @@ public sealed partial class IORingBuffer : IDisposable
         // Reserve virtual address space for both mappings
         var region = BsdNative.mmap(
             nint.Zero,
-            (nuint)(physicalSize * 2),
+            (nuint)((long)physicalSize * 2),
             BsdNative.PROT_NONE,
             BsdNative.MAP_PRIVATE | BsdNative.MAP_ANON,
             -1,
@@ -769,7 +791,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (buffer == BsdNative.MAP_FAILED)
         {
-            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.munmap(region, (nuint)((long)physicalSize * 2));
             BsdNative.close(fd);
             throw new InvalidOperationException($"mmap (first) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -786,7 +808,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == BsdNative.MAP_FAILED)
         {
-            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.munmap(region, (nuint)((long)physicalSize * 2));
             BsdNative.close(fd);
             throw new InvalidOperationException($"mmap (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -857,7 +879,7 @@ public sealed partial class IORingBuffer : IDisposable
         {
             if (_buffer != nint.Zero)
             {
-                LinuxNative.munmap(_buffer, (nuint)(_physicalSize * 2));
+                LinuxNative.munmap(_buffer, (nuint)((long)_physicalSize * 2));
             }
 
             if (_handle != nint.Zero)
@@ -870,7 +892,7 @@ public sealed partial class IORingBuffer : IDisposable
         {
             if (_buffer != nint.Zero)
             {
-                BsdNative.munmap(_buffer, (nuint)(_physicalSize * 2));
+                BsdNative.munmap(_buffer, (nuint)((long)_physicalSize * 2));
             }
 
             if (_handle != nint.Zero)

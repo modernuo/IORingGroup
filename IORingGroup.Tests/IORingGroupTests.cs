@@ -115,10 +115,13 @@ public class IORingGroupTests
     }
 
     [SkippableFact]
-    public void Create_MaxRegisteredBuffers_DefaultsToTwicePerConnection()
+    public void Create_MaxRegisteredBuffers_DefaultsToWhatTheManagerNeeds()
     {
+        // Two buffers per connection rounded up to whole base slabs; 8 connections sit under the
+        // 16-buffer slab floor, so each pool still allocates a full slab.
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
-        Assert.Equal(16, ring.MaxRegisteredBuffers);
+        Assert.Equal(RingSocketManager.RequiredRegisteredBuffers(8), ring.MaxRegisteredBuffers);
+        Assert.Equal(32, ring.MaxRegisteredBuffers);
     }
 
     [SkippableFact]
