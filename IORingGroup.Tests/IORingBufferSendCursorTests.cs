@@ -161,4 +161,60 @@ public class IORingBufferSendCursorTests
 
         Assert.Throws<ArgumentOutOfRangeException>(() => buffer.CommitShortSend(101));
     }
+
+    [Fact]
+    public void GetSendableSpan_ReturnsOnlyBytesNotYetHandedToTransport()
+    {
+        using var buffer = IORingBuffer.Create(65536);
+        var data = new byte[100];
+        for (var i = 0; i < data.Length; i++)
+        {
+            data[i] = (byte)i;
+        }
+
+        data.CopyTo(buffer.GetWriteSpan());
+        buffer.CommitWrite(100);
+        buffer.CommitSend(40); // 40 in flight, 60 sendable
+
+        var sendable = buffer.GetSendableSpan();
+
+        Assert.Equal(60, sendable.Length);
+        Assert.Equal(data.AsSpan(40, 60).ToArray(), sendable.ToArray());
+    }
+
+    [Fact]
+    public void GetSendableSpan_IsContiguousAcrossTheWrap()
+    {
+        using var buffer = IORingBuffer.Create(65536);
+
+        // Move the cursors near the end, then write across the physical boundary
+        buffer.CommitWrite(65000);
+        buffer.CommitSend(65000);
+        buffer.CommitRead(65000);
+
+        var data = new byte[1000];
+        for (var i = 0; i < data.Length; i++)
+        {
+            data[i] = (byte)(i * 7);
+        }
+
+        data.CopyTo(buffer.GetWriteSpan());
+        buffer.CommitWrite(1000);
+
+        Assert.Equal(data, buffer.GetSendableSpan().ToArray());
+    }
+
+    [Fact]
+    public void DiscardSendable_KeepsInFlightBytesOnly()
+    {
+        using var buffer = IORingBuffer.Create(65536);
+        buffer.CommitWrite(100);
+        buffer.CommitSend(40);
+
+        buffer.DiscardSendable();
+
+        Assert.Equal(0, buffer.SendableBytes);
+        Assert.Equal(40, buffer.InFlightBytes);
+        Assert.Equal(40, buffer.ReadableBytes);
+    }
 }

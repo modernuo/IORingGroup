@@ -248,6 +248,20 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     /// <summary>
+    /// Gets the bytes written but not yet handed to the transport (<c>[sent, tail)</c>).
+    /// Contiguous thanks to the double mapping.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public unsafe Span<byte> GetSendableSpan() => new((byte*)_buffer + _sent, SendableBytes);
+
+    /// <summary>
+    /// Drops the bytes not yet handed to the transport, keeping only what is in flight.
+    /// Used when those bytes have been moved to another buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void DiscardSendable() => _tail = _sent;
+
+    /// <summary>
     /// Advances the read position after consuming data.
     /// </summary>
     /// <param name="count">Number of bytes consumed.</param>
