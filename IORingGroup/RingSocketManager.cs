@@ -213,7 +213,11 @@ public sealed class RingSocketManager : IDisposable
     /// <param name="recvBufferSize">Size of each receive buffer (default 64KB).</param>
     /// <param name="sendBufferSize">Size of each send buffer (default 256KB).</param>
     /// <param name="initialBufferSlabs">Initial buffer pool slabs (default 8).</param>
-    /// <param name="maxBufferSlabs">Maximum buffer pool slabs (default 32).</param>
+    /// <param name="maxBufferSlabs">
+    /// Upper bound on base buffer pool slabs (default 32). Both base pools are additionally capped
+    /// at the slabs <paramref name="maxSockets"/> sockets can occupy, one buffer each, so a small
+    /// socket count silently lowers this and <paramref name="initialBufferSlabs"/> with it.
+    /// </param>
     /// <param name="maxSendBufferSize">
     /// Largest send buffer a socket may grow to. 0 (default) means <paramref name="sendBufferSize"/>,
     /// which disables growth. Must be a power of two no smaller than <paramref name="sendBufferSize"/>
@@ -311,22 +315,14 @@ public sealed class RingSocketManager : IDisposable
         // Create buffer pools
         // Estimate slab size based on max sockets
         var slabSize = BufferPoolSlabSize(maxSockets, maxBufferSlabs);
+        var sendSlabSize = SendPoolSlabSize(slabSize);
 
-        _recvBufferPool = new IORingBufferPool(
-            ring,
-            slabSize: slabSize,
-            bufferSize: recvBufferSize,
-            initialSlabs: initialBufferSlabs,
-            maxSlabs: maxBufferSlabs
-        );
-
-        _sendBufferPool = new IORingBufferPool(
-            ring,
-            slabSize: slabSize / 4, // Fewer send buffers typically needed
-            bufferSize: sendBufferSize,
-            initialSlabs: initialBufferSlabs / 2,
-            maxSlabs: maxBufferSlabs
-        );
+        // Neither base pool can hand out more than one buffer per socket, so slabs past that are
+        // memory and registration-table entries that nothing could ever acquire - and the table is
+        // sized from the same bound. Clamp rather than throw: the defaults are deliberately generous
+        // and a small maxSockets is not the caller's mistake.
+        var recvSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, slabSize));
+        var sendSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, sendSlabSize));
 
         // long: MaxSendBufferSize is capped at 256 MiB, but sendBufferSize is not, and an int
         // doubling past 1 GiB wraps negative and loops forever.
@@ -337,18 +333,56 @@ public sealed class RingSocketManager : IDisposable
         }
 
         _sendTiers = new IORingBufferPool[tierCount];
-        var tierSize = sendBufferSize;
-        for (var i = 0; i < tierCount; i++)
+
+        // Each pool maps and registers its memory in its own constructor, so one that throws after
+        // earlier pools were built would strand theirs: nothing outside this constructor has a
+        // reference to the half-built manager to dispose it. Release what exists, then rethrow.
+        var created = new List<IORingBufferPool>(tierCount + 2);
+        try
         {
-            tierSize *= 2;
-            _sendTiers[i] = new IORingBufferPool(
+            _recvBufferPool = new IORingBufferPool(
                 ring,
-                slabSize: TierSlabSize(tierSize),
-                bufferSize: tierSize,
-                initialSlabs: 0,
-                maxSlabs: TierMaxSlabs,
-                retentionWindows: sendBufferRetentionWindows
+                slabSize: slabSize,
+                bufferSize: recvBufferSize,
+                initialSlabs: Math.Min(initialBufferSlabs, recvSlabs),
+                maxSlabs: recvSlabs
             );
+            created.Add(_recvBufferPool);
+
+            _sendBufferPool = new IORingBufferPool(
+                ring,
+                slabSize: sendSlabSize, // Fewer send buffers typically needed
+                bufferSize: sendBufferSize,
+                initialSlabs: Math.Min(initialBufferSlabs / 2, sendSlabs),
+                maxSlabs: sendSlabs
+            );
+            created.Add(_sendBufferPool);
+
+            var tierSize = sendBufferSize;
+            for (var i = 0; i < tierCount; i++)
+            {
+                tierSize *= 2;
+                var tierPool = new IORingBufferPool(
+                    ring,
+                    slabSize: TierSlabSize(tierSize),
+                    bufferSize: tierSize,
+                    initialSlabs: 0,
+                    maxSlabs: TierMaxSlabs,
+                    retentionWindows: sendBufferRetentionWindows
+                );
+
+                _sendTiers[i] = tierPool;
+                created.Add(tierPool);
+            }
+        }
+        catch
+        {
+            for (var i = 0; i < created.Count; i++)
+            {
+                created[i].Dispose();
+            }
+
+            throw;
         }
     }
 
@@ -358,6 +392,24 @@ public sealed class RingSocketManager : IDisposable
     /// </summary>
     private static int BufferPoolSlabSize(int maxSockets, int maxBufferSlabs) =>
         Math.Max(64, maxSockets / maxBufferSlabs);
+
+    /// <summary>
+    /// Buffers per slab in the base send pool: a quarter of the recv pool's, since a connection
+    /// sends far less often than it receives. Shared with <see cref="RequiredRegisteredBuffers"/>
+    /// so the two cannot drift.
+    /// </summary>
+    private static int SendPoolSlabSize(int recvSlabSize) => recvSlabSize / 4;
+
+    /// <summary>
+    /// Slabs of <paramref name="slabSize"/> buffers needed before every one of
+    /// <paramref name="maxSockets"/> sockets holds one. A base pool can never use more than this,
+    /// whatever <c>maxBufferSlabs</c> allows.
+    /// </summary>
+    private static int SlabsPerSocketSet(int maxSockets, int slabSize) => (maxSockets - 1) / slabSize + 1;
+
+    /// <summary>Buffers those slabs hold.</summary>
+    private static int RoundUpToSlabs(int maxSockets, int slabSize) =>
+        SlabsPerSocketSet(maxSockets, slabSize) * slabSize;
 
     /// <summary>
     /// Buffers per slab in the tier pool holding buffers of <paramref name="tierSize"/> bytes.
@@ -382,10 +434,19 @@ public sealed class RingSocketManager : IDisposable
 
     /// <summary>
     /// Registration table size a ring needs for this configuration: everything both base pools can
-    /// ever allocate, plus as many first-tier buffers as the growth budget can hold (larger tiers
-    /// use fewer). The base pools round up to whole slabs, so their maximum is well above one recv
-    /// and one send buffer per socket.
+    /// actually hand out, plus as many first-tier buffers as the growth budget can hold (larger
+    /// tiers use fewer).
     /// </summary>
+    /// <remarks>
+    /// A socket holds at most one base recv buffer and one base send buffer at a time - a retiring
+    /// buffer is a tier buffer's predecessor, and a shrink acquires its base buffer before releasing
+    /// the tier one it replaces - so neither base pool can ever hand out more than
+    /// <paramref name="maxSockets"/> buffers, rounded up to whole slabs. Its <c>maxSlabs</c> ceiling
+    /// is only an upper bound on top of that, and at the library's own defaults it is the looser of
+    /// the two by a wide margin; bounding by both is what lets
+    /// <c>IORingGroup.Create(maxConnections: n)</c> and <c>new RingSocketManager(ring, n)</c> compose
+    /// without an explicit table size.
+    /// </remarks>
     public static int RequiredRegisteredBuffers(
         int maxSockets,
         int sendBufferSize,
@@ -400,8 +461,9 @@ public sealed class RingSocketManager : IDisposable
         checked
         {
             var slabSize = BufferPoolSlabSize(maxSockets, maxBufferSlabs);
-            var recvMax = maxBufferSlabs * slabSize;
-            var sendMax = maxBufferSlabs * (slabSize / 4);
+            var sendSlabSize = SendPoolSlabSize(slabSize);
+            var recvMax = Math.Min(maxBufferSlabs * slabSize, RoundUpToSlabs(maxSockets, slabSize));
+            var sendMax = Math.Min(maxBufferSlabs * sendSlabSize, RoundUpToSlabs(maxSockets, sendSlabSize));
 
             var tierHeadroom = maxSendBufferSize > sendBufferSize && sendBufferGrowthBudget > 0
                 ? (int)(sendBufferGrowthBudget / (sendBufferSize * 2L))

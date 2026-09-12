@@ -109,6 +109,33 @@ public class RingSocketManagerGrowthTests : IDisposable
         return received;
     }
 
+    /// <summary>
+    /// Pumps until the manager has actually reaped the last send completion. The peer having every
+    /// byte does not mean the DataSent completion has been processed: SendsInFlight is still
+    /// non-zero until it is, and a shrink asked for in that window is legitimately refused.
+    /// </summary>
+    private void WaitForDrain(RingSocket socket)
+    {
+        var deadline = Environment.TickCount64 + 5000;
+        var drained = false;
+
+        while (!drained && Environment.TickCount64 - deadline < 0)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+
+            drained = socket is { SendsInFlight: 0, RetiringSendBuffer: null } &&
+                      socket.SendBuffer.ReadableBytes == 0;
+
+            if (!drained)
+            {
+                Thread.Sleep(1);
+            }
+        }
+
+        Assert.True(drained, "the socket's sends did not drain within the deadline");
+    }
+
     [Fact]
     public void Constructor_TiersFollowPowersOfTwoUpToMax()
     {
@@ -119,12 +146,70 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void RequiredRegisteredBuffers_CoversBothPoolsPlusBudgetWorthOfFirstTier()
     {
-        // slabSize = max(64, 16 / 4) = 64, so the recv pool tops out at 4 x 64 and the send pool at
-        // 4 x 16 -- well above the two-per-socket that the sockets themselves need.
-        Assert.Equal(256 + 64, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
+        // slabSize = max(64, 16 / 4) = 64 and the send pool takes a quarter of that. Each base pool
+        // is bounded by what 16 sockets can actually pull -- one buffer each, rounded up to whole
+        // slabs -- rather than by the 4-slab ceiling, which neither pool could ever fill: one recv
+        // slab (64) and one send slab (16).
+        Assert.Equal(64 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
 
         // 16 x 64 KB of budget buys 8 first-tier (128 KB) buffers.
-        Assert.Equal(256 + 64 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
+        Assert.Equal(64 + 16 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
+    }
+
+    [Fact]
+    public void RequiredRegisteredBuffers_FitsTheLibraryDefaultTable()
+    {
+        // IORingGroup.Create's default table is maxConnections x 2. The manager's defaults have to
+        // fit inside it, or the library cannot be used without an explicit table size.
+        Assert.True(RingSocketManager.RequiredRegisteredBuffers(1024, 256 * 1024, 256 * 1024, 0) <= 2048);
+
+        // ModernUO's shape: recv 32 x 128 = 4096 and send 32 x 32 = 1024, both at their slab
+        // ceiling here, plus 256 MiB of budget worth of 512 KB first-tier buffers.
+        Assert.Equal(
+            4096 + 1024 + 512,
+            RingSocketManager.RequiredRegisteredBuffers(4096, 256 * 1024, 2 * 1024 * 1024, 256L * 1024 * 1024)
+        );
+    }
+
+    [Fact]
+    public void Constructor_ComposesWithTheLibraryDefaults()
+    {
+        // Create(maxConnections: n) + new RingSocketManager(ring, n) with nothing else specified has
+        // to work: the default table is maxConnections x 2, and the defaults must fit it.
+        using var ring = System.Network.IORingGroup.Create(queueSize: 256, maxConnections: 1024);
+        using var manager = new RingSocketManager(ring, 1024);
+
+        Assert.Equal(1024, manager.MaxSockets);
+        Assert.Equal(0, manager.SendBufferTierCount); // growth off by default
+    }
+
+    [Fact]
+    public void Constructor_DisposesEarlierPoolsWhenALaterOneFails()
+    {
+        // Two managers on one ring: the cross-check only compares the table's size, not what is
+        // left of it, so the second one passes and then runs out part way through. Its recv pool
+        // takes the last 64 entries and its send pool has nowhere to register -- the case where the
+        // recv pool is stranded, since nothing outside the constructor holds the half-built manager
+        // to dispose it.
+        var needed = RingSocketManager.RequiredRegisteredBuffers(64, Base, Base, 0);
+        Assert.Equal(64 + 64, needed);
+
+        using var ring = System.Network.IORingGroup.Create(
+            queueSize: 64, maxConnections: 64, maxRegisteredBuffers: needed + 64
+        );
+
+        using var first = new RingSocketManager(ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base);
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new RingSocketManager(ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base)
+        );
+
+        Assert.Contains("registration", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // The 64 entries the failed manager's recv pool held are free again, which they would not be
+        // if it had leaked.
+        using var proof = new IORingBufferPool(ring, slabSize: 64, bufferSize: Base, initialSlabs: 1, maxSlabs: 1);
+        Assert.Equal(64, proof.TotalCapacity);
     }
 
     [Fact]
@@ -215,6 +300,7 @@ public class RingSocketManagerGrowthTests : IDisposable
         after.CopyTo(expected, first.Length + queued.Length);
 
         Assert.Equal(expected, ReadAll(client, expected.Length));
+        WaitForDrain(socket);
         Assert.Null(socket.RetiringSendBuffer);
 
         client.Close();
@@ -340,6 +426,7 @@ public class RingSocketManagerGrowthTests : IDisposable
         Assert.False(_manager.TryShrinkSendBuffer(socket)); // in flight
 
         ReadAll(client, 512);
+        WaitForDrain(socket);
         Assert.True(_manager.TryShrinkSendBuffer(socket));
         Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
         Assert.False(_manager.TryShrinkSendBuffer(socket)); // already base
@@ -374,6 +461,7 @@ public class RingSocketManagerGrowthTests : IDisposable
 
         // Let the peer drain it; the completion retires the original.
         Assert.Equal(payload, ReadAll(client, payload.Length));
+        WaitForDrain(socket);
         Assert.Null(socket.RetiringSendBuffer);
 
         Assert.True(_manager.TryShrinkSendBuffer(socket));

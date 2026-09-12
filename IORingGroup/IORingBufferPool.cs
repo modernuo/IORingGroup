@@ -212,23 +212,31 @@ public sealed class IORingBufferPool : IDisposable
         for (var i = 0; i < SlabSize; i++)
         {
             var poolIndex = basePoolIndex + i;
-            var buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
 
-            // Register with ring. An unregistered buffer would be accepted here and then fail every
-            // operation posted against it, which reads as a random disconnect, so fail where the
-            // cause is visible - but unwind first, or the slab's mappings and the registrations of
-            // the buffers before it leak. Backends signal the failure either way: RIO returns a
-            // negative id, the Unix backends throw.
+            // Allocate and register inside one try. An unregistered buffer would be accepted here
+            // and then fail every operation posted against it, which reads as a random disconnect,
+            // so fail where the cause is visible - but unwind first, or the slab's mappings and the
+            // registrations of the buffers before it leak. The mapping itself can fail the same way
+            // part way through a growing pool (address space, a locked-memory rlimit), and the slab
+            // is not published until it is whole, so nothing else would ever release them. Backends
+            // signal a registration failure either way: RIO returns a negative id, the Unix
+            // backends throw.
+            IORingBuffer? buffer = null;
             int bufferId;
             try
             {
+                buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
                 bufferId = _ring.RegisterBuffer(buffer);
             }
             catch (Exception ex)
             {
                 // The message reads the registration count, so build it before unwinding drops it.
-                var message = RegistrationFailureMessage(slabId, i);
-                buffer.Dispose();
+                var message = buffer == null
+                    ? AllocationFailureMessage(slabId, i)
+                    : RegistrationFailureMessage(slabId, i);
+
+                // Null only when Create itself threw, in which case there is nothing to dispose.
+                buffer?.Dispose();
                 UnwindSlab(slab, i);
 
                 throw new InvalidOperationException(message, ex);
@@ -253,6 +261,15 @@ public sealed class IORingBufferPool : IDisposable
         slab.FreeCount = SlabSize;
         return slab;
     }
+
+    /// <summary>
+    /// Explains a failed mapping. The inner exception carries the real cause; all this adds is
+    /// where in the pool it happened, which the allocation itself knows nothing about.
+    /// </summary>
+    private string AllocationFailureMessage(int slabId, int index) =>
+        $"Buffer allocation failed for buffer {index} of slab {slabId} ({BufferSize} byte buffers): " +
+        "the double mapping could not be created. Look at the buffer size, at available address " +
+        "space, or at a locked-memory rlimit.";
 
     /// <summary>
     /// Explains a failed registration without guessing at its cause. The table size is offered as
