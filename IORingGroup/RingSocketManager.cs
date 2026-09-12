@@ -1082,6 +1082,15 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
+        // While a buffer retires nothing is posted from the current one, so all of its bytes are
+        // still copyable. Bytes in flight here would mean a second buffer the kernel is reading,
+        // which the single retiring slot cannot hold: refuse rather than overwrite it.
+        if (socket.RetiringSendBuffer != null && current.InFlightBytes != 0)
+        {
+            Debug.Assert(false, "growth with a retiring buffer found bytes in flight on the current buffer");
+            return false;
+        }
+
         if (!TryAcquireTier(tier, out var next))
         {
             _growthRefusals++;
@@ -1102,8 +1111,8 @@ public sealed class RingSocketManager : IDisposable
         }
         else
         {
-            // Only the buffer with bytes in flight retires; while one exists nothing is posted
-            // from the current buffer, so a second growth never finds in-flight bytes here.
+            // Unreachable with a retiring buffer present: the guard above refused, and a current
+            // buffer with nothing in flight has nothing readable once its sendable bytes moved.
             Debug.Assert(socket.RetiringSendBuffer == null, "growth would drop an unretired send buffer");
             socket.RetiringSendBuffer = current;
         }
