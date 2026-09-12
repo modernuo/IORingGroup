@@ -31,15 +31,13 @@ public interface IIORingGroup : IDisposable
     int MaxOutstandingSendsPerSocket => 1;
 
     /// <summary>
-    /// Size of the buffer registration table. Two per connection covers one recv and one send
-    /// buffer each; consumers that swap in larger send buffers need headroom beyond that.
+    /// Size of the buffer registration table; two slots per connection cover one recv and one send
+    /// buffer, more for consumers that swap in larger send buffers.
     /// </summary>
     /// <remarks>
-    /// 0 means "unknown" and is the default, so an implementation outside this package keeps
-    /// compiling. <see cref="RingSocketManager"/> skips its startup cross-check against
-    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/> when this reports 0, trading the
-    /// early error for a failure at the first registration the ring cannot satisfy. All four
-    /// bundled backends report their real table size.
+    /// 0 means unknown, the default for implementations outside this package.
+    /// <see cref="RingSocketManager"/> then skips its cross-check against
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/>, failing at first registration instead.
     /// </remarks>
     int MaxRegisteredBuffers => 0;
 

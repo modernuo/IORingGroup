@@ -110,9 +110,8 @@ public class RingSocketManagerGrowthTests : IDisposable
     }
 
     /// <summary>
-    /// Pumps until the manager has actually reaped the last send completion. The peer having every
-    /// byte does not mean the DataSent completion has been processed: SendsInFlight is still
-    /// non-zero until it is, and a shrink asked for in that window is legitimately refused.
+    /// Pumps until the manager reaps the last send completion; the peer having every byte doesn't
+    /// mean SendsInFlight is zero yet, so a shrink asked for too early is legitimately refused.
     /// </summary>
     private void WaitForDrain(RingSocket socket)
     {
@@ -146,10 +145,9 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void RequiredRegisteredBuffers_CoversBothPoolsPlusBudgetWorthOfFirstTier()
     {
-        // slabSize = max(64, 16 / 4) = 64 and the send pool takes a quarter of that. Each base pool
-        // is bounded by what 16 sockets can actually pull -- one buffer each, rounded up to whole
-        // slabs -- rather than by the 4-slab ceiling, which neither pool could ever fill: one recv
-        // slab (64) and one send slab (16).
+        // slabSize = max(64, 16/4) = 64, send pool = a quarter of that. Each base pool is bounded by
+        // what 16 sockets can pull (rounded to whole slabs), not the 4-slab ceiling: one recv slab
+        // (64), one send slab (16).
         Assert.Equal(64 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
 
         // 16 x 64 KB of budget buys 8 first-tier (128 KB) buffers.
@@ -159,12 +157,11 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void RequiredRegisteredBuffers_FitsTheLibraryDefaultTable()
     {
-        // IORingGroup.Create's default table is maxConnections x 2. The manager's defaults have to
-        // fit inside it, or the library cannot be used without an explicit table size.
+        // Default table is maxConnections x 2; the manager's defaults must fit it or callers need an explicit table size.
         Assert.True(RingSocketManager.RequiredRegisteredBuffers(1024, 256 * 1024, 256 * 1024, 0) <= 2048);
 
-        // ModernUO's shape: recv 32 x 128 = 4096 and send 32 x 32 = 1024, both at their slab
-        // ceiling here, plus 256 MiB of budget worth of 512 KB first-tier buffers.
+        // recv 32 x 128 = 4096 and send 32 x 32 = 1024, both at their slab ceiling here, plus
+        // 256 MiB of budget worth of 512 KB first-tier buffers.
         Assert.Equal(
             4096 + 1024 + 512,
             RingSocketManager.RequiredRegisteredBuffers(4096, 256 * 1024, 2 * 1024 * 1024, 256L * 1024 * 1024)
@@ -174,8 +171,7 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Constructor_ComposesWithTheLibraryDefaults()
     {
-        // Create(maxConnections: n) + new RingSocketManager(ring, n) with nothing else specified has
-        // to work: the default table is maxConnections x 2, and the defaults must fit it.
+        // Create(maxConnections: n) + new RingSocketManager(ring, n) alone must work: the default table is maxConnections x 2.
         using var ring = System.Network.IORingGroup.Create(queueSize: 256, maxConnections: 1024);
         using var manager = new RingSocketManager(ring, 1024);
 
@@ -186,11 +182,9 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Constructor_DisposesEarlierPoolsWhenALaterOneFails()
     {
-        // Two managers on one ring: the cross-check only compares the table's size, not what is
-        // left of it, so the second one passes and then runs out part way through. Its recv pool
-        // takes the last 64 entries and its send pool has nowhere to register -- the case where the
-        // recv pool is stranded, since nothing outside the constructor holds the half-built manager
-        // to dispose it.
+        // The cross-check compares table size, not what remains, so two managers on one ring can
+        // both pass; the second's recv pool then claims the last entries and its send pool has
+        // nowhere to register, stranding the recv pool.
         var needed = RingSocketManager.RequiredRegisteredBuffers(64, Base, Base, 0);
         Assert.Equal(64 + 64, needed);
 
@@ -206,8 +200,7 @@ public class RingSocketManagerGrowthTests : IDisposable
 
         Assert.Contains("registration", ex.Message, StringComparison.OrdinalIgnoreCase);
 
-        // The 64 entries the failed manager's recv pool held are free again, which they would not be
-        // if it had leaked.
+        // Free again - a leak would keep these 64 entries unavailable.
         using var proof = new IORingBufferPool(ring, slabSize: 64, bufferSize: Base, initialSlabs: 1, maxSlabs: 1);
         Assert.Equal(64, proof.TotalCapacity);
     }
@@ -215,11 +208,8 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Constructor_RejectsPositiveBudgetBelowOneTierSlab()
     {
-        // The default registration table here (maxConnections x 2 = 16) is far too small for the
-        // pools, so the constructor's ring cross-check would reject this ring too. The single-
-        // argument checks run first and the cross-check last, because the cross-check needs every
-        // sizing argument to already be known good; that ordering is what makes this ParamName
-        // deterministic, and the assertion below pins it.
+        // This ring is also too small for the pools, but single-argument checks run before the
+        // cross-check, so this ParamName fires first.
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
 
         var ex = Assert.Throws<ArgumentOutOfRangeException>(
@@ -253,9 +243,8 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Constructor_RejectsMaxSendBufferSizeAboveTheCeiling()
     {
-        // 512 MiB overflows the int arithmetic that bounds a tier's slab, so it is refused outright
-        // rather than silently defeating the budget. The ceiling is checked before anything is
-        // allocated, so the ring's own size never comes into it.
+        // 512 MiB overflows the int arithmetic that bounds a tier's slab; the ceiling is checked
+        // before anything is allocated, so the ring's own size never comes into it.
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
 
         var ex = Assert.Throws<ArgumentOutOfRangeException>(
@@ -321,9 +310,8 @@ public class RingSocketManagerGrowthTests : IDisposable
         _manager.ProcessSendQueue();
         _manager.Submit();
 
-        // Posted bytes stay readable until a completion is reaped, and nothing reaps one between
-        // here and the grow, so the original genuinely has bytes in flight no matter how fast
-        // loopback is.
+        // Posted bytes stay readable until a completion is reaped, and nothing reaps one before the
+        // grow, so the original genuinely has bytes in flight.
         Assert.Equal(1024, original.ReadableBytes);
 
         Assert.True(_manager.TryGrowSendBuffer(socket)); // 64 -> 128, original retiring
@@ -335,8 +323,7 @@ public class RingSocketManagerGrowthTests : IDisposable
         Assert.True(_manager.TryGrowSendBuffer(socket)); // 128 -> 256, middle had nothing in flight
 
         Assert.Equal(4 * Base, socket.SendBuffer.PhysicalSize);
-        // The middle buffer had nothing in flight, so it went straight back to its pool and the
-        // original is still the one retiring -- NotSame alone would also pass on a null.
+        // Middle had nothing in flight, so it returned to its pool immediately; NotSame alone would also pass on null.
         Assert.Same(original, socket.RetiringSendBuffer);
         Assert.NotSame(middle, socket.RetiringSendBuffer);
         Assert.Equal(2048, socket.SendBuffer.ReadableBytes);
@@ -446,7 +433,7 @@ public class RingSocketManagerGrowthTests : IDisposable
         _manager.Submit();
 
         // Posted bytes stay readable until a completion is reaped, and nothing reaps one here, so
-        // the original is genuinely outstanding at grow time whatever loopback did.
+        // the original is genuinely outstanding at grow time.
         Assert.Equal(payload.Length, original.ReadableBytes);
 
         Assert.True(_manager.TryGrowSendBuffer(socket));
@@ -482,8 +469,7 @@ public class RingSocketManagerGrowthTests : IDisposable
         _manager.ProcessSendQueue();
         _manager.Submit();
 
-        // Same reasoning as above: the send is outstanding as far as the manager is concerned until
-        // a completion is reaped, so the grow below always leaves the original retiring.
+        // The send is outstanding until a completion is reaped, so the grow below leaves the original retiring.
         Assert.Equal(payload.Length, original.ReadableBytes);
 
         Assert.True(_manager.TryGrowSendBuffer(socket));
@@ -491,8 +477,8 @@ public class RingSocketManagerGrowthTests : IDisposable
         Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
         Assert.Equal(1, _manager.GetSendBufferTierStats(0).InUse);
 
-        // The peer never reads: the retiring buffer is still attached when the socket is finalized,
-        // which is the path that has to release two send buffers rather than one.
+        // The peer never reads, so the retiring buffer is still attached when the socket finalizes -
+        // the path that must release two send buffers, not one.
         _manager.DisconnectImmediate(socket);
 
         var disconnected = false;

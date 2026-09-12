@@ -58,8 +58,7 @@ public sealed class RingSocket
     public IORingBuffer SendBuffer { get; internal set; }
 
     /// <summary>
-    /// The previous send buffer while sends posted from it are still in flight. Nothing is posted
-    /// from <see cref="SendBuffer"/> until this has drained, which keeps the stream in order.
+    /// Previous send buffer draining in-flight sends. Nothing posts from <see cref="SendBuffer"/> until this drains, keeping the stream in order.
     /// </summary>
     internal IORingBuffer? RetiringSendBuffer { get; set; }
 
@@ -94,10 +93,9 @@ public sealed class RingSocket
     /// </remarks>
     internal int SendsInFlight { get; private set; }
 
-    // Posted lengths and the buffer each was posted from, oldest first. Completions on a request
-    // queue arrive in submission order, so each completion reclaims the entry at the head. The
-    // buffer travels with the length because a send may outlive the buffer it was posted from
-    // being replaced.
+    // Posted length + originating buffer, oldest first; completions arrive in submission order, so
+    // each reclaims the head entry. The buffer travels with the length since a send can outlive
+    // the buffer it was posted from being replaced.
     private readonly int[] _inFlightLengths;
     private readonly IORingBuffer[] _inFlightBuffers;
     private int _inFlightHead;
@@ -263,8 +261,7 @@ public sealed class RingSocket
     /// <returns>True if disconnect should proceed now.</returns>
     internal bool CheckDisconnect()
     {
-        // Wait for ALL in-flight operations AND both send buffers to drain
-        // This is critical for zero-copy I/O safety
+        // Critical for zero-copy I/O safety
         return DisconnectPending && !RecvPending && !SendPending && SendDrained;
     }
 

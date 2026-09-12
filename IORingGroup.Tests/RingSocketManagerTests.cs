@@ -18,11 +18,8 @@ public class RingSocketManagerTests : IDisposable
 
     public RingSocketManagerTests()
     {
-        // The default table (maxConnections x 2) covers one recv and one send buffer per connection,
-        // but the pools round up to whole slabs and can allocate past that. The manager cross-checks
-        // the two at construction now, so size the ring from the same helper - plus one entry for
-        // PostSend_DrainsRetiringBufferBeforeCurrent, which registers a stand-in buffer of its own
-        // on this ring and which the helper knows nothing about.
+        // Sized via RequiredRegisteredBuffers since the manager cross-checks it at construction;
+        // +1 for the stand-in buffer PostSend_DrainsRetiringBufferBeforeCurrent registers on this ring.
         var registered = RingSocketManager.RequiredRegisteredBuffers(64, 64 * 1024, 64 * 1024, 0) + 1;
         _ring = System.Network.IORingGroup.Create(queueSize: 256, maxRegisteredBuffers: registered);
         _manager = new RingSocketManager(_ring, maxSockets: 64, recvBufferSize: 64 * 1024, sendBufferSize: 64 * 1024);
@@ -758,8 +755,7 @@ public class RingSocketManagerTests : IDisposable
     }
 
     /// <summary>
-    /// With a retiring buffer attached, nothing is posted from the current buffer until the
-    /// retiring one has fully drained; ordering across the swap is the whole point.
+    /// The retiring buffer drains before the current one posts, keeping order across the swap.
     /// </summary>
     [Fact]
     public void PostSend_DrainsRetiringBufferBeforeCurrent()
@@ -771,13 +767,12 @@ public class RingSocketManagerTests : IDisposable
         _manager.ProcessSendQueue();
         _manager.Submit(); // "first" in flight from the original buffer
 
-        // Zero-copy sends read from registered memory, so the stand-in buffer is registered the way
-        // the pool registers its own. Releasing it unregisters and disposes it again.
+        // Zero-copy sends read from registered memory, so the stand-in buffer is registered like the pool's own.
         var replacement = IORingBuffer.Create(65536);
         replacement.BufferId = _ring.RegisterBuffer(replacement);
 
-        // A full table would hand back -1 here and every send from this buffer would quietly go
-        // nowhere, which shows up as a garbled payload rather than as the table being too small.
+        // A full table would hand back -1 here, and sends from this buffer would quietly go
+        // nowhere - a garbled payload, not a visible table-too-small error.
         Assert.True(replacement.BufferId >= 0);
 
         var second = "second"u8.ToArray();
@@ -808,8 +803,7 @@ public class RingSocketManagerTests : IDisposable
         client.Close();
         ProcessUntilAllDisconnected();
 
-        // A finalized socket's buffers are released at the top of the *next* pass, so one more is
-        // needed; that release is what unregisters and disposes the non-pooled replacement.
+        // A finalized socket's buffers release at the top of the *next* pass, which unregisters and disposes the non-pooled replacement.
         _manager.ProcessCompletions(_events);
     }
 }

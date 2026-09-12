@@ -135,8 +135,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
         _freeSlotCount = maxConnections;
 
-        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection,
-        // unless the caller asks for more headroom)
+        // Default: one recv + one send buffer per connection
         _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];

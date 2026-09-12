@@ -187,7 +187,7 @@ public class IORingBufferSendCursorTests
     {
         using var buffer = IORingBuffer.Create(65536);
 
-        // Move the cursors near the end, then write across the physical boundary
+        // Near the end, so this write crosses the physical boundary
         buffer.CommitWrite(65000);
         buffer.CommitSend(65000);
         buffer.CommitRead(65000);

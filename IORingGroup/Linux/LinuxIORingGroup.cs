@@ -81,8 +81,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
-        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection,
-        // unless the caller asks for more headroom)
+        // Default: one recv + one send buffer per connection
         _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];

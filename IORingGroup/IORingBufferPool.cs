@@ -94,8 +94,7 @@ public sealed class IORingBufferPool : IDisposable
     public int RetentionWindows { get; }
 
     /// <summary>
-    /// Bytes one slab of this pool holds. Long because a large buffer size times a slab of them
-    /// overflows an int well inside the sizes the manager's top tiers allow.
+    /// Bytes one slab holds; long because buffer size times slab size overflows int well within the manager's top tiers.
     /// </summary>
     public long SlabBytes => (long)SlabSize * BufferSize;
 
@@ -176,9 +175,8 @@ public sealed class IORingBufferPool : IDisposable
         _slabs = new List<PoolSlab>(maxSlabs);
         _firstNonFullSlab = 0;
 
-        // Pre-allocate initial slabs. A slab that fails part way through has already unwound itself;
-        // the slabs before it are this constructor's to release, since nothing will ever see the
-        // half-built pool to dispose it.
+        // A slab that fails has already unwound itself; slabs before it are this loop's to
+        // release, since the half-built pool is never visible elsewhere.
         for (var i = 0; i < initialSlabs; i++)
         {
             PoolSlab slab;
@@ -213,14 +211,9 @@ public sealed class IORingBufferPool : IDisposable
         {
             var poolIndex = basePoolIndex + i;
 
-            // Allocate and register inside one try. An unregistered buffer would be accepted here
-            // and then fail every operation posted against it, which reads as a random disconnect,
-            // so fail where the cause is visible - but unwind first, or the slab's mappings and the
-            // registrations of the buffers before it leak. The mapping itself can fail the same way
-            // part way through a growing pool (address space, a locked-memory rlimit), and the slab
-            // is not published until it is whole, so nothing else would ever release them. Backends
-            // signal a registration failure either way: RIO returns a negative id, the Unix
-            // backends throw.
+            // Registration can fail two ways: RIO returns a negative id, other backends throw.
+            // Either must unwind this slab's buffers - it isn't published until whole, so nothing
+            // else will ever release them.
             IORingBuffer? buffer = null;
             int bufferId;
             try
@@ -263,8 +256,7 @@ public sealed class IORingBufferPool : IDisposable
     }
 
     /// <summary>
-    /// Explains a failed mapping. The inner exception carries the real cause; all this adds is
-    /// where in the pool it happened, which the allocation itself knows nothing about.
+    /// Explains a failed mapping: the inner exception carries the cause, this only adds where in the pool it happened.
     /// </summary>
     private string AllocationFailureMessage(int slabId, int index) =>
         $"Buffer allocation failed for buffer {index} of slab {slabId} ({BufferSize} byte buffers): " +
@@ -272,11 +264,8 @@ public sealed class IORingBufferPool : IDisposable
         "space, or at a locked-memory rlimit.";
 
     /// <summary>
-    /// Explains a failed registration without guessing at its cause. The table size is offered as
-    /// the remediation only when this pool has demonstrably filled it; otherwise the failure is a
-    /// native one - a locked-memory rlimit, exhausted address space - or another pool sharing the
-    /// ring, and telling the reader to resize the table would send them to the wrong knob. The
-    /// count is this pool's own, so it can only prove the table full, never prove it is not.
+    /// Explains a failed registration. Suggests resizing the table only when this pool's own count
+    /// proves it full, since a lower count could still mean a native limit or another pool sharing the ring.
     /// </summary>
     private string RegistrationFailureMessage(int slabId, int index)
     {
@@ -293,8 +282,7 @@ public sealed class IORingBufferPool : IDisposable
     }
 
     /// <summary>
-    /// Releases the buffers of a slab that failed part way through creation. The slab was never
-    /// published, so nothing else will ever unregister them.
+    /// Releases the buffers of a slab that failed creation; never published, so nothing else will ever unregister them.
     /// </summary>
     private void UnwindSlab(PoolSlab slab, int count)
     {
@@ -308,8 +296,7 @@ public sealed class IORingBufferPool : IDisposable
     }
 
     /// <summary>
-    /// Unregisters and disposes every buffer of a fully built slab. The one place that releases a
-    /// slab, shared by the constructor's unwind, <see cref="Maintain"/>'s trim, and <see cref="Dispose"/>.
+    /// Unregisters and disposes every buffer of a slab; the single release path for the constructor's unwind, <see cref="Maintain"/>'s trim, and <see cref="Dispose"/>.
     /// </summary>
     private void DisposeSlab(PoolSlab slab)
     {
