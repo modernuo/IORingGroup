@@ -25,17 +25,22 @@ public static class IORingGroup
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
     /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 2).</param>
+    /// <param name="maxRegisteredBuffers">
+    /// Size of the buffer registration table. 0 (default) means <c>maxConnections * 2</c>; pass a
+    /// larger value for headroom beyond the default one recv + one send buffer per connection.
+    /// </param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
     public static IIORingGroup Create(
         int queueSize = DefaultQueueSize,
         int maxConnections = DefaultMaxConnections,
-        int maxOutstandingSends = 1
+        int maxOutstandingSends = 1,
+        int maxRegisteredBuffers = 0
     )
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return CreateWindowsRing(maxConnections, maxOutstandingSends);
+            return CreateWindowsRing(maxConnections, maxOutstandingSends, maxRegisteredBuffers);
         }
 
         // Other backends ignore maxOutstandingSends and report 1 via MaxOutstandingSendsPerSocket:
@@ -44,31 +49,31 @@ public static class IORingGroup
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            return CreateLinuxRing(queueSize, maxConnections);
+            return CreateLinuxRing(queueSize, maxConnections, maxRegisteredBuffers);
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
             RuntimeInformation.IsOSPlatform(OSPlatform.FreeBSD))
         {
-            return CreateDarwinRing(queueSize, maxConnections);
+            return CreateDarwinRing(queueSize, maxConnections, maxRegisteredBuffers);
         }
 
         throw new PlatformNotSupportedException(
             $"IORingGroup is not supported on platform: {RuntimeInformation.OSDescription}");
     }
 
-    private static IIORingGroup CreateWindowsRing(int maxConnections, int maxOutstandingSends) =>
-        new Windows.WindowsManagedRIOGroup(maxConnections, maxOutstandingSends);
+    private static IIORingGroup CreateWindowsRing(int maxConnections, int maxOutstandingSends, int maxRegisteredBuffers) =>
+        new Windows.WindowsManagedRIOGroup(maxConnections, maxOutstandingSends, maxRegisteredBuffers);
 
-    private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections)
+    private static IIORingGroup CreateLinuxRing(int queueSize, int maxConnections, int maxRegisteredBuffers)
     {
         if (IORing.LinuxIORingGroup.IsAvailable())
         {
-            return new IORing.LinuxIORingGroup(queueSize, maxConnections);
+            return new IORing.LinuxIORingGroup(queueSize, maxConnections, maxRegisteredBuffers);
         }
 
         // Fallback to epoll when io_uring is unavailable
-        return new EPoll.LinuxEpollGroup(queueSize, maxConnections);
+        return new EPoll.LinuxEpollGroup(queueSize, maxConnections, maxRegisteredBuffers);
     }
 
     /// <summary>
@@ -77,20 +82,27 @@ public static class IORingGroup
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
     /// <param name="maxConnections">Maximum concurrent connections.</param>
+    /// <param name="maxRegisteredBuffers">
+    /// Size of the buffer registration table. 0 (default) means <c>maxConnections * 2</c>.
+    /// </param>
     /// <returns>Epoll-based IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if not running on Linux.</exception>
-    public static IIORingGroup CreateLinuxEpoll(int queueSize = DefaultQueueSize, int maxConnections = DefaultMaxConnections)
+    public static IIORingGroup CreateLinuxEpoll(
+        int queueSize = DefaultQueueSize,
+        int maxConnections = DefaultMaxConnections,
+        int maxRegisteredBuffers = 0
+    )
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
             throw new PlatformNotSupportedException("epoll requires Linux");
         }
 
-        return new EPoll.LinuxEpollGroup(queueSize, maxConnections);
+        return new EPoll.LinuxEpollGroup(queueSize, maxConnections, maxRegisteredBuffers);
     }
 
-    private static Darwin.DarwinIORingGroup CreateDarwinRing(int queueSize, int maxConnections) =>
-        new Darwin.DarwinIORingGroup(queueSize, maxConnections);
+    private static Darwin.DarwinIORingGroup CreateDarwinRing(int queueSize, int maxConnections, int maxRegisteredBuffers) =>
+        new Darwin.DarwinIORingGroup(queueSize, maxConnections, maxRegisteredBuffers);
 
     /// <summary>
     /// Returns true if this is a power of 2 (used to validate queue size).

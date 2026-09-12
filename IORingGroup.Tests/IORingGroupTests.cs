@@ -114,6 +114,33 @@ public class IORingGroupTests
         ring.AdvanceCompletionQueue(0); // Should not throw
     }
 
+    [SkippableFact]
+    public void Create_MaxRegisteredBuffers_DefaultsToTwicePerConnection()
+    {
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
+        Assert.Equal(16, ring.MaxRegisteredBuffers);
+    }
+
+    [SkippableFact]
+    public void Create_MaxRegisteredBuffers_AllowsHeadroomBeyondConnections()
+    {
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: 20);
+        Assert.Equal(20, ring.MaxRegisteredBuffers);
+
+        var buffers = new IORingBuffer[20];
+        for (var i = 0; i < buffers.Length; i++)
+        {
+            buffers[i] = IORingBuffer.Create(65536);
+            Assert.True(ring.RegisterBuffer(buffers[i]) >= 0, $"registration {i} failed");
+        }
+
+        for (var i = 0; i < buffers.Length; i++)
+        {
+            ring.UnregisterBuffer(i);
+            buffers[i].Dispose();
+        }
+    }
+
     private static Socket CreateListeningSocket()
     {
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);

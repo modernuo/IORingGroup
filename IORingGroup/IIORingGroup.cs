@@ -31,6 +31,12 @@ public interface IIORingGroup : IDisposable
     int MaxOutstandingSendsPerSocket => 1;
 
     /// <summary>
+    /// Size of the buffer registration table. Two per connection covers one recv and one send
+    /// buffer each; consumers that swap in larger send buffers need headroom beyond that.
+    /// </summary>
+    int MaxRegisteredBuffers { get; }
+
+    /// <summary>
     /// Whether outstanding recv/send operations retire only once the socket is closed. RIO cancels
     /// them on close; the other backends retire them after a shutdown of both directions, so the
     /// handle can stay open until they have completed.
