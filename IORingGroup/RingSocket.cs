@@ -127,8 +127,9 @@ public sealed class RingSocket
     internal bool ShutdownSent { get; set; }
 
     /// <summary>
-    /// Gets whether a force-close is in progress: the handle is closed and the socket is waiting
-    /// for its outstanding operations to retire before release.
+    /// Gets whether a force-close is in progress: the socket is shut down (closed at once only where
+    /// close is what cancels its requests) and waiting for its outstanding operations to retire
+    /// before release.
     /// </summary>
     internal bool Aborting { get; set; }
 

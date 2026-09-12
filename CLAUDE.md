@@ -63,4 +63,4 @@ IORingGroup is a cross-platform zero-copy async socket I/O library for .NET 10+ 
 
 - **Buffer safety**: Buffers must not be released while I/O is in-flight. Graceful disconnect drains and waits for pending recv/send completions; `DisconnectImmediate` shuts down the socket (closing it at once only where close is what cancels, i.e. RIO) and waits for every outstanding recv/send to retire before the Disconnected event. The slot and buffers are released on the pass after that event, once the consumer has read the events that referenced them.
 - **Generation tracking**: Socket slots are reused; generation counters in user data prevent processing stale completions from a previous socket occupying the same slot.
-- **Single-threaded ring access**: The submission/completion queues are accessed from a single thread. Cross-thread work is enqueued via `ConcurrentQueue` (send queue, disconnect queue).
+- **Single-threaded ring access**: The submission/completion queues, `RingSocketManager`, and its send and disconnect queues (plain `Queue<T>`) are all accessed from a single thread; only `Wake()` may be called from another thread.
