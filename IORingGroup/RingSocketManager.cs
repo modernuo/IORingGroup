@@ -308,7 +308,7 @@ public sealed class RingSocketManager : IDisposable
 
         // Both base pools hand out one buffer per socket, so they are sized identically
         var slabSize = BasePoolSlabSize(maxSockets, maxBufferSlabs);
-        var baseSlabs = SlabsPerSocketSet(maxSockets, slabSize);
+        var baseSlabs = BasePoolSlabCount(maxSockets, maxBufferSlabs);
         var baseInitialSlabs = Math.Min(initialBufferSlabs, baseSlabs);
 
         // long: an int doubling past 1 GiB wraps and loops forever
@@ -388,14 +388,17 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Slabs of <paramref name="slabSize"/> buffers needed before every one of
-    /// <paramref name="maxSockets"/> sockets holds one; a base pool can never use more than this.
+    /// Slabs of <see cref="BasePoolSlabSize"/> buffers a base pool needs before every one of <paramref name="maxSockets"/> sockets holds one.
     /// </summary>
-    private static int SlabsPerSocketSet(int maxSockets, int slabSize) => (maxSockets - 1) / slabSize + 1;
+    /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
+    /// <param name="maxBufferSlabs">Divisor setting base slab size; see <see cref="BasePoolSlabSize"/>.</param>
+    public static int BasePoolSlabCount(int maxSockets, int maxBufferSlabs)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
 
-    /// <summary>Buffers those slabs hold.</summary>
-    private static int RoundUpToSlabs(int maxSockets, int slabSize) =>
-        SlabsPerSocketSet(maxSockets, slabSize) * slabSize;
+        return (maxSockets - 1) / BasePoolSlabSize(maxSockets, maxBufferSlabs) + 1;
+    }
 
     /// <summary>
     /// Buffers per slab in the tier pool holding buffers of <paramref name="tierSize"/> bytes.
@@ -429,7 +432,7 @@ public sealed class RingSocketManager : IDisposable
 
         checked
         {
-            return RoundUpToSlabs(maxSockets, BasePoolSlabSize(maxSockets, maxBufferSlabs)) * 2;
+            return BasePoolSlabCount(maxSockets, maxBufferSlabs) * BasePoolSlabSize(maxSockets, maxBufferSlabs) * 2;
         }
     }
 

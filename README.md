@@ -193,7 +193,7 @@ A growth is refused when the tier has no free buffer and its next slab would not
 
 #### What bounds memory, and what bounds connections
 
-Worst-case tier memory is exactly `sendBufferGrowthBudget`. Both base pools are bounded by `maxSockets`, since a socket holds exactly one buffer from each: with `slabSize = RingSocketManager.BasePoolSlabSize(maxSockets, maxBufferSlabs)` — `max(16, maxSockets / maxBufferSlabs)` — each pool tops out at `maxSockets` rounded up to a whole slab. `maxBufferSlabs` sets the slab *size*, not a ceiling on connections, so every socket slot is usable.
+Worst-case tier memory is exactly `sendBufferGrowthBudget`. Both base pools are bounded by `maxSockets`, since a socket holds exactly one buffer from each: with `slabSize = RingSocketManager.BasePoolSlabSize(maxSockets, maxBufferSlabs)` — `max(16, maxSockets / maxBufferSlabs)` — each pool tops out at `maxSockets` rounded up to a whole slab, `RingSocketManager.BasePoolSlabCount(maxSockets, maxBufferSlabs)` of them. `maxBufferSlabs` sets the slab *size*, not a ceiling on connections, so every socket slot is usable.
 
 `IORingGroup.Create(maxConnections: n)` with `maxRegisteredBuffers: 0` sizes its table from that same rule — `RingSocketManager.RequiredRegisteredBuffers(n)`, the no-growth overload — so `Create(maxConnections: n)` paired with `new RingSocketManager(ring, n)` always composes. That is a little more than `n × 2` whenever the slab does not divide `n` (1000 sockets need 2016). Pass the full `RequiredRegisteredBuffers(maxSockets, sendBufferSize, maxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs)` when the manager enables growth or uses a non-default `maxBufferSlabs`.
 

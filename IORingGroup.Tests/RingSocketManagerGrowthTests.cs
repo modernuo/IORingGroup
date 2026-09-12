@@ -191,6 +191,14 @@ public class RingSocketManagerGrowthTests : IDisposable
     }
 
     [Fact]
+    public void BasePoolSlabCount_RoundsUp()
+    {
+        Assert.Equal(3, RingSocketManager.BasePoolSlabCount(40, 4));       // slab 16, 40 needs 2.5
+        Assert.Equal(128, RingSocketManager.BasePoolSlabCount(4096, 128)); // slab 32, divides exactly
+        Assert.Equal(1, RingSocketManager.BasePoolSlabCount(8, 128));      // the 16-buffer floor covers it
+    }
+
+    [Fact]
     public void CreateSocket_SucceedsForEverySocketUpToMax()
     {
         // slab = max(16, 40 / 2) = 20, so the pools start at 20 buffers and grow one slab to reach 40
