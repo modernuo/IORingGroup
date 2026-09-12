@@ -97,7 +97,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         public ulong UserData;
     }
 
-    public DarwinIORingGroup(int queueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
+    public DarwinIORingGroup(
+        int queueSize,
+        int maxConnections = IORingGroup.DefaultMaxConnections,
+        int maxRegisteredBuffers = 0
+    )
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
@@ -131,8 +135,8 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         }
         _freeSlotCount = maxConnections;
 
-        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
-        _maxExternalBuffers = maxConnections * 2;
+        // Default: one recv + one send buffer per connection
+        _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
@@ -744,6 +748,9 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <inheritdoc/>
     /// <remarks>kevent takes a timespec with nanosecond granularity.</remarks>
     public bool SupportsHighResolutionWait => true;
+
+    /// <inheritdoc/>
+    public int MaxRegisteredBuffers => _maxExternalBuffers;
 
     /// <inheritdoc/>
     public void Wake()

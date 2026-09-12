@@ -31,6 +31,17 @@ public interface IIORingGroup : IDisposable
     int MaxOutstandingSendsPerSocket => 1;
 
     /// <summary>
+    /// Size of the buffer registration table; two slots per connection cover one recv and one send
+    /// buffer, more for consumers that swap in larger send buffers.
+    /// </summary>
+    /// <remarks>
+    /// 0 means unknown, the default for implementations outside this package.
+    /// <see cref="RingSocketManager"/> then skips its cross-check against
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/>, failing at first registration instead.
+    /// </remarks>
+    int MaxRegisteredBuffers => 0;
+
+    /// <summary>
     /// Whether outstanding recv/send operations retire only once the socket is closed. RIO cancels
     /// them on close; the other backends retire them after a shutdown of both directions, so the
     /// handle can stay open until they have completed.

@@ -92,7 +92,11 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         public ulong UserData;
     }
 
-    public LinuxEpollGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
+    public LinuxEpollGroup(
+        int queueSize = IORingGroup.DefaultQueueSize,
+        int maxConnections = IORingGroup.DefaultMaxConnections,
+        int maxRegisteredBuffers = 0
+    )
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
@@ -131,8 +135,8 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         }
         _freeSlotCount = maxConnections;
 
-        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
-        _maxExternalBuffers = maxConnections * 2;
+        // Default: one recv + one send buffer per connection
+        _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
@@ -545,6 +549,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// <inheritdoc/>
     /// <remarks>epoll_wait's timeout is backed by a high-resolution kernel timer.</remarks>
     public bool SupportsHighResolutionWait => true;
+
+    /// <inheritdoc/>
+    public int MaxRegisteredBuffers => _maxExternalBuffers;
 
     /// <inheritdoc/>
     public void Wake()

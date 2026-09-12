@@ -44,9 +44,9 @@ IORingGroup is a cross-platform zero-copy async socket I/O library for .NET 10+ 
 
 **Core types**:
 - `IORingBuffer` — Double-mapped circular buffer (physical memory mapped twice in virtual address space to eliminate wrap-around). Platform-specific allocation (VirtualAlloc2 / memfd_create / shm_open).
-- `IORingBufferPool` — Multi-slab buffer pool with on-demand allocation and pre-registration with the ring.
+- `IORingBufferPool` — Multi-slab buffer pool with on-demand allocation and pre-registration with the ring. Tracks `InUse`/`PeakInUse` and a windowed `RetainFloor`; `Maintain()` rotates the usage window and trims at most one idle slab down to that floor.
 - `RingSocket` — Managed socket wrapping an OS handle with pre-registered send/recv buffers. Tracks in-flight operation flags and generation counter for stale completion detection.
-- `RingSocketManager` — High-level manager providing O(1) slot allocation with generation tracking, flush queue for batched sends, graceful disconnect queue, and event-based API (`RingSocketEvent`: DataReceived, DataSent, Disconnected, Accept).
+- `RingSocketManager` — High-level manager providing O(1) slot allocation with generation tracking, flush queue for batched sends, graceful disconnect queue, and event-based API (`RingSocketEvent`: DataReceived, DataSent, Disconnected, Accept). Optionally grows a socket's send buffer through power-of-two tiers under a byte budget via `TryGrowSendBuffer`/`TryShrinkSendBuffer`; `Maintain()` rotates each tier pool's usage window and trims idle slabs.
 
 **User data encoding** (`IORingUserData`): 64-bit value packing `[8 opType][16 generation][8 reserved][32 socketId]` to detect stale completions after socket slot reuse.
 
@@ -64,3 +64,4 @@ IORingGroup is a cross-platform zero-copy async socket I/O library for .NET 10+ 
 - **Buffer safety**: Buffers must not be released while I/O is in-flight. Graceful disconnect drains and waits for pending recv/send completions; `DisconnectImmediate` shuts down the socket (closing it at once only where close is what cancels, i.e. RIO) and waits for every outstanding recv/send to retire before the Disconnected event. The slot and buffers are released on the pass after that event, once the consumer has read the events that referenced them.
 - **Generation tracking**: Socket slots are reused; generation counters in user data prevent processing stale completions from a previous socket occupying the same slot.
 - **Single-threaded ring access**: The submission/completion queues, `RingSocketManager`, and its send and disconnect queues (plain `Queue<T>`) are all accessed from a single thread; only `Wake()` may be called from another thread.
+- **Send buffer growth**: while a socket has a `RetiringSendBuffer`, nothing is posted from its current `SendBuffer`; a retiring buffer is released only by the completion that drains it, or by disconnect finalization if the swap never completed, so never attach an empty buffer as retiring.

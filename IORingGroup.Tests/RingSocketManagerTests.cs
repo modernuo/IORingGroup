@@ -18,7 +18,10 @@ public class RingSocketManagerTests : IDisposable
 
     public RingSocketManagerTests()
     {
-        _ring = System.Network.IORingGroup.Create(queueSize: 256);
+        // Sized via RequiredRegisteredBuffers since the manager cross-checks it at construction;
+        // +1 for the stand-in buffer PostSend_DrainsRetiringBufferBeforeCurrent registers on this ring.
+        var registered = RingSocketManager.RequiredRegisteredBuffers(64, 64 * 1024, 64 * 1024, 0) + 1;
+        _ring = System.Network.IORingGroup.Create(queueSize: 256, maxRegisteredBuffers: registered);
         _manager = new RingSocketManager(_ring, maxSockets: 64, recvBufferSize: 64 * 1024, sendBufferSize: 64 * 1024);
         _events = new RingSocketEvent[64];
 
@@ -749,5 +752,58 @@ public class RingSocketManagerTests : IDisposable
             _manager.Submit();
             Thread.Sleep(10);
         }
+    }
+
+    /// <summary>
+    /// The retiring buffer drains before the current one posts, keeping order across the swap.
+    /// </summary>
+    [Fact]
+    public void PostSend_DrainsRetiringBufferBeforeCurrent()
+    {
+        var socket = AcceptManaged(out var client);
+
+        var first = "first"u8.ToArray();
+        Write(socket, first);
+        _manager.ProcessSendQueue();
+        _manager.Submit(); // "first" in flight from the original buffer
+
+        // Zero-copy sends read from registered memory, so the stand-in buffer is registered like the pool's own.
+        var replacement = IORingBuffer.Create(65536);
+        replacement.BufferId = _ring.RegisterBuffer(replacement);
+
+        // A full table would hand back -1 here, and sends from this buffer would quietly go
+        // nowhere - a garbled payload, not a visible table-too-small error.
+        Assert.True(replacement.BufferId >= 0);
+
+        var second = "second"u8.ToArray();
+        second.CopyTo(replacement.GetWriteSpan());
+        replacement.CommitWrite(second.Length);
+
+        socket.RetiringSendBuffer = socket.SendBuffer;
+        socket.SendBuffer = replacement;
+        socket.QueueSend();
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+
+        var received = new byte[first.Length + second.Length];
+        var total = 0;
+        for (var i = 0; i < 100 && total < received.Length; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            if (client.Poll(1000, System.Net.Sockets.SelectMode.SelectRead))
+            {
+                total += client.Receive(received, total, received.Length - total, System.Net.Sockets.SocketFlags.None);
+            }
+        }
+
+        Assert.Equal("firstsecond"u8.ToArray(), received);
+        Assert.Null(socket.RetiringSendBuffer);
+
+        client.Close();
+        ProcessUntilAllDisconnected();
+
+        // A finalized socket's buffers release at the top of the *next* pass, which unregisters and disposes the non-pooled replacement.
+        _manager.ProcessCompletions(_events);
     }
 }

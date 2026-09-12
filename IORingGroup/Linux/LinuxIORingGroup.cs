@@ -70,15 +70,19 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
 
     private volatile bool _disposed;
 
-    public LinuxIORingGroup(int queueSize = IORingGroup.DefaultQueueSize, int maxConnections = IORingGroup.DefaultMaxConnections)
+    public LinuxIORingGroup(
+        int queueSize = IORingGroup.DefaultQueueSize,
+        int maxConnections = IORingGroup.DefaultMaxConnections,
+        int maxRegisteredBuffers = 0
+    )
     {
         if (!IORingGroup.IsPowerOfTwo(queueSize))
         {
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
-        // Initialize external buffer tracking (maxConnections * 2 for recv + send buffer per connection)
-        _maxExternalBuffers = maxConnections * 2;
+        // Default: one recv + one send buffer per connection
+        _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
@@ -490,6 +494,9 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <inheritdoc/>
     /// <remarks>poll's timeout is backed by a high-resolution kernel timer.</remarks>
     public bool SupportsHighResolutionWait => true;
+
+    /// <inheritdoc/>
+    public int MaxRegisteredBuffers => _maxExternalBuffers;
 
     /// <inheritdoc/>
     public void Wake()

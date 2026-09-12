@@ -148,6 +148,55 @@ while (running)
 }
 ```
 
+### Send buffer growth
+
+Bursty sockets can outgrow the base send buffer without paying that cost for every idle connection. `RingSocketManager` supports optional growth through power-of-two tiers above the base `sendBufferSize`, bounded by a byte budget shared across all sockets:
+
+```csharp
+using var ring = IORingGroup.Create(
+    maxConnections: 4096,
+    maxRegisteredBuffers: RingSocketManager.RequiredRegisteredBuffers(
+        maxSockets: 4096,
+        sendBufferSize: 256 * 1024,
+        maxSendBufferSize: 4 * 1024 * 1024,
+        sendBufferGrowthBudget: 512 * 1024 * 1024
+    )
+);
+
+using var manager = new RingSocketManager(
+    ring,
+    maxSockets: 4096,
+    maxSendBufferSize: 4 * 1024 * 1024,       // largest a socket may grow to (0 disables growth)
+    sendBufferGrowthBudget: 512 * 1024 * 1024 // bytes of tier-pool capacity shared across all sockets
+);
+```
+
+`maxConnections` is not optional here: it defaults to 1024, and a ring built for 1024 connections cannot carry a manager built for 4096.
+
+- `maxSendBufferSize` is the ceiling a socket can grow to; 0 (the default) means growth is disabled. It must be a power of two, no smaller than `sendBufferSize`, and no larger than 256 MiB.
+- `sendBufferGrowthBudget` caps how many bytes the tier pools may hold in total; a positive value below `RingSocketManager.MinimumSendBufferGrowthBudget(sendBufferSize)` throws, since tier buffers are only ever handed out a slab at a time.
+- `RequiredRegisteredBuffers(...)` computes the registration table size these settings need — pass it as `IORingGroup.Create(maxRegisteredBuffers:)` so the ring and the manager can't drift out of sync. The manager cross-checks the two in its constructor and throws when the ring's table is too small, so a mismatch surfaces at startup instead of at an accept or a growth.
+- Call `manager.Maintain()` about once a minute from the ring thread. It rotates each tier pool's usage window, trims at most one idle slab per tier down to the recent peak, and returns a `SendBufferMaintenance` snapshot (buffers released, growth refusals, tier capacity/usage). Its `TierInUse` and `TierRetainFloor` are buffer *counts* summed across tiers of different sizes; use `manager.GetSendBufferTierStats(tier)` when you need one tier's real numbers.
+
+#### Budget per tier, not just in total
+
+Tier buffers are allocated a slab at a time, and a slab of tier size *S* holds `max(4, min(16, 8 MiB / S))` buffers — so a slab costs 8 MiB up to the point where the floor of 4 buffers takes over, and more above it. Clearing `MinimumSendBufferGrowthBudget` only guarantees the *first* tier is reachable. With the 256 KiB base and 4 MiB ceiling above:
+
+| Tier size | Buffers per slab | Slab cost |
+|-----------|------------------|-----------|
+| 512 KiB   | 16               | 8 MiB     |
+| 1 MiB     | 8                | 8 MiB     |
+| 2 MiB     | 4                | 8 MiB     |
+| 4 MiB     | 4                | 16 MiB    |
+
+A growth is refused when the tier has no free buffer and its next slab would not fit in what the budget has left, so the budget must cover at least one slab of a tier for that tier to be usable at all — and in practice several, since the lower tiers allocate first and hold their capacity until `Maintain()` trims them. `SendBufferMaintenance.GrowthRefusals` is how you find out the budget is set too low.
+
+#### What bounds memory, and what bounds connections
+
+Worst-case tier memory is exactly `sendBufferGrowthBudget`. The base pools are bounded separately, and not by `maxSockets`: with `slabSize = max(64, maxSockets / maxBufferSlabs)`, the recv pool tops out at `maxBufferSlabs × slabSize` buffers and the base send pool at `maxBufferSlabs × (slabSize / 4)` — a quarter of the recv pool.
+
+For large `maxSockets` that quarter, not `maxSockets`, is what actually bounds concurrent connections: the configuration above allows 4096 sockets but only `32 × 32 = 1024` base send buffers (256 MiB of them), and `CreateSocket` returns null once they are all handed out. Raise `maxBufferSlabs`, or size `maxSockets` against the send pool rather than the socket table, if every slot has to be usable at once.
+
 ## Threading Model
 
 IORingGroup is designed for **single-threaded** event loops. The ring, the manager, and all socket operations must be called from the same thread:
