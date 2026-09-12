@@ -145,13 +145,12 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void RequiredRegisteredBuffers_CoversBothPoolsPlusBudgetWorthOfFirstTier()
     {
-        // slabSize = max(64, 16/4) = 64, send pool = a quarter of that. Each base pool is bounded by
-        // what 16 sockets can pull (rounded to whole slabs), not the 4-slab ceiling: one recv slab
-        // (64), one send slab (16).
-        Assert.Equal(64 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
+        // slabSize = max(16, 16/4) = 16, the same for both pools, and 16 sockets fill exactly one
+        // slab of each.
+        Assert.Equal(16 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
 
         // 16 x 64 KB of budget buys 8 first-tier (128 KB) buffers.
-        Assert.Equal(64 + 16 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
+        Assert.Equal(16 + 16 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
     }
 
     [Fact]
@@ -160,12 +159,163 @@ public class RingSocketManagerGrowthTests : IDisposable
         // Default table is maxConnections x 2; the manager's defaults must fit it or callers need an explicit table size.
         Assert.True(RingSocketManager.RequiredRegisteredBuffers(1024, 256 * 1024, 256 * 1024, 0) <= 2048);
 
-        // recv 32 x 128 = 4096 and send 32 x 32 = 1024, both at their slab ceiling here, plus
+        // slabSize = max(16, 4096/128) = 32, so each base pool holds one buffer per socket, plus
         // 256 MiB of budget worth of 512 KB first-tier buffers.
         Assert.Equal(
-            4096 + 1024 + 512,
+            4096 + 4096 + 512,
             RingSocketManager.RequiredRegisteredBuffers(4096, 256 * 1024, 2 * 1024 * 1024, 256L * 1024 * 1024)
         );
+    }
+
+    [Fact]
+    public void BasePools_AreSymmetric_AndReachMaxSockets()
+    {
+        // slab = max(16, 40 / 4) = 16; both pools need 3 slabs to hold 40 sockets
+        Assert.Equal(16, RingSocketManager.BasePoolSlabSize(40, 4));
+        Assert.Equal(2 * 48, RingSocketManager.RequiredRegisteredBuffers(40, Base, Base, 0, 4));
+
+        // The floor keeps a tiny socket table off one-buffer slabs
+        Assert.Equal(16, RingSocketManager.BasePoolSlabSize(8, 4));
+    }
+
+    [Fact]
+    public void CreateSocket_SucceedsForEverySocketUpToMax()
+    {
+        // slab = max(16, 40 / 2) = 20, so the pools start at 20 buffers and grow one slab to reach 40
+        const int maxSockets = 40;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(maxSockets, Base, Base, 0, 2);
+        Assert.Equal(2 * maxSockets, registered);
+
+        using var ring = System.Network.IORingGroup.Create(
+            queueSize: 256, maxConnections: maxSockets, maxRegisteredBuffers: registered
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: maxSockets, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 1, maxBufferSlabs: 2
+        );
+
+        var port = 23000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 64);
+        var clients = new List<Socket>(maxSockets);
+
+        try
+        {
+            for (var i = 0; i < maxSockets; i++)
+            {
+                // The send pool used to cap at maxSockets / 4, so this returned null partway through
+                Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
+                manager.Submit();
+            }
+
+            Assert.Equal(maxSockets, manager.ConnectedCount);
+        }
+        finally
+        {
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
+    [Fact]
+    public void Maintain_TrimsIdleBaseSlabsDownToTheInitialCount()
+    {
+        const int maxSockets = 40;
+        const int slab = 16;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(maxSockets, Base, Base, 0, 4);
+        using var ring = System.Network.IORingGroup.Create(
+            queueSize: 256, maxConnections: maxSockets, maxRegisteredBuffers: registered
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: maxSockets, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 1, maxBufferSlabs: 4, sendBufferRetentionWindows: 1
+        );
+
+        var port = 24000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 64);
+        var clients = new List<Socket>(20);
+
+        try
+        {
+            for (var i = 0; i < 20; i++)
+            {
+                Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
+                manager.Submit();
+            }
+
+            // Two slabs of each pool are live
+            Assert.Equal(2L * 2 * slab * Base, manager.Maintain().BaseCapacityBytes);
+
+            CloseAll(manager, clients);
+            Assert.Equal(0, manager.ConnectedCount);
+
+            manager.Maintain(); // window records the 20 that were live
+            var trimmed = manager.Maintain(); // peak 0: the top slab of each pool goes back
+
+            Assert.Equal(2 * slab, trimmed.BaseBuffersReleased);
+            Assert.Equal(2L * slab * Base, trimmed.BaseCapacityBytes);
+        }
+        finally
+        {
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
+    /// <summary>
+    /// Connects a client, accepts it on <paramref name="listener"/>, and returns the configured handle.
+    /// </summary>
+    private static nint AcceptOn(IIORingGroup ring, nint listener, int port, List<Socket> clients)
+    {
+        var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(IPAddress.Loopback, port);
+        clients.Add(client);
+
+        ring.PrepareAccept(listener, 0, 0, IORingUserData.EncodeAccept());
+        ring.Submit();
+
+        var completions = new Completion[1];
+        nint handle = -1;
+        for (var i = 0; i < 200 && handle <= 0; i++)
+        {
+            if (ring.PeekCompletions(completions) > 0)
+            {
+                ring.AdvanceCompletionQueue(1);
+                handle = completions[0].Result;
+            }
+            else
+            {
+                Thread.Sleep(5);
+            }
+        }
+
+        Assert.True(handle > 0);
+        ring.ConfigureSocket(handle);
+        return handle;
+    }
+
+    /// <summary>
+    /// Closes every client and pumps until the manager has released their slots and buffers.
+    /// </summary>
+    private static void CloseAll(RingSocketManager manager, List<Socket> clients)
+    {
+        for (var i = 0; i < clients.Count; i++)
+        {
+            clients[i].Close();
+        }
+
+        clients.Clear();
+
+        var events = new RingSocketEvent[64];
+        for (var i = 0; i < 1000 && manager.ConnectedCount > 0; i++)
+        {
+            manager.ProcessCompletions(events);
+            manager.Submit();
+            Thread.Sleep(2);
+        }
+
+        // Buffers go back on the pass after the consumer has seen the disconnect events
+        manager.ProcessCompletions(events);
+        manager.Submit();
     }
 
     [Fact]
@@ -192,10 +342,15 @@ public class RingSocketManagerGrowthTests : IDisposable
             queueSize: 64, maxConnections: 64, maxRegisteredBuffers: needed + 64
         );
 
-        using var first = new RingSocketManager(ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base);
+        // Four slabs up front on both sides: lazy pools would never reach the table's edge here.
+        using var first = new RingSocketManager(
+            ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base, initialBufferSlabs: 4
+        );
 
         var ex = Assert.Throws<InvalidOperationException>(
-            () => new RingSocketManager(ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base)
+            () => new RingSocketManager(
+                ring, maxSockets: 64, recvBufferSize: Base, sendBufferSize: Base, initialBufferSlabs: 4
+            )
         );
 
         Assert.Contains("registration", ex.Message, StringComparison.OrdinalIgnoreCase);

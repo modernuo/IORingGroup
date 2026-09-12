@@ -116,6 +116,37 @@ public class IORingBufferPoolRetentionTests : IDisposable
     }
 
     [Fact]
+    public void Maintain_NeverTrimsBelowMinSlabs()
+    {
+        using var pool = new IORingBufferPool(
+            _ring, slabSize: 2, bufferSize: 65536, initialSlabs: 1, maxSlabs: 4, retentionWindows: 1, minSlabs: 1
+        );
+
+        Assert.Equal(1, pool.MinSlabs);
+        Assert.True(pool.TryAcquire(out var a));
+        Assert.True(pool.TryAcquire(out var b));
+        Assert.True(pool.TryAcquire(out var c)); // second slab
+        pool.Release(a!);
+        pool.Release(b!);
+        pool.Release(c!);
+
+        Assert.Equal(0, pool.Maintain()); // floor 3
+        Assert.Equal(2, pool.Maintain()); // floor 0: second slab trimmed
+        Assert.Equal(0, pool.Maintain()); // first slab is the minimum
+        Assert.Equal(1, pool.CurrentSlabs);
+    }
+
+    [Fact]
+    public void Constructor_RejectsMinSlabsAboveMaxSlabs()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => new IORingBufferPool(_ring, slabSize: 2, bufferSize: 65536, initialSlabs: 0, maxSlabs: 2, minSlabs: 3)
+        );
+
+        Assert.Equal("minSlabs", ex.ParamName);
+    }
+
+    [Fact]
     public void HasFreeBuffer_ReflectsSlabState()
     {
         using var pool = CreatePool(slabSize: 1, maxSlabs: 1);
