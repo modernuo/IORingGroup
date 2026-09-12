@@ -453,6 +453,55 @@ public class RingSocketManagerGrowthTests : IDisposable
     }
 
     [Fact]
+    public void CreateSocket_UnwindsThePublishedSocket_WhenTheFirstReceiveCannotBePosted()
+    {
+        // slab 16, one slab: capacity is exactly maxSockets, so a leaked pair costs a socket
+        const int maxSockets = 16;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(maxSockets, Base, Base, 0, 1);
+        Assert.Equal(2 * maxSockets, registered);
+
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(
+                queueSize: 256, maxConnections: maxSockets, maxRegisteredBuffers: registered
+            )
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: maxSockets, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 1, maxBufferSlabs: 1
+        );
+
+        var port = 30000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 64);
+        var clients = new List<Socket>(maxSockets + 1);
+
+        try
+        {
+            ring.ThrowOnNextPrepareRecv = true;
+
+            var handle = AcceptOn(ring, listener, port, clients);
+            Assert.Throws<InvalidOperationException>(() => manager.CreateSocket(handle));
+
+            // The socket was published before the post, so it has to be taken back out
+            Assert.Equal(0, manager.ConnectedCount);
+
+            // Both buffers and the slot are reusable: a leak would leave the last socket nothing
+            for (var i = 0; i < maxSockets; i++)
+            {
+                Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
+                manager.Submit();
+            }
+
+            Assert.Equal(maxSockets, manager.ConnectedCount);
+        }
+        finally
+        {
+            ring.ThrowOnNextPrepareRecv = false;
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
+    [Fact]
     public void CreateSocket_ReleasesTheRecvBuffer_WhenTheSendSlabRaisesAnArgumentError()
     {
         // slab 16, two slabs: capacity is exactly maxSockets, so one leaked buffer costs one socket

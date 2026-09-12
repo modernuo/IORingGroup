@@ -26,6 +26,9 @@ public sealed class FailingRegistrationRing : IIORingGroup
     /// <summary>Makes <see cref="RegisterBuffer"/> raise an argument error instead of refusing operationally.</summary>
     public bool ThrowArgumentExceptionOnRegister { get; set; }
 
+    /// <summary>Fails the next receive the manager posts, the way a full submission queue does; self-clearing.</summary>
+    public bool ThrowOnNextPrepareRecv { get; set; }
+
     /// <summary>
     /// Lets the next <paramref name="count"/> registrations through, then raises an argument error;
     /// <see cref="int.MaxValue"/> disarms it. Puts the failure inside one specific slab.
@@ -85,8 +88,16 @@ public sealed class FailingRegistrationRing : IIORingGroup
     public void UnregisterBuffer(int bufferId) => _inner.UnregisterBuffer(bufferId);
     public void PrepareSendBuffer(int connId, int bufferId, int offset, int length, ulong userData) =>
         _inner.PrepareSendBuffer(connId, bufferId, offset, length, userData);
-    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData) =>
+    public void PrepareRecvBuffer(int connId, int bufferId, int offset, int length, ulong userData)
+    {
+        if (ThrowOnNextPrepareRecv)
+        {
+            ThrowOnNextPrepareRecv = false;
+            throw new InvalidOperationException("Test-injected submission queue failure");
+        }
+
         _inner.PrepareRecvBuffer(connId, bufferId, offset, length, userData);
+    }
     public void WaitForCompletion(int timeoutMs) => _inner.WaitForCompletion(timeoutMs);
     public void Wake() => _inner.Wake();
     public void Dispose() => _inner.Dispose();

@@ -71,6 +71,12 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // than at startup.
     public const int MaxConfigurableOutstandingSends = 64;
 
+    /// <summary>
+    /// Largest registration table this backend supports: a posted operation carries its buffer id in
+    /// a 16-bit index, so roughly 32k sockets at one recv and one send buffer each.
+    /// </summary>
+    public const int MaxRegisteredBufferCeiling = ushort.MaxValue;
+
     private readonly uint _outstandingSendsPerSocket;
 
     /// <inheritdoc/>
@@ -160,6 +166,21 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         ArgumentOutOfRangeException.ThrowIfLessThan(maxOutstandingSends, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(maxOutstandingSends, MaxConfigurableOutstandingSends);
 
+        // A posted operation carries its buffer id in a ushort, so an id past that would narrow into
+        // another socket's buffer. Checked here, before anything native is allocated.
+        var registeredBuffers = maxRegisteredBuffers > 0
+            ? maxRegisteredBuffers
+            : RingSocketManager.RequiredRegisteredBuffers(maxConnections);
+
+        if (registeredBuffers > MaxRegisteredBufferCeiling)
+        {
+            throw new ArgumentOutOfRangeException(
+                maxRegisteredBuffers > 0 ? nameof(maxRegisteredBuffers) : nameof(maxConnections),
+                $"RIO registers at most {MaxRegisteredBufferCeiling} buffers and this needs {registeredBuffers}, " +
+                "since a posted operation identifies its buffer with a 16-bit index"
+            );
+        }
+
         _outstandingSendsPerSocket = (uint)maxOutstandingSends;
 
         // Step 1: Initialize WinSock and load RIO function table
@@ -190,9 +211,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         _connections = (RioConnection*)NativeMemory.AllocZeroed(mc, (nuint)sizeof(RioConnection));
 
-        _maxExternalBuffers = maxRegisteredBuffers > 0
-            ? (uint)maxRegisteredBuffers
-            : (uint)RingSocketManager.RequiredRegisteredBuffers(maxConnections);
+        _maxExternalBuffers = (uint)registeredBuffers;
         _externalBufferIds = (nint*)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(nint));
         _externalBufferPtrs = (byte**)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(byte*));
         _externalBufferLens = (uint*)NativeMemory.AllocZeroed(_maxExternalBuffers, sizeof(uint));
@@ -980,7 +999,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
             }
         }
 
-        if (slot < 0)
+        // Belt to the constructor's braces: never hand out an id the posting sites would narrow
+        if (slot < 0 || slot > MaxRegisteredBufferCeiling)
         {
             return -1;
         }

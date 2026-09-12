@@ -67,6 +67,28 @@ public class WindowsManagedRIOGroupTests
     private const int MaxConnections = 128;
 
     [SkippableFact]
+    public void Create_RejectsARegistrationTablePastTheUshortBufferId()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");
+
+        // A posted operation carries its buffer id in a ushort, so id 65536 would narrow to 0 and
+        // read another socket's buffer
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => System.Network.IORingGroup.Create(maxConnections: MaxConnections, maxRegisteredBuffers: 65536)
+        );
+
+        Assert.Equal("maxRegisteredBuffers", ex.ParamName);
+        Assert.Contains("65535", ex.Message);
+
+        // The largest table that still fits
+        using var ring = System.Network.IORingGroup.Create(
+            maxConnections: MaxConnections, maxRegisteredBuffers: ushort.MaxValue
+        );
+
+        Assert.Equal(ushort.MaxValue, ring.MaxRegisteredBuffers);
+    }
+
+    [SkippableFact]
     public void Dispose_WithPendingAccepts_DoesNotTouchFreedMemory()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), "Windows only");

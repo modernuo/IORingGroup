@@ -524,9 +524,24 @@ public sealed class RingSocketManager : IDisposable
 
             _sockets[slotId] = socket;
             ConnectedCount++;
-            owned = true; // the socket holds the buffers now and releases them when it finalizes
 
-            PostRecv(socket);
+            try
+            {
+                PostRecv(socket);
+            }
+            catch
+            {
+                // Nothing is outstanding: PostRecv marks RecvPending only once the op is built, so the
+                // socket can be unpublished here and the finally below reclaims both buffers
+                _sockets[slotId] = null;
+                ConnectedCount--;
+                Unregister(socket);
+                CloseHandle(socket);
+
+                throw;
+            }
+
+            owned = true; // the socket holds the buffers now and releases them when it finalizes
 
             return socket;
         }
