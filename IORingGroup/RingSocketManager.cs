@@ -493,38 +493,55 @@ public sealed class RingSocketManager : IDisposable
             return null;
         }
 
-        if (!TryAcquireLazy(_sendBufferPool, out var sendBuffer))
+        // One unwind for every exit that is not a live socket, thrown ones included: an argument
+        // error propagates by design and must not take the recv buffer with it
+        var owned = false;
+        IORingBuffer? sendBuffer = null;
+        try
         {
-            _recvBufferPool.Release(recvBuffer!);
-            return null;
-        }
+            if (!TryAcquireLazy(_sendBufferPool, out sendBuffer))
+            {
+                return null;
+            }
 
-        var connId = _ring.RegisterSocket(socketHandle);
-        if (connId < 0)
+            var connId = _ring.RegisterSocket(socketHandle);
+            if (connId < 0)
+            {
+                return null;
+            }
+
+            var generation = ++_generations[slotId];
+
+            var socket = new RingSocket(
+                this,
+                slotId,
+                socketHandle,
+                connId,
+                generation,
+                recvBuffer!,
+                sendBuffer!
+            );
+
+            _sockets[slotId] = socket;
+            ConnectedCount++;
+            owned = true; // the socket holds the buffers now and releases them when it finalizes
+
+            PostRecv(socket);
+
+            return socket;
+        }
+        finally
         {
-            _recvBufferPool.Release(recvBuffer!);
-            _sendBufferPool.Release(sendBuffer!);
-            return null;
+            if (!owned)
+            {
+                _recvBufferPool.Release(recvBuffer!);
+
+                if (sendBuffer != null)
+                {
+                    _sendBufferPool.Release(sendBuffer);
+                }
+            }
         }
-
-        var generation = ++_generations[slotId];
-
-        var socket = new RingSocket(
-            this,
-            slotId,
-            socketHandle,
-            connId,
-            generation,
-            recvBuffer!,
-            sendBuffer!
-        );
-
-        _sockets[slotId] = socket;
-        ConnectedCount++;
-
-        PostRecv(socket);
-
-        return socket;
     }
 
     /// <summary>

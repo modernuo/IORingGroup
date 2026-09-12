@@ -13,6 +13,7 @@ public sealed class FailingRegistrationRing : IIORingGroup
 {
     private readonly IIORingGroup _inner;
     private int _allowedRegistrations = int.MaxValue;
+    private int _registrationsBeforeArgumentError = int.MaxValue;
 
     public FailingRegistrationRing(IIORingGroup inner) => _inner = inner;
 
@@ -25,11 +26,22 @@ public sealed class FailingRegistrationRing : IIORingGroup
     /// <summary>Makes <see cref="RegisterBuffer"/> raise an argument error instead of refusing operationally.</summary>
     public bool ThrowArgumentExceptionOnRegister { get; set; }
 
+    /// <summary>
+    /// Lets the next <paramref name="count"/> registrations through, then raises an argument error;
+    /// <see cref="int.MaxValue"/> disarms it. Puts the failure inside one specific slab.
+    /// </summary>
+    public void ThrowArgumentExceptionAfter(int count) => _registrationsBeforeArgumentError = count;
+
     public int RegisterBuffer(IORingBuffer buffer)
     {
-        if (ThrowArgumentExceptionOnRegister)
+        if (ThrowArgumentExceptionOnRegister || _registrationsBeforeArgumentError <= 0)
         {
             throw new ArgumentException("Test-injected argument error", nameof(buffer));
+        }
+
+        if (_registrationsBeforeArgumentError != int.MaxValue)
+        {
+            _registrationsBeforeArgumentError--;
         }
 
         if (_allowedRegistrations <= 0)

@@ -22,6 +22,16 @@ public class IORingBufferTests
         Assert.Throws<ArgumentOutOfRangeException>(() => IORingBuffer.Create(0));
     }
 
+    [Fact]
+    public void ValidateSize_RejectsASizeThatOverflowsWhenDoubled()
+    {
+        // The mapping reserves 2x, so 1 GiB wraps the int arithmetic the Unix paths used
+        Assert.Throws<ArgumentOutOfRangeException>(() => IORingBuffer.ValidateSize(1 << 30));
+
+        // The largest power of two that still doubles inside an int
+        IORingBuffer.ValidateSize(1 << 29);
+    }
+
     [SkippableFact]
     public void Create_BelowWindowsAllocationGranularity_ThrowsOnWindows()
     {
