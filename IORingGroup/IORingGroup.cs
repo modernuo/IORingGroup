@@ -24,10 +24,15 @@ public static class IORingGroup
     /// Creates an IIORingGroup instance appropriate for the current platform.
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
-    /// <param name="maxConnections">Maximum concurrent connections. Determines external buffer capacity (maxConnections * 2).</param>
+    /// <param name="maxConnections">
+    /// Maximum concurrent connections. It also supplies the default registration table size
+    /// (<c>maxConnections * 2</c>) when <paramref name="maxRegisteredBuffers"/> is 0, but only then.
+    /// </param>
     /// <param name="maxRegisteredBuffers">
     /// Size of the buffer registration table. 0 (default) means <c>maxConnections * 2</c>; pass a
     /// larger value for headroom beyond the default one recv + one send buffer per connection.
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/> computes what a
+    /// <see cref="RingSocketManager"/> configuration needs, which is well above that default.
     /// </param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>

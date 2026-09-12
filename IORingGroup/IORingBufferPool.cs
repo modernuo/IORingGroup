@@ -31,6 +31,7 @@ public sealed class IORingBufferPool : IDisposable
     private readonly int[] _windows;
     private int _firstNonFullSlab;
     private int _windowIndex;
+    private int _registeredBuffers;
     private bool _disposed;
 
     // Fallback tracking
@@ -92,7 +93,11 @@ public sealed class IORingBufferPool : IDisposable
     /// <summary>Number of maintenance windows a peak stays in force.</summary>
     public int RetentionWindows { get; }
 
-    public int SlabBytes => SlabSize * BufferSize;
+    /// <summary>
+    /// Bytes one slab of this pool holds. Long because a large buffer size times a slab of them
+    /// overflows an int well inside the sizes the manager's top tiers allow.
+    /// </summary>
+    public long SlabBytes => (long)SlabSize * BufferSize;
 
     public long CapacityBytes => (long)TotalCapacity * BufferSize;
 
@@ -171,10 +176,28 @@ public sealed class IORingBufferPool : IDisposable
         _slabs = new List<PoolSlab>(maxSlabs);
         _firstNonFullSlab = 0;
 
-        // Pre-allocate initial slabs
+        // Pre-allocate initial slabs. A slab that fails part way through has already unwound itself;
+        // the slabs before it are this constructor's to release, since nothing will ever see the
+        // half-built pool to dispose it.
         for (var i = 0; i < initialSlabs; i++)
         {
-            _slabs.Add(CreateSlab(i));
+            PoolSlab slab;
+            try
+            {
+                slab = CreateSlab(i);
+            }
+            catch
+            {
+                for (var j = 0; j < _slabs.Count; j++)
+                {
+                    DisposeSlab(_slabs[j]);
+                }
+
+                _slabs.Clear();
+                throw;
+            }
+
+            _slabs.Add(slab);
         }
     }
 
@@ -191,22 +214,37 @@ public sealed class IORingBufferPool : IDisposable
             var poolIndex = basePoolIndex + i;
             var buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
 
-            // Register with ring
-            var bufferId = _ring.RegisterBuffer(buffer);
-            if (bufferId < 0)
+            // Register with ring. An unregistered buffer would be accepted here and then fail every
+            // operation posted against it, which reads as a random disconnect, so fail where the
+            // cause is visible - but unwind first, or the slab's mappings and the registrations of
+            // the buffers before it leak. Backends signal the failure either way: RIO returns a
+            // negative id, the Unix backends throw.
+            int bufferId;
+            try
             {
-                // An unregistered buffer would be accepted here and then fail every operation posted
-                // against it, which reads as a random disconnect. Fail where the cause is visible.
+                bufferId = _ring.RegisterBuffer(buffer);
+            }
+            catch (Exception ex)
+            {
+                // The message reads the registration count, so build it before unwinding drops it.
+                var message = RegistrationFailureMessage(slabId, i);
                 buffer.Dispose();
                 UnwindSlab(slab, i);
 
-                throw new InvalidOperationException(
-                    $"Buffer registration failed: the ring's MaxRegisteredBuffers table ({_ring.MaxRegisteredBuffers} entries) is full. " +
-                    "Size it with RingSocketManager.RequiredRegisteredBuffers."
-                );
+                throw new InvalidOperationException(message, ex);
+            }
+
+            if (bufferId < 0)
+            {
+                var message = RegistrationFailureMessage(slabId, i);
+                buffer.Dispose();
+                UnwindSlab(slab, i);
+
+                throw new InvalidOperationException(message);
             }
 
             buffer.BufferId = bufferId;
+            _registeredBuffers++;
 
             slab.Buffers[i] = buffer;
             slab.FreeStack[i] = i;
@@ -214,6 +252,27 @@ public sealed class IORingBufferPool : IDisposable
 
         slab.FreeCount = SlabSize;
         return slab;
+    }
+
+    /// <summary>
+    /// Explains a failed registration without guessing at its cause. The table size is offered as
+    /// the remediation only when this pool has demonstrably filled it; otherwise the failure is a
+    /// native one - a locked-memory rlimit, exhausted address space - or another pool sharing the
+    /// ring, and telling the reader to resize the table would send them to the wrong knob. The
+    /// count is this pool's own, so it can only prove the table full, never prove it is not.
+    /// </summary>
+    private string RegistrationFailureMessage(int slabId, int index)
+    {
+        var max = _ring.MaxRegisteredBuffers;
+        var where = $"Buffer registration failed for buffer {index} of slab {slabId} ({BufferSize} byte buffers)";
+
+        return max > 0 && _registeredBuffers >= max
+            ? $"{where}: the ring's registration table is full ({max} entries). Size it with " +
+              "RingSocketManager.RequiredRegisteredBuffers and pass the result to IORingGroup.Create(maxRegisteredBuffers:)."
+            : $"{where}: the ring rejected the registration" +
+              (max > 0 ? $", with {_registeredBuffers} of the ring's {max} table entries held by this pool" : "") +
+              ". This pool has not filled the table on its own, so look at a native limit - a locked-memory " +
+              "rlimit, exhausted address space - or at other pools registering against the same ring.";
     }
 
     /// <summary>
@@ -226,6 +285,31 @@ public sealed class IORingBufferPool : IDisposable
         {
             var buffer = slab.Buffers[i];
             _ring.UnregisterBuffer(buffer.BufferId);
+            _registeredBuffers--;
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Unregisters and disposes every buffer of a fully built slab. The one place that releases a
+    /// slab, shared by the constructor's unwind, <see cref="Maintain"/>'s trim, and <see cref="Dispose"/>.
+    /// </summary>
+    private void DisposeSlab(PoolSlab slab)
+    {
+        for (var i = 0; i < slab.Buffers.Length; i++)
+        {
+            var buffer = slab.Buffers[i];
+            if (buffer == null)
+            {
+                continue;
+            }
+
+            if (buffer.BufferId >= 0)
+            {
+                _ring.UnregisterBuffer(buffer.BufferId);
+                _registeredBuffers--;
+            }
+
             buffer.Dispose();
         }
     }
@@ -353,6 +437,7 @@ public sealed class IORingBufferPool : IDisposable
             if (buffer.BufferId >= 0)
             {
                 _ring.UnregisterBuffer(buffer.BufferId);
+                _registeredBuffers--;
             }
 
             buffer.Dispose();
@@ -393,12 +478,7 @@ public sealed class IORingBufferPool : IDisposable
             return 0;
         }
 
-        for (var i = 0; i < SlabSize; i++)
-        {
-            var buffer = top.Buffers[i];
-            _ring.UnregisterBuffer(buffer.BufferId);
-            buffer.Dispose();
-        }
+        DisposeSlab(top);
 
         _slabs.RemoveAt(_slabs.Count - 1);
         if (_firstNonFullSlab > _slabs.Count)
@@ -428,6 +508,10 @@ public sealed class IORingBufferPool : IDisposable
         // Register with ring
         var bufferId = _ring.RegisterBuffer(buffer);
         buffer.BufferId = bufferId;
+        if (bufferId >= 0)
+        {
+            _registeredBuffers++;
+        }
 
         return buffer;
     }
@@ -482,17 +566,7 @@ public sealed class IORingBufferPool : IDisposable
         // Unregister and dispose all pooled buffers in all slabs
         for (var i = 0; i < _slabs.Count; i++)
         {
-            var slab = _slabs[i];
-            for (var j = 0; j < slab.Buffers.Length; j++)
-            {
-                var buffer = slab.Buffers[j];
-                if (buffer.BufferId >= 0)
-                {
-                    _ring.UnregisterBuffer(buffer.BufferId);
-                }
-
-                buffer.Dispose();
-            }
+            DisposeSlab(_slabs[i]);
         }
 
         _slabs.Clear();

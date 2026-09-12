@@ -18,7 +18,11 @@ public class RingSocketManagerTests : IDisposable
 
     public RingSocketManagerTests()
     {
-        _ring = System.Network.IORingGroup.Create(queueSize: 256);
+        // The default table (maxConnections x 2) covers one recv and one send buffer per connection,
+        // but the pools round up to whole slabs and can allocate well past that. The manager
+        // cross-checks the two at construction now, so size the ring from the same helper.
+        var registered = RingSocketManager.RequiredRegisteredBuffers(64, 64 * 1024, 64 * 1024, 0);
+        _ring = System.Network.IORingGroup.Create(queueSize: 256, maxRegisteredBuffers: registered);
         _manager = new RingSocketManager(_ring, maxSockets: 64, recvBufferSize: 64 * 1024, sendBufferSize: 64 * 1024);
         _events = new RingSocketEvent[64];
 

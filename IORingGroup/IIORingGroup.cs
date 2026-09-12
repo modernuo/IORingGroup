@@ -34,7 +34,14 @@ public interface IIORingGroup : IDisposable
     /// Size of the buffer registration table. Two per connection covers one recv and one send
     /// buffer each; consumers that swap in larger send buffers need headroom beyond that.
     /// </summary>
-    int MaxRegisteredBuffers { get; }
+    /// <remarks>
+    /// 0 means "unknown" and is the default, so an implementation outside this package keeps
+    /// compiling. <see cref="RingSocketManager"/> skips its startup cross-check against
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/> when this reports 0, trading the
+    /// early error for a failure at the first registration the ring cannot satisfy. All four
+    /// bundled backends report their real table size.
+    /// </remarks>
+    int MaxRegisteredBuffers => 0;
 
     /// <summary>
     /// Whether outstanding recv/send operations retire only once the socket is closed. RIO cancels

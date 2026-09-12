@@ -131,7 +131,10 @@ public class RingSocketManagerGrowthTests : IDisposable
     public void Constructor_RejectsPositiveBudgetBelowOneTierSlab()
     {
         // The default registration table here (maxConnections x 2 = 16) is far too small for the
-        // pools, so reaching pool construction at all would throw InvalidOperationException instead.
+        // pools, so the constructor's ring cross-check would reject this ring too. The single-
+        // argument checks run first and the cross-check last, because the cross-check needs every
+        // sizing argument to already be known good; that ordering is what makes this ParamName
+        // deterministic, and the assertion below pins it.
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
 
         var ex = Assert.Throws<ArgumentOutOfRangeException>(
@@ -144,6 +147,43 @@ public class RingSocketManagerGrowthTests : IDisposable
         );
 
         Assert.Equal("sendBufferGrowthBudget", ex.ParamName);
+    }
+
+    [Fact]
+    public void Constructor_RejectsRingTooSmallForTheConfiguration()
+    {
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8); // table = 16
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => new RingSocketManager(
+                ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+                initialBufferSlabs: 1, maxBufferSlabs: 2
+            )
+        );
+
+        Assert.Equal("ring", ex.ParamName);
+        Assert.Contains("RequiredRegisteredBuffers", ex.Message);
+    }
+
+    [Fact]
+    public void Constructor_RejectsMaxSendBufferSizeAboveTheCeiling()
+    {
+        // 512 MiB overflows the int arithmetic that bounds a tier's slab, so it is refused outright
+        // rather than silently defeating the budget. The ceiling is checked before anything is
+        // allocated, so the ring's own size never comes into it.
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => new RingSocketManager(
+                ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+                initialBufferSlabs: 0, maxBufferSlabs: 2,
+                maxSendBufferSize: 512 * 1024 * 1024,
+                sendBufferGrowthBudget: 1L << 40
+            )
+        );
+
+        Assert.Equal("maxSendBufferSize", ex.ParamName);
+        Assert.Contains("256 MiB", ex.Message);
     }
 
     [Fact]
@@ -190,17 +230,28 @@ public class RingSocketManagerGrowthTests : IDisposable
     public void Grow_WhileRetiring_ReleasesTheMiddleBufferImmediately()
     {
         var socket = Accept(out var client);
+        var original = socket.SendBuffer;
         Write(socket, Pattern(1024, 1));
         _manager.ProcessSendQueue();
         _manager.Submit();
 
+        // Posted bytes stay readable until a completion is reaped, and nothing reaps one between
+        // here and the grow, so the original genuinely has bytes in flight no matter how fast
+        // loopback is.
+        Assert.Equal(1024, original.ReadableBytes);
+
         Assert.True(_manager.TryGrowSendBuffer(socket)); // 64 -> 128, original retiring
+        Assert.Same(original, socket.RetiringSendBuffer);
+
         var middle = socket.SendBuffer;
         Write(socket, Pattern(2048, 2));
 
         Assert.True(_manager.TryGrowSendBuffer(socket)); // 128 -> 256, middle had nothing in flight
 
         Assert.Equal(4 * Base, socket.SendBuffer.PhysicalSize);
+        // The middle buffer had nothing in flight, so it went straight back to its pool and the
+        // original is still the one retiring -- NotSame alone would also pass on a null.
+        Assert.Same(original, socket.RetiringSendBuffer);
         Assert.NotSame(middle, socket.RetiringSendBuffer);
         Assert.Equal(2048, socket.SendBuffer.ReadableBytes);
 
@@ -294,6 +345,113 @@ public class RingSocketManagerGrowthTests : IDisposable
         Assert.False(_manager.TryShrinkSendBuffer(socket)); // already base
 
         client.Close();
+    }
+
+    [Fact]
+    public void Shrink_RefusedWhileABufferIsRetiring()
+    {
+        var socket = Accept(out var client);
+        var original = socket.SendBuffer;
+
+        var payload = Pattern(1024, 7);
+        Write(socket, payload);
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+
+        // Posted bytes stay readable until a completion is reaped, and nothing reaps one here, so
+        // the original is genuinely outstanding at grow time whatever loopback did.
+        Assert.Equal(payload.Length, original.ReadableBytes);
+
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        var grown = socket.SendBuffer;
+        Assert.Same(original, socket.RetiringSendBuffer);
+        Assert.Equal(2 * Base, grown.PhysicalSize);
+
+        // Shrinking now would hand the base pool a buffer the transport is still reading from.
+        Assert.False(_manager.TryShrinkSendBuffer(socket));
+        Assert.Same(grown, socket.SendBuffer);
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+
+        // Let the peer drain it; the completion retires the original.
+        Assert.Equal(payload, ReadAll(client, payload.Length));
+        Assert.Null(socket.RetiringSendBuffer);
+
+        Assert.True(_manager.TryShrinkSendBuffer(socket));
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+
+        client.Close();
+        DrainUntilDisconnected();
+    }
+
+    [Fact]
+    public void Abort_WithARetiringBuffer_ReleasesBothBuffersExactlyOnce()
+    {
+        var socket = Accept(out var client);
+        var original = socket.SendBuffer;
+
+        var payload = Pattern(4096, 11);
+        Write(socket, payload);
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+
+        // Same reasoning as above: the send is outstanding as far as the manager is concerned until
+        // a completion is reaped, so the grow below always leaves the original retiring.
+        Assert.Equal(payload.Length, original.ReadableBytes);
+
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        Assert.Same(original, socket.RetiringSendBuffer);
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+        Assert.Equal(1, _manager.GetSendBufferTierStats(0).InUse);
+
+        // The peer never reads: the retiring buffer is still attached when the socket is finalized,
+        // which is the path that has to release two send buffers rather than one.
+        _manager.DisconnectImmediate(socket);
+
+        var disconnected = false;
+        for (var i = 0; i < 500 && !disconnected; i++)
+        {
+            var count = _manager.ProcessCompletions(_events);
+            for (var j = 0; j < count; j++)
+            {
+                disconnected |= _events[j].Type == RingSocketEventType.Disconnected;
+            }
+
+            _manager.Submit();
+            if (!disconnected)
+            {
+                Thread.Sleep(10);
+            }
+        }
+
+        Assert.True(disconnected);
+
+        // Buffers go back on the pass after the consumer has seen the event that referenced them.
+        _manager.ProcessCompletions(_events);
+        _manager.Submit();
+
+        // A double release would drive InUse negative, a leak would leave it at 1.
+        Assert.Equal(0, _manager.GetSendBufferTierStats(0).InUse);
+        Assert.Equal(0, _manager.Maintain().TierInUse);
+        Assert.Equal(0, _manager.ConnectedCount);
+
+        // The base buffer went back to its own pool too, so the manager can still hand one out.
+        var next = Accept(out var secondClient);
+        Assert.Equal(1, _manager.ConnectedCount);
+        Assert.Equal(Base, next.SendBuffer.PhysicalSize);
+
+        client.Close();
+        secondClient.Close();
+        DrainUntilDisconnected();
+    }
+
+    private void DrainUntilDisconnected()
+    {
+        for (var i = 0; i < 500 && _manager.ConnectedCount > 0; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(10);
+        }
     }
 
     [Fact]
