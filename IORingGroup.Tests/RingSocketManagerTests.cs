@@ -225,6 +225,10 @@ public class RingSocketManagerTests : IDisposable
         // Assert
         Assert.True(disconnectEventReceived);
         Assert.Equal(0, _manager.ConnectedCount);
+
+        // Slot and buffers are released on the pass after the Disconnected event
+        Assert.NotNull(_manager.GetSocket(socketId, socket.Generation));
+        _manager.ProcessCompletions(_events);
         Assert.Null(_manager.GetSocket(socketId, socket.Generation));
     }
 
@@ -288,8 +292,9 @@ public class RingSocketManagerTests : IDisposable
         // Process completions to complete the disconnect
         ProcessUntilDisconnect();
 
-        // Assert - Socket is fully cleaned up
+        // Assert - Socket is fully cleaned up on the following pass
         Assert.Equal(0, _manager.ConnectedCount);
+        _manager.ProcessCompletions(_events);
         Assert.Null(_manager.GetSocket(socketId, socket.Generation));
     }
 
@@ -566,6 +571,129 @@ public class RingSocketManagerTests : IDisposable
 
         ProcessUntilAllDisconnected();
         Assert.Equal(0, _manager.ConnectedCount);
+    }
+
+    private RingSocket AcceptManaged(out Socket client)
+    {
+        client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(IPAddress.Loopback, _listenerPort);
+
+        var acceptedHandle = AcceptConnection();
+        Assert.True(acceptedHandle > 0);
+
+        _ring.ConfigureSocket(acceptedHandle);
+        var socket = _manager.CreateSocket(acceptedHandle);
+        Assert.NotNull(socket);
+        _manager.Submit(); // post the initial recv
+        return socket;
+    }
+
+    private static void Write(RingSocket socket, ReadOnlySpan<byte> data)
+    {
+        data.CopyTo(socket.SendBuffer.GetWriteSpan());
+        socket.SendBuffer.CommitWrite(data.Length);
+        socket.QueueSend();
+    }
+
+    /// <summary>
+    /// A send that fails (peer reset) must abort the socket, not park it in a drain that can never
+    /// finish because the failed bytes are still counted as readable. The recv buffer is filled
+    /// first so no recv is in flight and only the send can report the reset.
+    /// </summary>
+    [Fact]
+    public void FailedSend_AbortsInsteadOfStranding()
+    {
+        var socket = AcceptManaged(out var client);
+
+        client.Send(new byte[socket.RecvBuffer.PhysicalSize]);
+
+        for (var i = 0; i < 100 && (socket.RecvPending || socket.RecvBuffer.WritableBytes > 0); i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(10);
+        }
+
+        Assert.False(socket.RecvPending);
+
+        client.LingerState = new LingerOption(true, 0); // RST on close
+        client.Close();
+        Thread.Sleep(50);
+
+        Write(socket, new byte[4096]);
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+
+        Assert.True(ProcessUntilDisconnect(), "socket stranded after a failed send");
+        Assert.Equal(0, _manager.ConnectedCount);
+    }
+
+    /// <summary>
+    /// A force-close with a recv in flight must keep the slot and buffers until that recv has
+    /// retired through a completion; the peer never speaks, so nothing completes it but the abort.
+    /// </summary>
+    [Fact]
+    public void DisconnectImmediate_WithRecvInFlight_RetiresBeforeRelease()
+    {
+        var socket = AcceptManaged(out var client);
+        Assert.True(socket.RecvPending);
+
+        _manager.DisconnectImmediate(socket);
+
+        Assert.True(ProcessUntilDisconnect(), "abort never completed");
+        Assert.False(socket.RecvPending);
+        Assert.Equal(0, socket.SendsInFlight);
+        Assert.Equal(0, _manager.ConnectedCount);
+
+        client.Close();
+    }
+
+    /// <summary>
+    /// Data that arrives while a graceful disconnect is pending is delivered as a DataReceived
+    /// event, possibly in the same pass as Disconnected. The buffers must not be handed to a new
+    /// connection until the consumer has had that pass to read them.
+    /// </summary>
+    [Fact]
+    public void PendingDisconnect_DataReceived_BuffersOutliveThePass()
+    {
+        var socket = AcceptManaged(out var client);
+
+        socket.Disconnect(); // recv in flight: pending, write side shut
+        _manager.Submit();
+
+        var payload = "late data"u8.ToArray();
+        client.Send(payload);
+
+        var sawReceived = false;
+
+        for (var i = 0; i < 100 && !sawReceived; i++)
+        {
+            var count = _manager.ProcessCompletions(_events);
+            _manager.Submit();
+
+            for (var j = 0; j < count; j++)
+            {
+                if (_events[j].Socket == socket && _events[j].Type == RingSocketEventType.DataReceived)
+                {
+                    sawReceived = true;
+                }
+            }
+
+            Thread.Sleep(10);
+        }
+
+        Assert.True(sawReceived);
+        Assert.Equal(payload, socket.RecvBuffer.GetReadSpan().ToArray());
+
+        // A connection accepted before the next pass must not receive the departing socket's buffers
+        var next = AcceptManaged(out var nextClient);
+        Assert.NotSame(socket.RecvBuffer, next.RecvBuffer);
+        Assert.NotSame(socket.SendBuffer, next.SendBuffer);
+        Assert.Equal(payload, socket.RecvBuffer.GetReadSpan().ToArray());
+
+        client.Close();
+        nextClient.Close();
+        ProcessUntilAllDisconnected();
     }
 
     private nint AcceptConnection()

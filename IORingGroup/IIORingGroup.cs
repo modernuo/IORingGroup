@@ -31,6 +31,13 @@ public interface IIORingGroup : IDisposable
     int MaxOutstandingSendsPerSocket => 1;
 
     /// <summary>
+    /// Whether outstanding recv/send operations retire only once the socket is closed. RIO cancels
+    /// them on close; the other backends retire them after a shutdown of both directions, so the
+    /// handle can stay open until they have completed.
+    /// </summary>
+    bool CloseCancelsPendingIo => false;
+
+    /// <summary>
     /// Queues a poll operation to monitor a file descriptor for events.
     /// </summary>
     /// <param name="fd">File descriptor or socket handle to poll.</param>
@@ -177,6 +184,12 @@ public interface IIORingGroup : IDisposable
     /// Closes a socket.
     /// </summary>
     /// <param name="socket">The socket handle to close.</param>
+    /// <remarks>
+    /// Outstanding recv/send operations still produce a completion (RIO and the readiness backends
+    /// fail them; on io_uring close alone does not cancel, so call <see cref="Shutdown"/> with
+    /// both directions first and the recv completes with 0 or an error). The buffers those
+    /// operations reference must stay valid until their completions are consumed.
+    /// </remarks>
     void CloseSocket(nint socket);
 
     /// <summary>

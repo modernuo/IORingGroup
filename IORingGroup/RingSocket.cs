@@ -122,6 +122,22 @@ public sealed class RingSocket
     internal bool HandleClosed { get; set; }
 
     /// <summary>
+    /// Gets whether the write side has been shut down (FIN queued) for a graceful disconnect.
+    /// </summary>
+    internal bool ShutdownSent { get; set; }
+
+    /// <summary>
+    /// Gets whether a force-close is in progress: the handle is closed and the socket is waiting
+    /// for its outstanding operations to retire before release.
+    /// </summary>
+    internal bool Aborting { get; set; }
+
+    /// <summary>
+    /// Gets whether no operation is outstanding, so the buffers may be released.
+    /// </summary>
+    internal bool IoRetired => !RecvPending && SendsInFlight == 0;
+
+    /// <summary>
     /// Gets whether the socket has been unregistered from RIO.
     /// Used to prevent double-unregistration.
     /// </summary>

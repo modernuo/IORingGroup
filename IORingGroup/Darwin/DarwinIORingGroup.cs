@@ -909,7 +909,35 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     {
         if (socket >= 0)
         {
+            CancelPendingIo((int)socket);
             Darwin.close((int)socket);
+        }
+    }
+
+    // Close drops the fd's readiness registration, so a pending record would never execute;
+    // complete it as cancelled so the caller can retire it.
+    private void CancelPendingIo(int fd)
+    {
+        for (var i = 0; i < _maxConnections; i++)
+        {
+            if (_connIdToFd[i] != fd)
+            {
+                continue;
+            }
+
+            if (_hasRecv[i])
+            {
+                _hasRecv[i] = false;
+                AddCompletion(_pendingRecvs[i].UserData, -ECANCELED);
+            }
+
+            if (_hasSend[i])
+            {
+                _hasSend[i] = false;
+                AddCompletion(_pendingSends[i].UserData, -ECANCELED);
+            }
+
+            MarkDirty(i);
         }
     }
 
@@ -1047,6 +1075,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private const int EWOULDBLOCK = EAGAIN;
     private const int EINPROGRESS = 36;
     private const int EINTR = 4;
+    private const int ECANCELED = 89;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct sockaddr_in

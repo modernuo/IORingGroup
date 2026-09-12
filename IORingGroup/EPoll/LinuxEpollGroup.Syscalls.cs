@@ -28,6 +28,7 @@ public sealed unsafe partial class LinuxEpollGroup
     private const int EWOULDBLOCK = EAGAIN;
     private const int EINPROGRESS = 115;
     private const int EINTR = 4;
+    private const int ECANCELED = 125;
 
     private static partial class Syscalls
     {
