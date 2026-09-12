@@ -93,9 +93,7 @@ public sealed class RingSocket
     /// </remarks>
     internal int SendsInFlight { get; private set; }
 
-    // Posted length + originating buffer, oldest first; completions arrive in submission order, so
-    // each reclaims the head entry. The buffer travels with the length since a send can outlive
-    // the buffer it was posted from being replaced.
+    // (length, buffer) oldest first; completions arrive in order. A send can outlive the swap of its buffer
     private readonly int[] _inFlightLengths;
     private readonly IORingBuffer[] _inFlightBuffers;
     private int _inFlightHead;

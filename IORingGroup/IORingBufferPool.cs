@@ -94,7 +94,7 @@ public sealed class IORingBufferPool : IDisposable
     public int RetentionWindows { get; }
 
     /// <summary>
-    /// Bytes one slab holds; long because buffer size times slab size overflows int well within the manager's top tiers.
+    /// Bytes one slab holds.
     /// </summary>
     public long SlabBytes => (long)SlabSize * BufferSize;
 
@@ -175,8 +175,7 @@ public sealed class IORingBufferPool : IDisposable
         _slabs = new List<PoolSlab>(maxSlabs);
         _firstNonFullSlab = 0;
 
-        // A slab that fails has already unwound itself; slabs before it are this loop's to
-        // release, since the half-built pool is never visible elsewhere.
+        // Earlier slabs are released here; a failed slab unwinds itself
         for (var i = 0; i < initialSlabs; i++)
         {
             PoolSlab slab;
@@ -211,9 +210,7 @@ public sealed class IORingBufferPool : IDisposable
         {
             var poolIndex = basePoolIndex + i;
 
-            // Registration can fail two ways: RIO returns a negative id, other backends throw.
-            // Either must unwind this slab's buffers - it isn't published until whole, so nothing
-            // else will ever release them.
+            // RIO returns a negative id, other backends throw; either unwinds the unpublished slab
             IORingBuffer? buffer = null;
             int bufferId;
             try
@@ -223,12 +220,12 @@ public sealed class IORingBufferPool : IDisposable
             }
             catch (Exception ex)
             {
-                // The message reads the registration count, so build it before unwinding drops it.
+                // Built before the unwind changes the count
                 var message = buffer == null
                     ? AllocationFailureMessage(slabId, i)
                     : RegistrationFailureMessage(slabId, i);
 
-                // Null only when Create itself threw, in which case there is nothing to dispose.
+                // Null when Create threw
                 buffer?.Dispose();
                 UnwindSlab(slab, i);
 
@@ -256,7 +253,7 @@ public sealed class IORingBufferPool : IDisposable
     }
 
     /// <summary>
-    /// Explains a failed mapping: the inner exception carries the cause, this only adds where in the pool it happened.
+    /// Message for a failed mapping; the inner exception carries the cause.
     /// </summary>
     private string AllocationFailureMessage(int slabId, int index) =>
         $"Buffer allocation failed for buffer {index} of slab {slabId} ({BufferSize} byte buffers): " +
@@ -264,8 +261,7 @@ public sealed class IORingBufferPool : IDisposable
         "space, or at a locked-memory rlimit.";
 
     /// <summary>
-    /// Explains a failed registration. Suggests resizing the table only when this pool's own count
-    /// proves it full, since a lower count could still mean a native limit or another pool sharing the ring.
+    /// Message for a failed registration; blames the table only when this pool's own count proves it full.
     /// </summary>
     private string RegistrationFailureMessage(int slabId, int index)
     {
@@ -282,7 +278,7 @@ public sealed class IORingBufferPool : IDisposable
     }
 
     /// <summary>
-    /// Releases the buffers of a slab that failed creation; never published, so nothing else will ever unregister them.
+    /// Releases the buffers of a slab that failed creation.
     /// </summary>
     private void UnwindSlab(PoolSlab slab, int count)
     {

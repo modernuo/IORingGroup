@@ -148,11 +148,10 @@ public sealed class RingSocketManager : IDisposable
 
     private int _growthRefusals;
 
-    // The pool preallocates its slab list from maxSlabs; the budget, not this cap, bounds growth.
+    // The budget, not this cap, bounds growth
     private const int TierMaxSlabs = 1024;
 
-    // Tier buffers are handed out a slab at a time; cap one at 8 MiB (floor of 4 buffers) so a
-    // large base size cannot make the smallest usable budget absurd.
+    // Slab capped at 8 MiB (floor 4 buffers) so the minimum budget stays sane
     private const int TierSlabByteCap = 8 * 1024 * 1024;
 
     /// <summary>
@@ -210,9 +209,8 @@ public sealed class RingSocketManager : IDisposable
     /// <param name="sendBufferSize">Size of each send buffer (default 256KB).</param>
     /// <param name="initialBufferSlabs">Initial buffer pool slabs (default 8).</param>
     /// <param name="maxBufferSlabs">
-    /// Upper bound on base buffer pool slabs (default 32), further capped to what
-    /// <paramref name="maxSockets"/> sockets can occupy at one buffer each - a small socket count
-    /// silently lowers this and <paramref name="initialBufferSlabs"/> with it.
+    /// Upper bound on base pool slabs (default 32); a small <paramref name="maxSockets"/> lowers
+    /// this and <paramref name="initialBufferSlabs"/> to what the sockets can occupy.
     /// </param>
     /// <param name="maxSendBufferSize">
     /// Largest send buffer a socket may grow to. 0 (default) means <paramref name="sendBufferSize"/>,
@@ -220,9 +218,8 @@ public sealed class RingSocketManager : IDisposable
     /// and no larger than 256 MiB.
     /// </param>
     /// <param name="sendBufferGrowthBudget">
-    /// Bytes of tier-pool capacity allowed across all tiers. 0 refuses every growth; anything
-    /// positive must be at least <see cref="MinimumSendBufferGrowthBudget"/> for that base size,
-    /// since tier buffers are only ever allocated a slab at a time.
+    /// Bytes of tier-pool capacity allowed across all tiers. 0 refuses every growth; a positive
+    /// value must be at least <see cref="MinimumSendBufferGrowthBudget"/> (one slab).
     /// </param>
     /// <param name="sendBufferRetentionWindows">
     /// Number of <see cref="Maintain"/> windows a tier pool's peak usage stays in force (default 15).
@@ -255,8 +252,7 @@ public sealed class RingSocketManager : IDisposable
             throw new ArgumentOutOfRangeException(nameof(sendBufferRetentionWindows), "Must be at least 1");
         }
 
-        // Validated before anything is allocated, since a throw after the pools register memory
-        // with the ring would strand it.
+        // Validate before allocating; a later throw would strand registered memory
         if (maxSendBufferSize > SendBufferSizeCeiling)
         {
             throw new ArgumentOutOfRangeException(
@@ -271,7 +267,7 @@ public sealed class RingSocketManager : IDisposable
             throw new ArgumentOutOfRangeException(nameof(maxSendBufferSize), "Must be a power of two no smaller than sendBufferSize");
         }
 
-        // A positive budget below one first-tier slab buys nothing, since tier buffers come a slab at a time.
+        // Tier buffers come a slab at a time
         if (MaxSendBufferSize > sendBufferSize && sendBufferGrowthBudget > 0)
         {
             var minimumBudget = MinimumSendBufferGrowthBudget(sendBufferSize);
@@ -284,9 +280,7 @@ public sealed class RingSocketManager : IDisposable
             }
         }
 
-        // Checked here, not left to fail later at an accept or a growth where the cause is
-        // invisible: the default table (maxConnections x 2) is too small for the pools at any
-        // modest maxSockets.
+        // Fail here rather than at an accept or growth where the cause is invisible
         var needed = RequiredRegisteredBuffers(maxSockets, sendBufferSize, MaxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs);
         if (ring.MaxRegisteredBuffers > 0 && ring.MaxRegisteredBuffers < needed)
         {
@@ -311,13 +305,11 @@ public sealed class RingSocketManager : IDisposable
         var slabSize = BufferPoolSlabSize(maxSockets, maxBufferSlabs);
         var sendSlabSize = SendPoolSlabSize(slabSize);
 
-        // Neither base pool can hand out more than one buffer per socket, so slabs past that are
-        // memory and table entries nothing could ever acquire. Clamp rather than throw: a small
-        // maxSockets is not the caller's mistake.
+        // One buffer per socket per base pool; slabs beyond that could never be acquired
         var recvSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, slabSize));
         var sendSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, sendSlabSize));
 
-        // long: sendBufferSize is uncapped, and an int doubling past 1 GiB wraps negative and loops forever.
+        // long: an int doubling past 1 GiB wraps and loops forever
         var tierCount = 0;
         for (var size = (long)sendBufferSize * 2; size <= MaxSendBufferSize; size *= 2)
         {
@@ -326,8 +318,7 @@ public sealed class RingSocketManager : IDisposable
 
         _sendTiers = new IORingBufferPool[tierCount];
 
-        // A pool that throws after earlier ones were built would strand theirs; nothing outside
-        // this constructor can reach the half-built manager to dispose it.
+        // A later pool throwing would strand the earlier ones
         var created = new List<IORingBufferPool>(tierCount + 2);
         try
         {
@@ -384,7 +375,7 @@ public sealed class RingSocketManager : IDisposable
         Math.Max(64, maxSockets / maxBufferSlabs);
 
     /// <summary>
-    /// Buffers per slab in the base send pool: a quarter of the recv pool's, since a connection sends far less often than it receives.
+    /// Buffers per slab in the base send pool: a quarter of the recv pool's.
     /// </summary>
     private static int SendPoolSlabSize(int recvSlabSize) => recvSlabSize / 4;
 
@@ -404,8 +395,7 @@ public sealed class RingSocketManager : IDisposable
     private static int TierSlabSize(int tierSize) => Math.Max(4, Math.Min(16, TierSlabByteCap / tierSize));
 
     /// <summary>
-    /// Smallest growth budget that can hand out anything for this base send buffer size: one slab
-    /// of the first tier, since tier buffers are only ever allocated a slab at a time.
+    /// Smallest usable growth budget for this base size: one first-tier slab.
     /// </summary>
     public static long MinimumSendBufferGrowthBudget(int sendBufferSize)
     {
@@ -419,15 +409,12 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Registration table size a ring needs for this configuration: everything both base pools can
-    /// actually hand out, plus as many first-tier buffers as the growth budget can hold (larger
-    /// tiers use fewer).
+    /// Registration table size for this configuration: what both base pools can hand out plus
+    /// the first-tier buffers the growth budget can hold.
     /// </summary>
     /// <remarks>
-    /// A shrink acquires its base buffer before releasing the tier one, so even mid-swap a socket
-    /// holds at most one base recv and one base send buffer - a base pool never hands out more than
-    /// <paramref name="maxSockets"/>, rounded to slabs. <c>maxSlabs</c> is the looser ceiling,
-    /// letting <c>IORingGroup.Create</c> and <c>RingSocketManager</c> compose without an explicit table size.
+    /// A socket holds at most one base recv and one base send buffer, even mid-swap (a shrink
+    /// acquires before it releases), so each base pool is bounded by <paramref name="maxSockets"/> rounded to slabs.
     /// </remarks>
     public static int RequiredRegisteredBuffers(
         int maxSockets,
@@ -810,7 +797,7 @@ public sealed class RingSocketManager : IDisposable
             return;
         }
 
-        // The retiring buffer drains before the current one posts, keeping the stream in order across a swap.
+        // The retiring buffer drains before the current one posts
         var sendBuffer = socket.SendSource;
 
         // Drain everything queued, up to the outstanding limit. Posting from SendOffset rather than
@@ -937,8 +924,7 @@ public sealed class RingSocketManager : IDisposable
 
     private int HandleSendCompletion(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
     {
-        // No entry means the in-flight book-keeping lost track of the transport; guessing one
-        // routes into the short-send branch and corrupts the stream, so drop the connection instead.
+        // Accounting lost track of the transport; guessing corrupts the stream
         Debug.Assert(socket.SendsInFlight > 0, "send completion with nothing in flight");
         if (socket.SendsInFlight == 0)
         {
@@ -946,7 +932,7 @@ public sealed class RingSocketManager : IDisposable
             return 0;
         }
 
-        // The buffer the send was posted from, which may no longer be the socket's current one.
+        // May no longer be the current buffer
         var (posted, buffer) = socket.PopInFlight();
 
         if (socket.Aborting)
@@ -1120,7 +1106,7 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
-        // A second retiring buffer would need a second retiring slot, which doesn't exist.
+        // Only one retiring slot
         if (socket.RetiringSendBuffer != null && current.InFlightBytes != 0)
         {
             Debug.Assert(false, "growth with a retiring buffer found bytes in flight on the current buffer");
@@ -1147,7 +1133,7 @@ public sealed class RingSocketManager : IDisposable
         }
         else
         {
-            // Unreachable with a retiring buffer present: the guard above already refused that case.
+            // The guard above refused the retiring case
             Debug.Assert(socket.RetiringSendBuffer == null, "growth would drop an unretired send buffer");
             socket.RetiringSendBuffer = current;
         }
@@ -1182,8 +1168,7 @@ public sealed class RingSocketManager : IDisposable
     /// <param name="GrowthRefusals">Budget refusals since the previous call, which resets the counter.</param>
     /// <param name="TierCapacityBytes">Slab capacity allocated across every tier pool, in bytes.</param>
     /// <param name="TierInUse">
-    /// Buffers handed out, summed across tiers; a count, not a size, since tiers differ in buffer
-    /// size. Use <see cref="GetSendBufferTierStats"/> for one tier or <paramref name="TierCapacityBytes"/> for bytes.
+    /// Buffers handed out, summed across tiers (a count; see <see cref="GetSendBufferTierStats"/> per tier).
     /// </param>
     /// <param name="TierRetainFloor">
     /// Retention floors summed across tiers, in buffers; same caveat as <paramref name="TierInUse"/>.
@@ -1204,8 +1189,7 @@ public sealed class RingSocketManager : IDisposable
     public readonly record struct SendBufferTierStats(int BufferSize, int Capacity, int InUse, int RetainFloor);
 
     /// <summary>
-    /// Usage of a single growth tier, which <see cref="Maintain"/>'s aggregate cannot express
-    /// because it sums buffers of different sizes.
+    /// Usage of one growth tier.
     /// </summary>
     /// <param name="tier">Tier index, 0 being twice the base send buffer size.</param>
     public SendBufferTierStats GetSendBufferTierStats(int tier)
@@ -1273,7 +1257,7 @@ public sealed class RingSocketManager : IDisposable
             _recvBufferPool.Release(socket.RecvBuffer);
             ReleaseSendBuffer(socket.SendBuffer);
 
-            // A socket can be finalized mid-swap, with the retiring buffer never drained
+            // Finalized mid-swap; never drained
             if (socket.RetiringSendBuffer != null)
             {
                 ReleaseSendBuffer(socket.RetiringSendBuffer);
