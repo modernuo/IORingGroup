@@ -148,6 +148,34 @@ while (running)
 }
 ```
 
+### Send buffer growth
+
+Bursty sockets can outgrow the base send buffer without paying that cost for every idle connection. `RingSocketManager` supports optional growth through power-of-two tiers above the base `sendBufferSize`, bounded by a byte budget shared across all sockets:
+
+```csharp
+using var ring = IORingGroup.Create(
+    maxRegisteredBuffers: RingSocketManager.RequiredRegisteredBuffers(
+        maxSockets: 4096,
+        sendBufferSize: 256 * 1024,
+        maxSendBufferSize: 4 * 1024 * 1024,
+        sendBufferGrowthBudget: 512 * 1024 * 1024
+    )
+);
+
+using var manager = new RingSocketManager(
+    ring,
+    maxSockets: 4096,
+    maxSendBufferSize: 4 * 1024 * 1024,       // largest a socket may grow to (0 disables growth)
+    sendBufferGrowthBudget: 512 * 1024 * 1024 // bytes of tier-pool capacity shared across all sockets
+);
+```
+
+- `maxSendBufferSize` is the ceiling a socket can grow to; 0 (the default) means growth is disabled.
+- `sendBufferGrowthBudget` caps how many bytes the tier pools may hold in total; a positive value below `RingSocketManager.MinimumSendBufferGrowthBudget(sendBufferSize)` throws, since tier buffers are only ever handed out a slab at a time.
+- `RequiredRegisteredBuffers(...)` computes the registration table size these settings need — pass it as `IORingGroup.Create(maxRegisteredBuffers:)` so the ring and the manager can't drift out of sync.
+- Call `manager.Maintain()` about once a minute from the ring thread. It rotates each tier pool's usage window, trims at most one idle slab per tier down to the recent peak, and returns a `SendBufferMaintenance` snapshot (buffers released, growth refusals, tier capacity/usage).
+- Worst-case memory is bounded: base send buffer × `maxSockets`, plus at most `sendBufferGrowthBudget` for the tiers.
+
 ## Threading Model
 
 IORingGroup is designed for **single-threaded** event loops. The ring, the manager, and all socket operations must be called from the same thread:
