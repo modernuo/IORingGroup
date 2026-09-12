@@ -190,7 +190,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         _connections = (RioConnection*)NativeMemory.AllocZeroed(mc, (nuint)sizeof(RioConnection));
 
-        _maxExternalBuffers = maxRegisteredBuffers > 0 ? (uint)maxRegisteredBuffers : mc * 2;
+        _maxExternalBuffers = maxRegisteredBuffers > 0
+            ? (uint)maxRegisteredBuffers
+            : (uint)RingSocketManager.RequiredRegisteredBuffers(maxConnections);
         _externalBufferIds = (nint*)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(nint));
         _externalBufferPtrs = (byte**)NativeMemory.AllocZeroed(_maxExternalBuffers, (nuint)sizeof(byte*));
         _externalBufferLens = (uint*)NativeMemory.AllocZeroed(_maxExternalBuffers, sizeof(uint));

@@ -417,6 +417,23 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
+    /// Registration table size for a manager with send buffer growth disabled: what both base pools
+    /// can hand out. This is what <see cref="IORingGroup.Create"/> sizes its table to by default.
+    /// </summary>
+    /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
+    /// <param name="maxBufferSlabs">Divisor setting base slab size; see <see cref="BasePoolSlabSize"/>.</param>
+    public static int RequiredRegisteredBuffers(int maxSockets, int maxBufferSlabs = 128)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
+
+        checked
+        {
+            return RoundUpToSlabs(maxSockets, BasePoolSlabSize(maxSockets, maxBufferSlabs)) * 2;
+        }
+    }
+
+    /// <summary>
     /// Registration table size for this configuration: what both base pools can hand out plus
     /// the first-tier buffers the growth budget can hold.
     /// </summary>
@@ -431,19 +448,17 @@ public sealed class RingSocketManager : IDisposable
         long sendBufferGrowthBudget,
         int maxBufferSlabs = 128)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sendBufferSize);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
 
         checked
         {
-            var baseMax = RoundUpToSlabs(maxSockets, BasePoolSlabSize(maxSockets, maxBufferSlabs));
+            var baseMax = RequiredRegisteredBuffers(maxSockets, maxBufferSlabs);
 
             var tierHeadroom = maxSendBufferSize > sendBufferSize && sendBufferGrowthBudget > 0
                 ? (int)(sendBufferGrowthBudget / (sendBufferSize * 2L))
                 : 0;
 
-            return baseMax * 2 + tierHeadroom;
+            return baseMax + tierHeadroom;
         }
     }
 

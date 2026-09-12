@@ -136,7 +136,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         _freeSlotCount = maxConnections;
 
         // Default: one recv + one send buffer per connection
-        _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
+        _maxExternalBuffers = maxRegisteredBuffers > 0
+            ? maxRegisteredBuffers
+            : RingSocketManager.RequiredRegisteredBuffers(maxConnections);
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 

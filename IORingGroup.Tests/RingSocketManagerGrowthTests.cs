@@ -156,8 +156,20 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void RequiredRegisteredBuffers_FitsTheLibraryDefaultTable()
     {
-        // Default table is maxConnections x 2; the manager's defaults must fit it or callers need an explicit table size.
+        // Boundary-exact: slab = max(16, 1024/128) = 16 divides 1024, so the no-growth requirement is
+        // exactly 2048 and a table sized maxConnections x 2 still fits. Counts that the slab does not
+        // divide need more, which is why the factory derives its default from the same rule.
+        Assert.Equal(2048, RingSocketManager.RequiredRegisteredBuffers(1024));
         Assert.True(RingSocketManager.RequiredRegisteredBuffers(1024, 256 * 1024, 256 * 1024, 0) <= 2048);
+
+        // The two overloads agree when growth is off
+        Assert.Equal(
+            RingSocketManager.RequiredRegisteredBuffers(1000),
+            RingSocketManager.RequiredRegisteredBuffers(1000, 256 * 1024, 256 * 1024, 0)
+        );
+
+        // slab = max(16, 1000/128) = 16, and 1000 rounds up to 1008 buffers per pool
+        Assert.Equal(2 * 1008, RingSocketManager.RequiredRegisteredBuffers(1000));
 
         // slabSize = max(16, 4096/128) = 32, so each base pool holds one buffer per socket, plus
         // 256 MiB of budget worth of 512 KB first-tier buffers.
@@ -202,7 +214,8 @@ public class RingSocketManagerGrowthTests : IDisposable
         {
             for (var i = 0; i < maxSockets; i++)
             {
-                // The send pool used to cap at maxSockets / 4, so this returned null partway through
+                // The old send pool held maxBufferSlabs x (max(64, maxSockets / maxBufferSlabs) / 4)
+                // = 2 x 16 = 32 buffers here, so this returned null on socket 33
                 Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
                 manager.Submit();
             }
@@ -318,14 +331,19 @@ public class RingSocketManagerGrowthTests : IDisposable
         manager.Submit();
     }
 
-    [Fact]
-    public void Constructor_ComposesWithTheLibraryDefaults()
+    [Theory]
+    [InlineData(1024)] // slab divides the count exactly
+    [InlineData(1000)] // 1008 per pool: a table of maxConnections x 2 would be 16 short
+    [InlineData(100)]  // the 16-buffer floor applies: 112 per pool against a x 2 table of 200
+    public void Constructor_ComposesWithTheLibraryDefaults(int maxConnections)
     {
-        // Create(maxConnections: n) + new RingSocketManager(ring, n) alone must work: the default table is maxConnections x 2.
-        using var ring = System.Network.IORingGroup.Create(queueSize: 256, maxConnections: 1024);
-        using var manager = new RingSocketManager(ring, 1024);
+        // Create(maxConnections: n) + new RingSocketManager(ring, n) alone must work, so the ring's
+        // default table comes from the manager's own rule rather than a duplicate of it.
+        using var ring = System.Network.IORingGroup.Create(queueSize: 256, maxConnections: maxConnections);
+        using var manager = new RingSocketManager(ring, maxConnections);
 
-        Assert.Equal(1024, manager.MaxSockets);
+        Assert.Equal(RingSocketManager.RequiredRegisteredBuffers(maxConnections), ring.MaxRegisteredBuffers);
+        Assert.Equal(maxConnections, manager.MaxSockets);
         Assert.Equal(0, manager.SendBufferTierCount); // growth off by default
     }
 
@@ -382,7 +400,8 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Constructor_RejectsRingTooSmallForTheConfiguration()
     {
-        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8); // table = 16
+        // Explicit table: the default would be the 32 this configuration needs
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: 16);
 
         var ex = Assert.Throws<ArgumentException>(
             () => new RingSocketManager(
