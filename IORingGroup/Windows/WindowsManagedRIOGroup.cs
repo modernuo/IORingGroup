@@ -76,6 +76,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     /// <inheritdoc/>
     public int MaxOutstandingSendsPerSocket => (int)_outstandingSendsPerSocket;
 
+    /// <inheritdoc/>
+    public bool CloseCancelsPendingIo => true;
+
     // =========================================================================
     // Fields
     // =========================================================================

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 namespace System.Network;
@@ -157,6 +158,7 @@ public sealed class RingSocketManager : IDisposable
 
     // Disconnect queue
     private readonly Queue<RingSocket> _disconnectQueue = new();
+    private readonly List<RingSocket> _releasePending = new();
 
     private bool _disposed;
 
@@ -314,7 +316,9 @@ public sealed class RingSocketManager : IDisposable
     /// <summary>
     /// Processes completions from the ring and returns application events.
     /// </summary>
-    /// <param name="events">Buffer to receive events. Should be at least maxSockets in size.</param>
+    /// <param name="events">Buffer to receive events. Size it at 2 × maxSockets so a full batch of
+    /// completions and the disconnects that follow both fit; a Disconnected event that does not
+    /// fit waits for the next pass.</param>
     /// <returns>Number of events written.</returns>
     /// <remarks>
     /// This method:
@@ -332,6 +336,10 @@ public sealed class RingSocketManager : IDisposable
     public int ProcessCompletions(Span<RingSocketEvent> events)
     {
         var eventCount = 0;
+
+        // Buffers of sockets finalized last pass go back to the pools now, after the consumer has
+        // read the events that referenced them.
+        ReleaseRetiredBuffers();
 
         ProcessSendQueue();
 
@@ -389,13 +397,10 @@ public sealed class RingSocketManager : IDisposable
 
         _ring.AdvanceCompletionQueue(completionCount);
 
-        // CRITICAL: Submit all prepared operations BEFORE processing disconnects.
-        // Operations prepared by ProcessSendQueue() and completion handlers (PostRecv/PostSend)
-        // reference socket registrations and buffers that ProcessDisconnectQueue will release.
-        // Submitting now ensures those operations are sent to RIO before resources are freed.
+        // Operations prepared this pass reference registrations that finalization frees, so they
+        // are submitted first.
         _ring.Submit();
 
-        // Process disconnect queue
         ProcessDisconnectQueue(events, ref eventCount);
 
         return eventCount;
@@ -436,21 +441,64 @@ public sealed class RingSocketManager : IDisposable
         _sendQueue.Enqueue(socket);
     }
 
+    private const int ShutdownWrite = 1;
+    private const int ShutdownBoth = 2;
+
     /// <summary>
-    /// Disconnects a socket immediately and queues for resource release.
-    /// Use this when you need to force-close a socket without waiting for graceful disconnect.
+    /// Force-closes a socket: buffered data is not drained, and the socket is released once every
+    /// outstanding operation has retired. Use when the graceful path cannot finish.
     /// </summary>
+    /// <remarks>
+    /// Anything already prepared against this socket is submitted first, while its handle and
+    /// registration are still valid. Shutting down both directions makes the peer see FIN and
+    /// retires a pending recv or send on every backend but RIO, which cancels them on close; there
+    /// the handle is closed and the registration dropped at once so a recycled handle value cannot
+    /// resolve to this socket. Elsewhere the handle stays open until the socket is finalized, so no
+    /// operation can reach a recycled descriptor. The slot and buffers stay owned until every
+    /// completion has been consumed; releasing earlier would hand the kernel's target memory to
+    /// another connection.
+    /// </remarks>
     public void DisconnectImmediate(RingSocket socket)
     {
+        if (socket.Aborting || socket.DisconnectQueued)
+        {
+            return;
+        }
+
+        socket.Aborting = true;
         socket.Connected = false;
-        QueueForDisconnect(socket);
+
+        _ring.Submit();
+        _ring.Shutdown(socket.Handle, ShutdownBoth);
+
+        if (_ring.CloseCancelsPendingIo)
+        {
+            CloseHandle(socket);
+            Unregister(socket);
+        }
+
+        if (socket.IoRetired)
+        {
+            QueueForDisconnect(socket);
+        }
+    }
+
+    private void Unregister(RingSocket socket)
+    {
+        if (socket is { ConnectionId: >= 0, RioUnregistered: false })
+        {
+            socket.RioUnregistered = true;
+            _ring.UnregisterSocket(socket.ConnectionId);
+        }
     }
 
     /// <summary>
-    /// Queues a socket for disconnection, preventing double-queueing.
+    /// Queues a retired socket for release on the next pass. No further I/O may be posted on it.
     /// </summary>
     private void QueueForDisconnect(RingSocket socket)
     {
+        socket.Connected = false;
+
         // Prevent double-queueing which would cause double buffer release
         if (socket.DisconnectQueued)
         {
@@ -461,17 +509,26 @@ public sealed class RingSocketManager : IDisposable
         _disconnectQueue.Enqueue(socket);
     }
 
+    private void CloseHandle(RingSocket socket)
+    {
+        if (socket.HandleClosed)
+        {
+            return;
+        }
+
+        socket.HandleClosed = true;
+        _ring.CloseSocket(socket.Handle);
+    }
+
     /// <summary>
-    /// Initiates socket shutdown by sending FIN asynchronously.
-    /// The pending recv will complete naturally when client responds with FIN.
+    /// Shuts down the write side (FIN); the pending recv completes when the peer answers with its
+    /// own FIN. Synchronous on purpose: a ring shutdown op resolves its descriptor late and could
+    /// reach a recycled handle.
     /// </summary>
     internal void CloseSocketHandle(RingSocket socket)
     {
-        _ring.PrepareShutdown(
-            socket.Handle,
-            1, // SHUT_WR
-            IORingUserData.Encode(IORingUserData.OpShutdown, socket.Id, socket.Generation)
-        );
+        socket.ShutdownSent = true;
+        _ring.Shutdown(socket.Handle, ShutdownWrite);
     }
 
     private int FindFreeSlot()
@@ -576,8 +633,25 @@ public sealed class RingSocketManager : IDisposable
     {
         socket.RecvPending = false;
 
-        if (result <= 0)
+        if (socket.Aborting)
         {
+            if (socket.IoRetired)
+            {
+                QueueForDisconnect(socket);
+            }
+            return 0;
+        }
+
+        if (result < 0)
+        {
+            // Nothing can be delivered in either direction any more
+            DisconnectImmediate(socket);
+            return 0;
+        }
+
+        if (result == 0)
+        {
+            // Peer EOF: drain what is buffered, then close
             if (!socket.DisconnectPending)
             {
                 socket.Disconnect();
@@ -628,7 +702,7 @@ public sealed class RingSocketManager : IDisposable
     private void TrySendFinForPendingDisconnect(RingSocket socket)
     {
         if (socket is { DisconnectPending: true, SendPending: false,
-                SendBuffer.ReadableBytes: <= 0, RecvPending: true, HandleClosed: false })
+                SendBuffer.ReadableBytes: <= 0, RecvPending: true, ShutdownSent: false })
         {
             CloseSocketHandle(socket);
         }
@@ -638,21 +712,19 @@ public sealed class RingSocketManager : IDisposable
     {
         var posted = socket.SendsInFlight > 0 ? socket.PopInFlight() : 0;
 
-        if (result <= 0)
+        if (socket.Aborting)
         {
-            if (!socket.DisconnectPending)
-            {
-                socket.Disconnect();
-            }
-
-            if (socket.CheckDisconnect())
+            if (socket.IoRetired)
             {
                 QueueForDisconnect(socket);
             }
-            else
-            {
-                TrySendFinForPendingDisconnect(socket);
-            }
+            return 0;
+        }
+
+        if (result <= 0)
+        {
+            // The failed bytes stay counted as readable, so a drain could never finish
+            DisconnectImmediate(socket);
             return 0;
         }
 
@@ -663,13 +735,7 @@ public sealed class RingSocketManager : IDisposable
         {
             if (socket.SendsInFlight > 0)
             {
-                socket.Disconnect();
-
-                if (socket.CheckDisconnect())
-                {
-                    QueueForDisconnect(socket);
-                }
-
+                DisconnectImmediate(socket);
                 return 0;
             }
 
@@ -727,35 +793,37 @@ public sealed class RingSocketManager : IDisposable
 
     private void ProcessDisconnectQueue(Span<RingSocketEvent> events, ref int eventCount)
     {
-        while (_disconnectQueue.Count > 0)
+        // A socket whose Disconnected event does not fit waits for the next pass rather than
+        // losing the event.
+        while (_disconnectQueue.Count > 0 && eventCount < events.Length)
         {
             var socket = _disconnectQueue.Dequeue();
 
-            // Always unregister from RIO if registered (ConnectionId >= 0) and not already unregistered
-            // This is critical for DisconnectImmediate() which sets Connected=false before queueing
-            if (socket is { ConnectionId: >= 0, RioUnregistered: false })
-            {
-                _ring.UnregisterSocket(socket.ConnectionId);
-                socket.RioUnregistered = true;
-            }
+            Debug.Assert(socket.IoRetired, "socket finalized with I/O outstanding");
 
-            if (!socket.HandleClosed)
-            {
-                _ring.CloseSocket(socket.Handle);
-                socket.HandleClosed = true;
-            }
+            Unregister(socket);
+            CloseHandle(socket);
 
-            _recvBufferPool.Release(socket.RecvBuffer);
-            _sendBufferPool.Release(socket.SendBuffer);
-
-            _sockets[socket.Id] = null;
+            // The consumer may still read this pass's events from these buffers; the slot goes with
+            // them so capacity is not freed ahead of the buffers
+            _releasePending.Add(socket);
             ConnectedCount--;
 
-            if (eventCount < events.Length)
-            {
-                events[eventCount++] = RingSocketEvent.Disconnected(socket);
-            }
+            events[eventCount++] = RingSocketEvent.Disconnected(socket);
         }
+    }
+
+    private void ReleaseRetiredBuffers()
+    {
+        for (var i = 0; i < _releasePending.Count; i++)
+        {
+            var socket = _releasePending[i];
+            _recvBufferPool.Release(socket.RecvBuffer);
+            _sendBufferPool.Release(socket.SendBuffer);
+            _sockets[socket.Id] = null;
+        }
+
+        _releasePending.Clear();
     }
 
     /// <summary>
@@ -776,8 +844,8 @@ public sealed class RingSocketManager : IDisposable
             var socket = _sockets[i];
             if (socket != null)
             {
-                _ring.CloseSocket(socket.Handle);
-                _ring.UnregisterSocket(socket.ConnectionId);
+                CloseHandle(socket);
+                Unregister(socket);
                 _sockets[i] = null;
             }
         }
