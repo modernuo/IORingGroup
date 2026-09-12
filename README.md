@@ -199,7 +199,9 @@ Worst-case tier memory is exactly `sendBufferGrowthBudget`. Both base pools are 
 
 #### Base pools grow and shrink with the population
 
-Each base pool starts at `initialBufferSlabs` slabs (default 1), adds a slab when the live one runs out, and gives a fully idle top slab back on a `Maintain()` call whose retention floor has decayed below the remaining capacity — never below `initialBufferSlabs`. At `maxSockets: 4096`, `maxBufferSlabs: 128`, a 64 KiB recv buffer and a 256 KiB send buffer, that is a 32-buffer slab per pool: 2 MiB + 8 MiB resident at boot instead of 1.25 GiB, rising toward the full set as connections arrive and falling back after `sendBufferRetentionWindows` quiet windows.
+Each base pool starts at `initialBufferSlabs` slabs (default 1), adds a slab when the live one runs out, and gives a fully idle top slab back on a `Maintain()` call whose retention floor has decayed below the remaining capacity — never below `initialBufferSlabs`. At `maxSockets: 4096`, `maxBufferSlabs: 128`, a 64 KiB recv buffer and a 256 KiB send buffer, that is a 32-buffer slab per pool: 2 MiB + 8 MiB resident at boot, against the 96 MiB the previous defaults allocated up front and the 1.25 GiB the full set of base buffers costs at 4096 connections.
+
+Idle capacity comes back one slab per `Maintain()` call, and only from the top. Buffers are handed out from the lowest slab that has one free, so ordinary churn drains the newest slabs first and those are the ones that go; a long-lived connection holding a buffer in the top slab pins every slab beneath it until it disconnects. Expect the decay after `sendBufferRetentionWindows` quiet windows when the newest slabs are free, not as a guarantee.
 
 ## Threading Model
 

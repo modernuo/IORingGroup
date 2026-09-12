@@ -339,6 +339,156 @@ public class RingSocketManagerGrowthTests : IDisposable
         manager.Submit();
     }
 
+    [Fact]
+    public void CreateSocket_ReleasesTheRecvBuffer_WhenTheSendSlabCannotBeCreated()
+    {
+        // slab 20 per pool, one up front: socket 21 makes each pool grow a slab
+        const int maxSockets = 40;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(maxSockets, Base, Base, 0, 2);
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(
+                queueSize: 256, maxConnections: maxSockets, maxRegisteredBuffers: registered
+            )
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: maxSockets, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 1, maxBufferSlabs: 2
+        );
+
+        var port = 25000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 64);
+        var clients = new List<Socket>(maxSockets);
+
+        try
+        {
+            for (var i = 0; i < 20; i++)
+            {
+                Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
+                manager.Submit();
+            }
+
+            // Exactly one more slab's worth: the recv slab is built, the send slab's first buffer is refused
+            ring.FailRegistrationsAfter(20);
+
+            var refused = AcceptOn(ring, listener, port, clients);
+            Assert.Null(manager.CreateSocket(refused));
+            Assert.True(ring.RefusedRegistrations > 0);
+            Assert.Equal(20, manager.ConnectedCount);
+            ring.CloseSocket(refused);
+
+            // A leaked recv buffer would leave the pool one short of the remaining sockets
+            ring.FailRegistrationsAfter(int.MaxValue);
+            for (var i = 0; i < 20; i++)
+            {
+                Assert.NotNull(manager.CreateSocket(AcceptOn(ring, listener, port, clients)));
+                manager.Submit();
+            }
+
+            Assert.Equal(maxSockets, manager.ConnectedCount);
+        }
+        finally
+        {
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
+    [Fact]
+    public void TryShrinkSendBuffer_ReturnsFalse_WhenTheBaseSlabCannotBeRecreated()
+    {
+        var budget = 64L * Base;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, 2 * Base, budget, 2);
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered)
+        );
+        // No slabs up front, so the base send slab is trimmable once the socket has grown off it
+        using var manager = new RingSocketManager(
+            ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 0, maxBufferSlabs: 2,
+            maxSendBufferSize: 2 * Base, sendBufferGrowthBudget: budget, sendBufferRetentionWindows: 1
+        );
+
+        var port = 26000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+        var clients = new List<Socket>(1);
+
+        try
+        {
+            var socket = manager.CreateSocket(AcceptOn(ring, listener, port, clients))!;
+            manager.Submit();
+
+            Assert.True(manager.TryGrowSendBuffer(socket)); // base buffer goes back, its slab is now idle
+            manager.Maintain();
+            Assert.True(manager.Maintain().BaseBuffersReleased > 0); // the base send slab is gone
+
+            ring.FailRegistrationsAfter(0);
+            Assert.False(manager.TryShrinkSendBuffer(socket)); // must not escape into the DataSent path
+            Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+
+            // The socket still owns a working buffer
+            var payload = Pattern(4096, 3);
+            payload.CopyTo(socket.SendBuffer.GetWriteSpan());
+            socket.SendBuffer.CommitWrite(payload.Length);
+            socket.QueueSend();
+
+            var received = new byte[payload.Length];
+            var total = 0;
+            for (var i = 0; i < 500 && total < payload.Length; i++)
+            {
+                manager.ProcessCompletions(_events);
+                manager.Submit();
+                if (clients[0].Poll(1000, SelectMode.SelectRead))
+                {
+                    total += clients[0].Receive(received, total, payload.Length - total, SocketFlags.None);
+                }
+            }
+
+            Assert.Equal(payload, received);
+        }
+        finally
+        {
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
+    [Fact]
+    public void TryGrowSendBuffer_ReturnsFalse_WhenTheTierSlabCannotBeCreated()
+    {
+        var budget = 64L * Base;
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, 2 * Base, budget, 2);
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered)
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 1, maxBufferSlabs: 2,
+            maxSendBufferSize: 2 * Base, sendBufferGrowthBudget: budget
+        );
+
+        var port = 27000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+        var clients = new List<Socket>(1);
+
+        try
+        {
+            var socket = manager.CreateSocket(AcceptOn(ring, listener, port, clients))!;
+            manager.Submit();
+            var original = socket.SendBuffer;
+
+            ring.FailRegistrationsAfter(0); // the tier pool has no slab yet, so the first grow must build one
+            Assert.False(manager.TryGrowSendBuffer(socket));
+            Assert.Same(original, socket.SendBuffer);
+            Assert.Null(socket.RetiringSendBuffer);
+            Assert.Equal(1, manager.Maintain().GrowthRefusals);
+        }
+        finally
+        {
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
     [Theory]
     [InlineData(1024)] // slab divides the count exactly
     [InlineData(1000)] // 1008 per pool: a table of maxConnections x 2 would be 16 short

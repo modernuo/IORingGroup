@@ -488,12 +488,12 @@ public sealed class RingSocketManager : IDisposable
             return null;
         }
 
-        if (!_recvBufferPool.TryAcquire(out var recvBuffer))
+        if (!TryAcquireLazy(_recvBufferPool, out var recvBuffer))
         {
             return null;
         }
 
-        if (!_sendBufferPool.TryAcquire(out var sendBuffer))
+        if (!TryAcquireLazy(_sendBufferPool, out var sendBuffer))
         {
             _recvBufferPool.Release(recvBuffer!);
             return null;
@@ -1106,15 +1106,33 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
-        return pool.TryAcquire(out buffer);
+        return TryAcquireLazy(pool, out buffer);
+    }
+
+    /// <summary>
+    /// Acquires from a pool that fills lazily, reporting a slab the ring or the OS refused as plain
+    /// exhaustion. The pool still throws so its own failures stay visible; the manager is the boundary
+    /// where a caller that cannot take an exception - an accept, a grow, a shrink - fails soft instead.
+    /// </summary>
+    private static bool TryAcquireLazy(IORingBufferPool pool, out IORingBuffer? buffer)
+    {
+        try
+        {
+            return pool.TryAcquire(out buffer);
+        }
+        catch (InvalidOperationException)
+        {
+            buffer = null;
+            return false;
+        }
     }
 
     /// <summary>
     /// Moves the socket's queued-but-unsent bytes into the next larger send buffer. Bytes already
     /// handed to the transport stay in the old buffer, which is released once they complete.
     /// </summary>
-    /// <returns>False if the socket is closing, already at the largest tier, or the growth budget
-    /// cannot supply a buffer.</returns>
+    /// <returns>False if the socket is closing, already at the largest tier, or no buffer is available
+    /// within the growth budget; the socket keeps its current buffer.</returns>
     public bool TryGrowSendBuffer(RingSocket socket)
     {
         if (!socket.Connected || socket.DisconnectPending)
@@ -1168,6 +1186,7 @@ public sealed class RingSocketManager : IDisposable
     /// <summary>
     /// Returns a drained socket to a base-size send buffer. No copy: nothing is readable.
     /// </summary>
+    /// <returns>False if the socket is busy or the base pool has no buffer; it keeps its larger one.</returns>
     public bool TryShrinkSendBuffer(RingSocket socket)
     {
         if (!socket.Connected || socket.RetiringSendBuffer != null || socket.SendPending ||
@@ -1176,7 +1195,7 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
-        if (!_sendBufferPool.TryAcquire(out var baseBuffer))
+        if (!TryAcquireLazy(_sendBufferPool, out var baseBuffer))
         {
             return false;
         }
@@ -1188,7 +1207,7 @@ public sealed class RingSocketManager : IDisposable
 
     /// <summary>Snapshot returned by <see cref="Maintain"/>.</summary>
     /// <param name="BuffersReleased">Buffers returned to the OS by this call, summed across tiers.</param>
-    /// <param name="GrowthRefusals">Budget refusals since the previous call, which resets the counter.</param>
+    /// <param name="GrowthRefusals">Growths refused by the budget, or by a slab the ring would not take, since the previous call, which resets the counter.</param>
     /// <param name="TierCapacityBytes">Slab capacity allocated across every tier pool, in bytes.</param>
     /// <param name="TierInUse">
     /// Buffers handed out, summed across tiers (a count; see <see cref="GetSendBufferTierStats"/> per tier).
