@@ -22,8 +22,16 @@ public sealed class FailingRegistrationRing : IIORingGroup
     /// <summary>Registrations refused so far.</summary>
     public int RefusedRegistrations { get; private set; }
 
+    /// <summary>Makes <see cref="RegisterBuffer"/> raise an argument error instead of refusing operationally.</summary>
+    public bool ThrowArgumentExceptionOnRegister { get; set; }
+
     public int RegisterBuffer(IORingBuffer buffer)
     {
+        if (ThrowArgumentExceptionOnRegister)
+        {
+            throw new ArgumentException("Test-injected argument error", nameof(buffer));
+        }
+
         if (_allowedRegistrations <= 0)
         {
             RefusedRegistrations++;

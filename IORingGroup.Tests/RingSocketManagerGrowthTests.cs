@@ -452,6 +452,57 @@ public class RingSocketManagerGrowthTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(3)] // not a power of two
+    [InlineData(2)] // a power of two, but under the allocation granularity on every platform
+    [InlineData(0)]
+    public void Constructor_RejectsAnUnusableBufferSize_EvenWithNoSlabsUpFront(int recvBufferSize)
+    {
+        // Lazy pools would otherwise defer this to the first accept, which can only return null
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
+
+        var ex = Assert.ThrowsAny<ArgumentException>(
+            () => new RingSocketManager(
+                ring, maxSockets: 8, recvBufferSize: recvBufferSize, sendBufferSize: Base,
+                initialBufferSlabs: 0, maxBufferSlabs: 2
+            )
+        );
+
+        Assert.Equal("recvBufferSize", ex.ParamName);
+    }
+
+    [Fact]
+    public void CreateSocket_DoesNotSwallowAnArgumentErrorFromRegisterBuffer()
+    {
+        // Operational failures fail soft; an argument error is a bug and has to reach the caller
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8)
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 0, maxBufferSlabs: 2
+        );
+
+        var port = 28000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+        var clients = new List<Socket>(1);
+
+        try
+        {
+            var handle = AcceptOn(ring, listener, port, clients);
+            ring.ThrowArgumentExceptionOnRegister = true;
+
+            Assert.Throws<ArgumentException>(() => manager.CreateSocket(handle));
+            ring.CloseSocket(handle);
+        }
+        finally
+        {
+            ring.ThrowArgumentExceptionOnRegister = false;
+            CloseAll(manager, clients);
+            ring.CloseListener(listener);
+        }
+    }
+
     [Fact]
     public void TryGrowSendBuffer_ReturnsFalse_WhenTheTierSlabCannotBeCreated()
     {

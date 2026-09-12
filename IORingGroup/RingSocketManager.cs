@@ -248,10 +248,10 @@ public sealed class RingSocketManager : IDisposable
             throw new ArgumentOutOfRangeException(nameof(maxSockets), "Must be positive");
         }
 
-        if (sendBufferSize <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(sendBufferSize), "Must be positive");
-        }
+        // Named for this constructor's parameters rather than the pool's, and before anything is
+        // allocated: the pools fill lazily, so an unusable size must not wait for the first accept
+        IORingBuffer.ValidateSize(recvBufferSize);
+        IORingBuffer.ValidateSize(sendBufferSize);
 
         if (sendBufferRetentionWindows < 1)
         {

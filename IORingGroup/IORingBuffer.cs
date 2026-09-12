@@ -151,19 +151,22 @@ public sealed partial class IORingBuffer : IDisposable
     public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
 
     /// <summary>
-    /// Creates a new double-mapped circular buffer with pool tracking.
+    /// Throws if <paramref name="physicalSize"/> is not a buffer size this platform can double-map.
+    /// Callers that allocate lazily validate up front so a bad size fails where it was configured.
     /// </summary>
-    internal static IORingBuffer Create(int physicalSize, bool isPooled, int poolIndex)
+    /// <param name="physicalSize">Physical size in bytes.</param>
+    /// <param name="paramName">Name reported by the exception; defaults to the caller's argument.</param>
+    public static void ValidateSize(int physicalSize, [CallerArgumentExpression(nameof(physicalSize))] string? paramName = null)
     {
         if (physicalSize <= 0)
         {
-            throw new ArgumentOutOfRangeException(nameof(physicalSize), "Size must be positive");
+            throw new ArgumentOutOfRangeException(paramName, "Size must be positive");
         }
 
         // Verify power of 2
         if ((physicalSize & (physicalSize - 1)) != 0)
         {
-            throw new ArgumentException("Size must be a power of 2", nameof(physicalSize));
+            throw new ArgumentException("Size must be a power of 2", paramName);
         }
 
         // Windows places the second mapping at an offset of physicalSize and requires both the
@@ -178,9 +181,17 @@ public sealed partial class IORingBuffer : IDisposable
         {
             throw new ArgumentException(
                 $"Size must be a multiple of the allocation granularity ({alignment} bytes on this platform)",
-                nameof(physicalSize)
+                paramName
             );
         }
+    }
+
+    /// <summary>
+    /// Creates a new double-mapped circular buffer with pool tracking.
+    /// </summary>
+    internal static IORingBuffer Create(int physicalSize, bool isPooled, int poolIndex)
+    {
+        ValidateSize(physicalSize);
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -459,7 +470,9 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == nint.Zero)
         {
+            // Unmapping the first view frees its half; the second half is still a placeholder
             WindowsNative.UnmapViewOfFile(buffer);
+            WindowsNative.VirtualFree(region + physicalSize, 0, WindowsNative.MEM_RELEASE);
             WindowsNative.CloseHandle(handle);
             throw new InvalidOperationException($"MapViewOfFile3 (second) failed: {Marshal.GetLastPInvokeError()}");
         }

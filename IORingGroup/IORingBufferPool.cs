@@ -147,10 +147,9 @@ public sealed class IORingBufferPool : IDisposable
             throw new ArgumentOutOfRangeException(nameof(slabSize), "Slab size must be positive");
         }
 
-        if (bufferSize <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bufferSize), "Buffer size must be positive");
-        }
+        // Up front, not on the first acquire: slabs are lazy, so a bad size would otherwise surface
+        // as an accept failing long after the pool was configured
+        IORingBuffer.ValidateSize(bufferSize, nameof(bufferSize));
 
         if (initialSlabs < 0)
         {
@@ -233,6 +232,15 @@ public sealed class IORingBufferPool : IDisposable
             {
                 buffer = IORingBuffer.Create(BufferSize, isPooled: true, poolIndex: poolIndex);
                 bufferId = _ring.RegisterBuffer(buffer);
+            }
+            catch (ArgumentException)
+            {
+                // A bad size or a rejected argument is the caller's bug, not exhaustion: it must not
+                // reach the manager's soft-fail catch, which would turn it into a silent null accept
+                buffer?.Dispose();
+                UnwindSlab(slab, i);
+
+                throw;
             }
             catch (Exception ex)
             {
