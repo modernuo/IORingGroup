@@ -796,6 +796,10 @@ public class RingSocketManagerTests : IDisposable
         Assert.Null(socket.RetiringSendBuffer);
 
         client.Close();
-        ProcessUntilAllDisconnected(); // releases (and so disposes) the non-pooled replacement
+        ProcessUntilAllDisconnected();
+
+        // A finalized socket's buffers are released at the top of the *next* pass, so one more is
+        // needed; that release is what unregisters and disposes the non-pooled replacement.
+        _manager.ProcessCompletions(_events);
     }
 }
