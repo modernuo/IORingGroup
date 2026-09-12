@@ -193,6 +193,19 @@ public sealed class IORingBufferPool : IDisposable
 
             // Register with ring
             var bufferId = _ring.RegisterBuffer(buffer);
+            if (bufferId < 0)
+            {
+                // An unregistered buffer would be accepted here and then fail every operation posted
+                // against it, which reads as a random disconnect. Fail where the cause is visible.
+                buffer.Dispose();
+                UnwindSlab(slab, i);
+
+                throw new InvalidOperationException(
+                    $"Buffer registration failed: the ring's MaxRegisteredBuffers table ({_ring.MaxRegisteredBuffers} entries) is full. " +
+                    "Size it with RingSocketManager.RequiredRegisteredBuffers."
+                );
+            }
+
             buffer.BufferId = bufferId;
 
             slab.Buffers[i] = buffer;
@@ -201,6 +214,20 @@ public sealed class IORingBufferPool : IDisposable
 
         slab.FreeCount = SlabSize;
         return slab;
+    }
+
+    /// <summary>
+    /// Releases the buffers of a slab that failed part way through creation. The slab was never
+    /// published, so nothing else will ever unregister them.
+    /// </summary>
+    private void UnwindSlab(PoolSlab slab, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var buffer = slab.Buffers[i];
+            _ring.UnregisterBuffer(buffer.BufferId);
+            buffer.Dispose();
+        }
     }
 
     /// <summary>

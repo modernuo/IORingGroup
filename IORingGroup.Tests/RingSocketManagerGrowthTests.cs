@@ -19,7 +19,7 @@ public class RingSocketManagerGrowthTests : IDisposable
 
     public RingSocketManagerGrowthTests()
     {
-        var registered = RingSocketManager.RequiredRegisteredBuffers(64, Base, 4 * Base, 128L * Base);
+        var registered = RingSocketManager.RequiredRegisteredBuffers(64, Base, 4 * Base, 128L * Base, 4);
         _ring = System.Network.IORingGroup.Create(queueSize: 256, maxConnections: 64, maxRegisteredBuffers: registered);
         _manager = new RingSocketManager(
             _ring,
@@ -117,10 +117,33 @@ public class RingSocketManagerGrowthTests : IDisposable
     }
 
     [Fact]
-    public void RequiredRegisteredBuffers_AddsBudgetWorthOfFirstTier()
+    public void RequiredRegisteredBuffers_CoversBothPoolsPlusBudgetWorthOfFirstTier()
     {
-        Assert.Equal(32, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0));
-        Assert.Equal(32 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base));
+        // slabSize = max(64, 16 / 4) = 64, so the recv pool tops out at 4 x 64 and the send pool at
+        // 4 x 16 -- well above the two-per-socket that the sockets themselves need.
+        Assert.Equal(256 + 64, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4));
+
+        // 16 x 64 KB of budget buys 8 first-tier (128 KB) buffers.
+        Assert.Equal(256 + 64 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
+    }
+
+    [Fact]
+    public void Constructor_RejectsPositiveBudgetBelowOneTierSlab()
+    {
+        // The default registration table here (maxConnections x 2 = 16) is far too small for the
+        // pools, so reaching pool construction at all would throw InvalidOperationException instead.
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8);
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => new RingSocketManager(
+                ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+                initialBufferSlabs: 1, maxBufferSlabs: 2,
+                maxSendBufferSize: 2 * Base,
+                sendBufferGrowthBudget: RingSocketManager.MinimumSendBufferGrowthBudget(Base) - 1
+            )
+        );
+
+        Assert.Equal("sendBufferGrowthBudget", ex.ParamName);
     }
 
     [Fact]
@@ -205,6 +228,7 @@ public class RingSocketManagerGrowthTests : IDisposable
 
         Assert.False(_manager.TryGrowSendBuffer(socket));
         Assert.Equal(4 * Base, socket.SendBuffer.PhysicalSize);
+        Assert.Equal(0, _manager.Maintain().GrowthRefusals); // running out of tiers is not a budget refusal
 
         client.Close();
     }
@@ -212,11 +236,13 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Grow_RefusedWhenBudgetExhausted()
     {
-        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: 128);
+        var budget = RingSocketManager.MinimumSendBufferGrowthBudget(Base); // exactly one first-tier slab
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, 4 * Base, budget, 2);
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered);
         using var tight = new RingSocketManager(
             ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
             initialBufferSlabs: 1, maxBufferSlabs: 2,
-            maxSendBufferSize: 2 * Base, sendBufferGrowthBudget: 1L * Base // less than one tier slab
+            maxSendBufferSize: 4 * Base, sendBufferGrowthBudget: budget
         );
         var port = 21000 + Random.Shared.Next(1000);
         var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
@@ -241,8 +267,11 @@ public class RingSocketManagerGrowthTests : IDisposable
         ring.ConfigureSocket(handle);
         var socket = tight.CreateSocket(handle)!;
 
-        Assert.False(tight.TryGrowSendBuffer(socket));
-        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+        Assert.True(tight.TryGrowSendBuffer(socket)); // the first tier's slab fits the budget exactly
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+
+        Assert.False(tight.TryGrowSendBuffer(socket)); // the second tier's slab does not fit alongside it
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
         Assert.Equal(1, tight.Maintain().GrowthRefusals);
 
         ring.CloseListener(listener);
@@ -270,7 +299,8 @@ public class RingSocketManagerGrowthTests : IDisposable
     [Fact]
     public void Maintain_ReportsTierUsageAndTrimsAfterQuietWindows()
     {
-        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: 128);
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, 2 * Base, 64L * Base, 2);
+        using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered);
         using var quick = new RingSocketManager(
             ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
             initialBufferSlabs: 1, maxBufferSlabs: 2,
