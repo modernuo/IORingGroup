@@ -214,6 +214,9 @@ initial pools (at `maxSockets: 4096` and 4 KiB buffers, 32 MiB) but never touche
 
 Send promotion is the growth swap without the budget: queued bytes copy across, bytes in flight
 retire with the old buffer, and `TryGrowSendBuffer` promotes first if the consumer never asked.
+That promote-first path is the consumer's own way into the base pool before it has asked for one —
+gate it (ModernUO allows it only for a verified account or into an empty buffer) or the guarantee
+above is only as strong as the consumer's send path.
 Recv promotion is applied at the next recv completion, because a recv is armed against the current
 buffer almost always; the swap happens before that completion's `DataReceived` event, every
 readable byte moves across, and the next recv arms on the new buffer. Read `socket.RecvBuffer` per
