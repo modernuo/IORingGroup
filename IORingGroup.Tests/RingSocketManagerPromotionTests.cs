@@ -190,26 +190,113 @@ public class RingSocketManagerPromotionTests : IDisposable
     }
 
     [Fact]
-    public void Constructor_RejectsAnInitialSizeNotBelowBase()
+    public void Constructor_TurnsAnInitialPoolOff_WhenTheRequestReachesBase()
     {
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 16, maxRegisteredBuffers: 128);
-        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketManager(
+
+        using (var manager = new RingSocketManager(
             ring, maxSockets: 16, recvBufferSize: Base, sendBufferSize: Base, initialSendBufferSize: Base
-        ));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketManager(
+        ))
+        {
+            Assert.Equal(0, manager.InitialSendBufferSize);
+            Assert.Null(manager.InitialSendPool);
+        }
+
+        using var second = new RingSocketManager(
             ring, maxSockets: 16, recvBufferSize: Base, sendBufferSize: Base, initialRecvBufferSize: 2 * Base
-        ));
+        );
+        Assert.Equal(0, second.InitialRecvBufferSize);
     }
 
     [Fact]
-    public void Constructor_RejectsAnInitialSizeTheBufferCannotMap()
+    public void Constructor_RaisesAnInitialRequestToTheFloorAndAPowerOfTwo()
     {
         using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 16, maxRegisteredBuffers: 128);
-        // Not a power of two: ValidateSize's own exception, named for this constructor's parameter
-        var ex = Assert.Throws<ArgumentException>(() => new RingSocketManager(
+
+        using (var manager = new RingSocketManager(
             ring, maxSockets: 16, recvBufferSize: Base, sendBufferSize: Base, initialSendBufferSize: 3000
+        ))
+        {
+            // 3000 rounds up to 4096; on the legacy path the platform floor (64 KiB) wins instead
+            Assert.Equal(Math.Max(4096, IORingBuffer.MinimumSize), manager.InitialSendBufferSize);
+        }
+
+        using (var manager = new RingSocketManager(
+            ring, maxSockets: 16, recvBufferSize: Base, sendBufferSize: Base, initialSendBufferSize: 1
+        ))
+        {
+            Assert.Equal(IORingBuffer.MinimumSize, manager.InitialSendBufferSize);
+        }
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketManager(
+            ring, maxSockets: 16, recvBufferSize: Base, sendBufferSize: Base, initialSendBufferSize: -1
         ));
-        Assert.Equal("initialSendBufferSize", ex.ParamName);
+    }
+
+    [SkippableFact]
+    public void Constructor_LegacyWindowsPath_TurnsRecvPoolOffAtA64KiBBase()
+    {
+        Skip.IfNot(OperatingSystem.IsWindows());
+
+        IORingBuffer.ForceLegacyWindowsPath = true;
+        try
+        {
+            const int legacyBase = 64 * 1024;
+            const int otherBase = 128 * 1024;
+
+            var registered = RingSocketManager.RequiredRegisteredBuffers(16, otherBase, otherBase, 0, 4, 4096, 4096);
+            using var ring = System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 16, maxRegisteredBuffers: registered);
+            using var manager = new RingSocketManager(
+                ring, maxSockets: 16, recvBufferSize: legacyBase, sendBufferSize: otherBase,
+                initialBufferSlabs: 1, maxBufferSlabs: 4,
+                initialRecvBufferSize: 4096, initialSendBufferSize: 4096
+            );
+
+            // No room under a 64 KiB base once the request is raised to the 64 KiB legacy floor
+            Assert.Equal(0, manager.InitialRecvBufferSize);
+            // Raised to the floor and still below the 128 KiB base
+            Assert.Equal(65536, manager.InitialSendBufferSize);
+
+            var port = 28000 + Random.Shared.Next(1000);
+            var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+            try
+            {
+                using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                client.Connect(IPAddress.Loopback, port);
+                ring.PrepareAccept(listener, 0, 0, IORingUserData.EncodeAccept());
+                ring.Submit();
+
+                var completions = new Completion[1];
+                nint handle = -1;
+                for (var i = 0; i < 200 && handle <= 0; i++)
+                {
+                    if (ring.PeekCompletions(completions) > 0)
+                    {
+                        ring.AdvanceCompletionQueue(1);
+                        handle = completions[0].Result;
+                    }
+                    else
+                    {
+                        Thread.Sleep(5);
+                    }
+                }
+
+                Assert.True(handle > 0);
+                ring.ConfigureSocket(handle);
+                var socket = manager.CreateSocket(handle)!;
+
+                Assert.Equal(legacyBase, socket.RecvBuffer.PhysicalSize);
+                Assert.Equal(65536, socket.SendBuffer.PhysicalSize);
+            }
+            finally
+            {
+                ring.CloseListener(listener);
+            }
+        }
+        finally
+        {
+            IORingBuffer.ForceLegacyWindowsPath = null;
+        }
     }
 
     [Fact]

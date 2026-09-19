@@ -2,6 +2,7 @@
 // Copyright (c) 2025, ModernUO
 
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace System.Network;
@@ -247,14 +248,18 @@ public sealed class RingSocketManager : IDisposable
     /// Number of <see cref="Maintain"/> windows a pool's peak usage stays in force (default 15).
     /// </param>
     /// <param name="initialRecvBufferSize">
-    /// Recv buffer a socket starts with, promoted to <paramref name="recvBufferSize"/> by
-    /// <see cref="TryPromoteRecvBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise a
-    /// size <see cref="IORingBuffer.ValidateSize"/> accepts, smaller than <paramref name="recvBufferSize"/>.
+    /// A request for the recv buffer a socket starts with, promoted to <paramref name="recvBufferSize"/>
+    /// by <see cref="TryPromoteRecvBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise
+    /// the request is raised to <see cref="IORingBuffer.MinimumSize"/> and to a power of two; if that
+    /// reaches <paramref name="recvBufferSize"/> the pool is off. The effective size is reported by
+    /// <see cref="InitialRecvBufferSize"/>.
     /// </param>
     /// <param name="initialSendBufferSize">
-    /// Send buffer a socket starts with, promoted to <paramref name="sendBufferSize"/> by
-    /// <see cref="TryPromoteSendBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise a
-    /// size <see cref="IORingBuffer.ValidateSize"/> accepts, smaller than <paramref name="sendBufferSize"/>.
+    /// A request for the send buffer a socket starts with, promoted to <paramref name="sendBufferSize"/>
+    /// by <see cref="TryPromoteSendBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise
+    /// the request is raised to <see cref="IORingBuffer.MinimumSize"/> and to a power of two; if that
+    /// reaches <paramref name="sendBufferSize"/> the pool is off. The effective size is reported by
+    /// <see cref="InitialSendBufferSize"/>.
     /// </param>
     public RingSocketManager(
         IIORingGroup ring,
@@ -281,10 +286,8 @@ public sealed class RingSocketManager : IDisposable
         IORingBuffer.ValidateSize(recvBufferSize);
         IORingBuffer.ValidateSize(sendBufferSize);
 
-        ValidateInitialSize(initialRecvBufferSize, recvBufferSize, nameof(initialRecvBufferSize));
-        ValidateInitialSize(initialSendBufferSize, sendBufferSize, nameof(initialSendBufferSize));
-        InitialRecvBufferSize = initialRecvBufferSize;
-        InitialSendBufferSize = initialSendBufferSize;
+        InitialRecvBufferSize = CoerceInitialSize(initialRecvBufferSize, recvBufferSize, nameof(initialRecvBufferSize));
+        InitialSendBufferSize = CoerceInitialSize(initialSendBufferSize, sendBufferSize, nameof(initialSendBufferSize));
 
         if (sendBufferRetentionWindows < 1)
         {
@@ -322,7 +325,7 @@ public sealed class RingSocketManager : IDisposable
         // Fail here rather than at an accept or growth where the cause is invisible
         var needed = RequiredRegisteredBuffers(
             maxSockets, sendBufferSize, MaxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs,
-            initialRecvBufferSize, initialSendBufferSize
+            InitialRecvBufferSize, InitialSendBufferSize
         );
         if (ring.MaxRegisteredBuffers > 0 && ring.MaxRegisteredBuffers < needed)
         {
@@ -383,12 +386,12 @@ public sealed class RingSocketManager : IDisposable
             created.Add(_sendBufferPool);
 
             // Same slab rule as base: one buffer per socket, a flood fills them and retention keeps them
-            if (initialRecvBufferSize > 0)
+            if (InitialRecvBufferSize > 0)
             {
                 _initialRecvPool = new IORingBufferPool(
                     ring,
                     slabSize: slabSize,
-                    bufferSize: initialRecvBufferSize,
+                    bufferSize: InitialRecvBufferSize,
                     initialSlabs: baseInitialSlabs,
                     maxSlabs: baseSlabs,
                     retentionWindows: sendBufferRetentionWindows,
@@ -397,12 +400,12 @@ public sealed class RingSocketManager : IDisposable
                 created.Add(_initialRecvPool);
             }
 
-            if (initialSendBufferSize > 0)
+            if (InitialSendBufferSize > 0)
             {
                 _initialSendPool = new IORingBufferPool(
                     ring,
                     slabSize: slabSize,
-                    bufferSize: initialSendBufferSize,
+                    bufferSize: InitialSendBufferSize,
                     initialSlabs: baseInitialSlabs,
                     maxSlabs: baseSlabs,
                     retentionWindows: sendBufferRetentionWindows,
@@ -440,21 +443,31 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// An initial pool is optional (0) and otherwise must be mappable and smaller than the base it promotes to.
+    /// An initial size is a request, not a contract: 0 means no pool; anything else is raised to the
+    /// platform floor and to a power of two, and if that leaves no room below the base size the pool
+    /// is off. The effective size is what <see cref="InitialRecvBufferSize"/> and
+    /// <see cref="InitialSendBufferSize"/> report.
     /// </summary>
-    private static void ValidateInitialSize(int initialSize, int baseSize, string paramName)
+    private static int CoerceInitialSize(int requested, int baseSize, string paramName)
     {
-        if (initialSize == 0)
+        if (requested == 0)
         {
-            return;
+            return 0;
         }
 
-        IORingBuffer.ValidateSize(initialSize, paramName);
+        ArgumentOutOfRangeException.ThrowIfNegative(requested, paramName);
 
-        if (initialSize >= baseSize)
+        var size = Math.Max(requested, IORingBuffer.MinimumSize);
+        if (size > int.MaxValue / 2)
         {
-            throw new ArgumentOutOfRangeException(paramName, "Must be smaller than the base buffer size it promotes to, or 0 to disable");
+            throw new ArgumentOutOfRangeException(paramName, "Too large to double-map");
         }
+
+        size = (int)BitOperations.RoundUpToPowerOf2((uint)size);
+        IORingBuffer.ValidateSize(size, paramName);
+
+        // The legacy Windows mapping path floors at 64 KiB, which can equal the base recv size
+        return size >= baseSize ? 0 : size;
     }
 
     /// <summary>
@@ -527,7 +540,10 @@ public sealed class RingSocketManager : IDisposable
     /// A socket holds at most one recv and one send buffer per pool class, even mid-swap (a shrink
     /// or promotion acquires before it releases), so each pool is bounded by <paramref name="maxSockets"/>
     /// rounded to slabs. Initial pools count in full: a flood can fill them and retention keeps
-    /// them while authenticated sockets fill the base pools.
+    /// them while authenticated sockets fill the base pools. A non-zero initial size here always
+    /// counts as a pool, even though the constructor may coerce that request down to 0 (its floor
+    /// reaching the base size) once it knows the platform; sizing for a pool that ends up off is
+    /// merely conservative, never too small.
     /// </remarks>
     public static int RequiredRegisteredBuffers(
         int maxSockets,
