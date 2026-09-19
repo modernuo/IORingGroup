@@ -422,4 +422,96 @@ public class RingSocketManagerPromotionTests : IDisposable
         Assert.Equal(0, _manager.SendBufferPool.InUse);
         client.Close();
     }
+
+    [Fact]
+    public void PromoteRecv_WithARecvPending_SwapsAtTheNextCompletion_KeepingEveryByte()
+    {
+        var socket = Accept(out var client);
+        var first = Pattern(100, 1);
+        client.Send(first);
+        PumpUntilReadable(socket, first.Length); // delivered, not consumed: a partial packet
+        var original = socket.RecvBuffer;
+
+        Assert.True(_manager.TryPromoteRecvBuffer(socket));
+        Assert.Same(original, socket.RecvBuffer); // a recv is armed against it
+        Assert.True(socket.RecvPromotionPending);
+
+        var second = Pattern(50, 2);
+        client.Send(second);
+        PumpUntilReadable(socket, first.Length + second.Length);
+
+        Assert.Equal(Base, socket.RecvBuffer.PhysicalSize);
+        Assert.False(socket.RecvPromotionPending);
+        Assert.Equal(0, _manager.InitialRecvPool!.InUse);
+        Assert.Equal(1, _manager.RecvBufferPool.InUse);
+
+        var expected = new byte[first.Length + second.Length];
+        first.CopyTo(expected, 0);
+        second.CopyTo(expected, first.Length);
+        Assert.Equal(expected, socket.RecvBuffer.GetReadSpan().ToArray());
+
+        // The next recv is armed against the new buffer
+        var third = Pattern(200, 3);
+        client.Send(third);
+        PumpUntilReadable(socket, expected.Length + third.Length);
+        Assert.Equal(third, socket.RecvBuffer.GetReadSpan()[expected.Length..].ToArray());
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void PromoteRecv_WhenTheInitialBufferIsFull_SwapsImmediatelyAndRearmsRecv()
+    {
+        var socket = Accept(out var client);
+        var capacity = Initial - 1; // a ring buffer keeps one slot to tell full from empty
+        var fill = Pattern(capacity, 1);
+        client.Send(fill);
+        PumpUntilReadable(socket, capacity); // WritableBytes == 0, so nothing is armed
+        Assert.False(socket.RecvPending);
+
+        Assert.True(_manager.TryPromoteRecvBuffer(socket));
+
+        Assert.Equal(Base, socket.RecvBuffer.PhysicalSize);
+        Assert.Equal(fill, socket.RecvBuffer.GetReadSpan().ToArray());
+        Assert.True(socket.RecvPending);
+        Assert.False(socket.RecvPromotionPending);
+        _manager.Submit();
+
+        var more = Pattern(10, 2);
+        client.Send(more);
+        PumpUntilReadable(socket, capacity + more.Length);
+        Assert.Equal(more, socket.RecvBuffer.GetReadSpan()[capacity..].ToArray());
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void PromoteRecv_IsANoOpOncePromoted_AndRefusedWhileClosing()
+    {
+        var socket = Accept(out var client);
+        Assert.True(_manager.TryPromoteRecvBuffer(socket));
+        Assert.False(_manager.TryPromoteRecvBuffer(socket)); // already pending
+        client.Send(Pattern(8, 1));
+        PumpUntilReadable(socket, 8);
+        Assert.Equal(Base, socket.RecvBuffer.PhysicalSize);
+        Assert.False(_manager.TryPromoteRecvBuffer(socket)); // already promoted
+        CloseAndReap(client);
+
+        var closing = Accept(out var second);
+        closing.Disconnect();
+        Assert.False(_manager.TryPromoteRecvBuffer(closing));
+        CloseAndReap(second);
+    }
+
+    [Fact]
+    public void Disconnect_WithAPromotionPending_ReleasesTheInitialBuffer()
+    {
+        var socket = Accept(out var client);
+        Assert.True(_manager.TryPromoteRecvBuffer(socket));
+
+        CloseAndReap(client); // peer EOF completes the armed recv; nothing to promote onto
+
+        Assert.Equal(0, _manager.InitialRecvPool!.InUse);
+        Assert.Equal(0, _manager.RecvBufferPool.InUse);
+    }
 }

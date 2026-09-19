@@ -1036,6 +1036,12 @@ public sealed class RingSocketManager : IDisposable
 
         socket.RecvBuffer.CommitWrite(result);
 
+        // Before the event: the consumer reads this completion through socket.RecvBuffer
+        if (socket.RecvPromotionPending)
+        {
+            PromoteRecvBufferNow(socket);
+        }
+
         if (socket is { DisconnectPending: false, RecvBuffer.WritableBytes: > 0 })
         {
             PostRecv(socket);
@@ -1337,6 +1343,65 @@ public sealed class RingSocketManager : IDisposable
         }
 
         SwapSendBuffer(socket, next!);
+        return true;
+    }
+
+    /// <summary>True when the socket still holds the recv buffer it was created with from the initial pool.</summary>
+    private bool OnInitialRecvBuffer(RingSocket socket) =>
+        _initialRecvPool != null && socket.RecvBuffer.PhysicalSize == _initialRecvPool.BufferSize;
+
+    /// <summary>
+    /// Moves a socket from its initial recv buffer to a base one. A recv is normally armed against
+    /// the current buffer, so the swap is applied at the next recv completion, before that
+    /// completion's event is returned; only a full initial buffer (nothing armed) swaps at once.
+    /// </summary>
+    /// <returns>
+    /// False if the socket is not on an initial buffer, is closing, or a promotion is already pending.
+    /// True once the promotion is requested; the socket degrades to its initial buffer if the base
+    /// pool cannot supply one, and retries at each later completion.
+    /// </returns>
+    public bool TryPromoteRecvBuffer(RingSocket socket)
+    {
+        if (!OnInitialRecvBuffer(socket) || !socket.Connected || socket.DisconnectPending || socket.RecvPromotionPending)
+        {
+            return false;
+        }
+
+        socket.RecvPromotionPending = true;
+
+        if (!socket.RecvPending)
+        {
+            // Full buffer: nothing is armed, so swap now and re-arm on the new one
+            if (PromoteRecvBufferNow(socket))
+            {
+                PostRecv(socket);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Applies a pending recv promotion: every readable byte (an unconsumed partial packet plus the
+    /// completion just committed) moves to a base buffer and the initial one goes back to its pool.
+    /// Nothing may be armed against the old buffer when this runs.
+    /// </summary>
+    private bool PromoteRecvBufferNow(RingSocket socket)
+    {
+        Debug.Assert(!socket.RecvPending, "recv promotion applied with a recv armed");
+
+        if (!TryAcquireLazy(_recvBufferPool, out var next))
+        {
+            return false; // stays on the initial buffer; the flag keeps the retry alive
+        }
+
+        var readable = socket.RecvBuffer.GetReadSpan();
+        readable.CopyTo(next!.GetWriteSpan());
+        next.CommitWrite(readable.Length);
+
+        ReleaseRecvBuffer(socket.RecvBuffer);
+        socket.RecvBuffer = next;
+        socket.RecvPromotionPending = false;
         return true;
     }
 

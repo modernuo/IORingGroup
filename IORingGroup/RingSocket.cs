@@ -47,8 +47,9 @@ public sealed class RingSocket
     /// <summary>
     /// Gets the receive buffer for incoming data.
     /// Data arrives here after recv completions.
+    /// Replaced by the manager when the socket is promoted from its initial buffer; read it per event.
     /// </summary>
-    public IORingBuffer RecvBuffer { get; }
+    public IORingBuffer RecvBuffer { get; internal set; }
 
     /// <summary>
     /// Gets the send buffer for outgoing data.
@@ -77,6 +78,11 @@ public sealed class RingSocket
     /// Gets whether a recv operation is currently in-flight.
     /// </summary>
     internal bool RecvPending { get; set; }
+
+    /// <summary>
+    /// A recv promotion was requested while a recv was armed; the manager applies it at the next completion.
+    /// </summary>
+    internal bool RecvPromotionPending { get; set; }
 
     /// <summary>
     /// Gets whether any send operation is currently in-flight.
