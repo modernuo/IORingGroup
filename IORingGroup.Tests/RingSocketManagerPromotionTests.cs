@@ -261,4 +261,128 @@ public class RingSocketManagerPromotionTests : IDisposable
         Assert.Equal(1, _manager.InitialRecvPool.CurrentSlabs);
         Assert.Equal(1, _manager.InitialSendPool.CurrentSlabs);
     }
+
+    [Fact]
+    public void PromoteSend_WithNothingInFlight_ReleasesTheInitialBuffer()
+    {
+        var socket = Accept(out var client);
+        var queued = Pattern(100, 1);
+        Write(socket, queued); // sendable, never posted
+
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+        Assert.Null(socket.RetiringSendBuffer);
+        Assert.Equal(queued.Length, socket.SendBuffer.ReadableBytes);
+        Assert.Equal(0, _manager.InitialSendPool!.InUse);
+        Assert.Equal(1, _manager.SendBufferPool.InUse);
+
+        Assert.Equal(queued, ReadAll(client, queued.Length));
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void PromoteSend_WithBytesInFlight_RetiresTheInitialBufferAndKeepsOrder()
+    {
+        var socket = Accept(out var client);
+        var first = Pattern(Initial / 2, 1);
+        Write(socket, first);
+        _manager.ProcessSendQueue();
+        _manager.Submit(); // in flight from the initial buffer
+
+        var queued = Pattern(Initial / 4, 2);
+        Write(socket, queued);
+        var original = socket.SendBuffer;
+
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+        Assert.Same(original, socket.RetiringSendBuffer);
+        Assert.Equal(0, original.SendableBytes);
+        Assert.Equal(queued.Length, socket.SendBuffer.ReadableBytes);
+
+        var after = Pattern(Base / 2, 3); // more than the initial buffer could ever hold
+        Write(socket, after);
+
+        var expected = new byte[first.Length + queued.Length + after.Length];
+        first.CopyTo(expected, 0);
+        queued.CopyTo(expected, first.Length);
+        after.CopyTo(expected, first.Length + queued.Length);
+
+        Assert.Equal(expected, ReadAll(client, expected.Length));
+        WaitForDrain(socket);
+        Assert.Null(socket.RetiringSendBuffer);
+        Assert.Equal(0, _manager.InitialSendPool!.InUse);
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void PromoteSend_IsANoOpOncePromoted_AndRefusedWhileClosing()
+    {
+        var socket = Accept(out var client);
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+        Assert.False(_manager.TryPromoteSendBuffer(socket));
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+        CloseAndReap(client);
+
+        var closing = Accept(out var second);
+        closing.Disconnect();
+        Assert.False(_manager.TryPromoteSendBuffer(closing));
+        Assert.Equal(Initial, closing.SendBuffer.PhysicalSize);
+        CloseAndReap(second);
+    }
+
+    [Fact]
+    public void Grow_PromotesFirst_ThenGrowsThroughTheTiers()
+    {
+        var socket = Accept(out var client);
+
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize); // promotion, not a tier
+
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void Shrink_ReturnsToBase_NeverToInitial()
+    {
+        var socket = Accept(out var client);
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        WaitForDrain(socket);
+
+        Assert.True(_manager.TryShrinkSendBuffer(socket));
+        Assert.Equal(Base, socket.SendBuffer.PhysicalSize);
+        Assert.False(_manager.TryShrinkSendBuffer(socket));
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
+    public void Abort_WithARetiringInitialBuffer_ReleasesBothToTheirPools()
+    {
+        var socket = Accept(out var client);
+        Write(socket, Pattern(256, 1));
+        _manager.ProcessSendQueue();
+        _manager.Submit();
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+        Assert.NotNull(socket.RetiringSendBuffer);
+
+        _manager.DisconnectImmediate(socket);
+        for (var i = 0; i < 500 && _manager.ConnectedCount > 0; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(5);
+        }
+
+        _manager.ProcessCompletions(_events);
+        Assert.Equal(0, _manager.InitialSendPool!.InUse);
+        Assert.Equal(0, _manager.SendBufferPool.InUse);
+        client.Close();
+    }
 }

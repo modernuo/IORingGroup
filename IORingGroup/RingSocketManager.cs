@@ -1270,43 +1270,23 @@ public sealed class RingSocketManager : IDisposable
         }
     }
 
+    /// <summary>True when the socket still holds the send buffer it was created with from the initial pool.</summary>
+    private bool OnInitialSendBuffer(RingSocket socket) =>
+        _initialSendPool != null && socket.SendBuffer.PhysicalSize == _initialSendPool.BufferSize;
+
     /// <summary>
-    /// Moves the socket's queued-but-unsent bytes into the next larger send buffer. Bytes already
-    /// handed to the transport stay in the old buffer, which is released once they complete.
+    /// Makes <paramref name="next"/> the socket's send buffer: queued-but-unsent bytes move across;
+    /// bytes already handed to the transport stay in the old buffer, which is released once they
+    /// complete. Shared by growth and promotion so the two cannot drift.
     /// </summary>
-    /// <returns>False if the socket is closing, already at the largest tier, or no buffer is available
-    /// within the growth budget; the socket keeps its current buffer.</returns>
-    public bool TryGrowSendBuffer(RingSocket socket)
+    private void SwapSendBuffer(RingSocket socket, IORingBuffer next)
     {
-        if (!socket.Connected || socket.DisconnectPending)
-        {
-            return false;
-        }
-
         var current = socket.SendBuffer;
-        var tier = TierIndexOf(current) + 1;
-        if (tier >= _sendTiers.Length)
-        {
-            return false;
-        }
-
-        // Only one retiring slot
-        if (socket.RetiringSendBuffer != null && current.InFlightBytes != 0)
-        {
-            Debug.Assert(false, "growth with a retiring buffer found bytes in flight on the current buffer");
-            return false;
-        }
-
-        if (!TryAcquireTier(tier, out var next))
-        {
-            _growthRefusals++;
-            return false;
-        }
 
         var unsent = current.SendableBytes;
         if (unsent > 0)
         {
-            current.GetSendableSpan().CopyTo(next!.GetWriteSpan());
+            current.GetSendableSpan().CopyTo(next.GetWriteSpan());
             next.CommitWrite(unsent);
             current.DiscardSendable();
         }
@@ -1317,12 +1297,87 @@ public sealed class RingSocketManager : IDisposable
         }
         else
         {
-            // The guard above refused the retiring case
-            Debug.Assert(socket.RetiringSendBuffer == null, "growth would drop an unretired send buffer");
+            // The callers refused the retiring case
+            Debug.Assert(socket.RetiringSendBuffer == null, "swap would drop an unretired send buffer");
             socket.RetiringSendBuffer = current;
         }
 
-        socket.SendBuffer = next!;
+        socket.SendBuffer = next;
+    }
+
+    /// <summary>
+    /// A socket on an initial send buffer may already have one retiring; a second cannot be parked.
+    /// </summary>
+    private static bool CanSwapSendBuffer(RingSocket socket)
+    {
+        if (socket.RetiringSendBuffer != null && socket.SendBuffer.InFlightBytes != 0)
+        {
+            Debug.Assert(false, "swap with a retiring buffer found bytes in flight on the current buffer");
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Moves a socket from its initial send buffer to a base one. Unbudgeted: the base pool is sized
+    /// for every socket, so this fails only when a slab cannot be created.
+    /// </summary>
+    /// <returns>False if the socket is not on an initial buffer, is closing, or the base pool has no buffer.</returns>
+    public bool TryPromoteSendBuffer(RingSocket socket)
+    {
+        if (!OnInitialSendBuffer(socket) || !socket.Connected || socket.DisconnectPending || !CanSwapSendBuffer(socket))
+        {
+            return false;
+        }
+
+        if (!TryAcquireLazy(_sendBufferPool, out var next))
+        {
+            return false;
+        }
+
+        SwapSendBuffer(socket, next!);
+        return true;
+    }
+
+    /// <summary>
+    /// Moves the socket's queued-but-unsent bytes into the next larger send buffer. Bytes already
+    /// handed to the transport stay in the old buffer, which is released once they complete. A
+    /// socket still on its initial buffer is promoted to base instead, as a safety net for a
+    /// consumer that never asked.
+    /// </summary>
+    /// <returns>False if the socket is closing, already at the largest tier, or no buffer is available
+    /// within the growth budget; the socket keeps its current buffer.</returns>
+    public bool TryGrowSendBuffer(RingSocket socket)
+    {
+        if (!socket.Connected || socket.DisconnectPending)
+        {
+            return false;
+        }
+
+        if (OnInitialSendBuffer(socket))
+        {
+            return TryPromoteSendBuffer(socket);
+        }
+
+        var tier = TierIndexOf(socket.SendBuffer) + 1;
+        if (tier >= _sendTiers.Length)
+        {
+            return false;
+        }
+
+        if (!CanSwapSendBuffer(socket))
+        {
+            return false;
+        }
+
+        if (!TryAcquireTier(tier, out var next))
+        {
+            _growthRefusals++;
+            return false;
+        }
+
+        SwapSendBuffer(socket, next!);
         return true;
     }
 
