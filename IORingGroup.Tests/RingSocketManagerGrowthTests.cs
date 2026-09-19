@@ -151,6 +151,10 @@ public class RingSocketManagerGrowthTests : IDisposable
 
         // 16 x 64 KB of budget buys 8 first-tier (128 KB) buffers.
         Assert.Equal(16 + 16 + 8, RingSocketManager.RequiredRegisteredBuffers(16, Base, 4 * Base, 16L * Base, 4));
+
+        // Each initial pool is bounded like a base pool: one buffer per socket, rounded to slabs
+        Assert.Equal(16 + 16 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4, initialSendBufferSize: Base / 2));
+        Assert.Equal(16 + 16 + 16 + 16, RingSocketManager.RequiredRegisteredBuffers(16, Base, Base, 0, 4, Base / 2, Base / 2));
     }
 
     [Fact]
