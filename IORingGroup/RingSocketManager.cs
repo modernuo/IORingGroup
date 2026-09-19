@@ -1356,9 +1356,10 @@ public sealed class RingSocketManager : IDisposable
     /// completion's event is returned; only a full initial buffer (nothing armed) swaps at once.
     /// </summary>
     /// <returns>
-    /// False if the socket is not on an initial buffer, is closing, or a promotion is already pending.
-    /// True once the promotion is requested; the socket degrades to its initial buffer if the base
-    /// pool cannot supply one, and retries at each later completion.
+    /// True once the promotion is requested (a recv is armed; it applies at the next completion,
+    /// retrying there if the base pool cannot supply) or already applied. False if the socket is not
+    /// on an initial buffer, is closing, a promotion is already pending, or - with nothing armed -
+    /// the base pool could not supply a buffer, in which case the caller may call again.
     /// </returns>
     public bool TryPromoteRecvBuffer(RingSocket socket)
     {
@@ -1371,11 +1372,15 @@ public sealed class RingSocketManager : IDisposable
 
         if (!socket.RecvPending)
         {
-            // Full buffer: nothing is armed, so swap now and re-arm on the new one
-            if (PromoteRecvBufferNow(socket))
+            // Full buffer: nothing is armed, so no completion can apply this later. Swap now and
+            // re-arm on the new buffer, or report the failure so the caller can try again.
+            if (!PromoteRecvBufferNow(socket))
             {
-                PostRecv(socket);
+                socket.RecvPromotionPending = false;
+                return false;
             }
+
+            PostRecv(socket);
         }
 
         return true;
@@ -1392,7 +1397,7 @@ public sealed class RingSocketManager : IDisposable
 
         if (!TryAcquireLazy(_recvBufferPool, out var next))
         {
-            return false; // stays on the initial buffer; the flag keeps the retry alive
+            return false; // Stays on the initial buffer; the deferred path retries at the next completion
         }
 
         var readable = socket.RecvBuffer.GetReadSpan();

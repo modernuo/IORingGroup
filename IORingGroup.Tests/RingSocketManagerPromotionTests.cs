@@ -514,4 +514,92 @@ public class RingSocketManagerPromotionTests : IDisposable
         Assert.Equal(0, _manager.InitialRecvPool!.InUse);
         Assert.Equal(0, _manager.RecvBufferPool.InUse);
     }
+
+    [Fact]
+    public void PromoteRecv_WhenTheInitialBufferIsFull_AndBaseCannotSupply_ReportsFalseAndStaysRetryable()
+    {
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, Base, 0, 2, Initial, Initial);
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered)
+        );
+        // No slabs up front: the base recv slab is created on the first promotion, which is where it fails
+        using var manager = new RingSocketManager(
+            ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 0, maxBufferSlabs: 2,
+            initialRecvBufferSize: Initial, initialSendBufferSize: Initial
+        );
+
+        var port = 27000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+        var events = new RingSocketEvent[16];
+        Socket? client = null;
+
+        try
+        {
+            client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client.Connect(IPAddress.Loopback, port);
+            ring.PrepareAccept(listener, 0, 0, IORingUserData.EncodeAccept());
+            ring.Submit();
+
+            var completions = new Completion[1];
+            nint handle = -1;
+            for (var i = 0; i < 200 && handle <= 0; i++)
+            {
+                if (ring.PeekCompletions(completions) > 0)
+                {
+                    ring.AdvanceCompletionQueue(1);
+                    handle = completions[0].Result;
+                }
+                else
+                {
+                    Thread.Sleep(5);
+                }
+            }
+
+            Assert.True(handle > 0);
+            ring.ConfigureSocket(handle);
+            var socket = manager.CreateSocket(handle)!;
+            manager.Submit();
+
+            var capacity = Initial - 1;
+            var fill = Pattern(capacity, 1);
+            client.Send(fill);
+            for (var i = 0; i < 500 && socket.RecvBuffer.ReadableBytes < capacity; i++)
+            {
+                manager.ProcessCompletions(events);
+                manager.Submit();
+                Thread.Sleep(1);
+            }
+
+            Assert.Equal(capacity, socket.RecvBuffer.ReadableBytes);
+            Assert.False(socket.RecvPending);
+
+            ring.FailRegistrationsAfter(0); // the base recv slab cannot be registered
+            var refusedBefore = ring.RefusedRegistrations;
+
+            Assert.False(manager.TryPromoteRecvBuffer(socket));
+            Assert.False(socket.RecvPromotionPending);
+            Assert.Equal(Initial, socket.RecvBuffer.PhysicalSize);
+            Assert.Equal(fill, socket.RecvBuffer.GetReadSpan().ToArray()); // nothing lost
+            Assert.True(ring.RefusedRegistrations > refusedBefore);
+
+            // A second call tries again rather than short-circuiting on a stale flag
+            var refusedAfterFirst = ring.RefusedRegistrations;
+            Assert.False(manager.TryPromoteRecvBuffer(socket));
+            Assert.True(ring.RefusedRegistrations > refusedAfterFirst);
+        }
+        finally
+        {
+            client?.Close();
+            for (var i = 0; i < 500 && manager.ConnectedCount > 0; i++)
+            {
+                manager.ProcessCompletions(events);
+                manager.Submit();
+                Thread.Sleep(5);
+            }
+
+            manager.ProcessCompletions(events);
+            ring.CloseListener(listener);
+        }
+    }
 }
