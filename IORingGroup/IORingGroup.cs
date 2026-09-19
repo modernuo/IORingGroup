@@ -34,7 +34,9 @@ public static class IORingGroup
     /// <paramref name="maxConnections"/>: both of a manager's base pools at the default
     /// <c>maxBufferSlabs</c>. A manager configured for send buffer growth, or for a different
     /// <c>maxBufferSlabs</c>, needs the value from
-    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int)"/> instead.
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int, int, int)"/> instead.
+    /// A manager configured with initial pools needs the same overload, with the initial sizes
+    /// passed, since this default covers only the base pools.
     /// </param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>

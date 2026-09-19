@@ -41,8 +41,9 @@ public interface IIORingGroup : IDisposable
     /// pool up, so it is not always exactly twice the connection count.
     /// 0 means unknown, the default for implementations outside this package.
     /// <see cref="RingSocketManager"/> then skips its cross-check against
-    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int)"/>, failing at
-    /// first registration instead.
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int, int, int)"/>, failing at
+    /// first registration instead. A manager configured with initial pools needs that overload's
+    /// table computed with the initial sizes passed, since this default covers only the base pools.
     /// </remarks>
     int MaxRegisteredBuffers => 0;
 

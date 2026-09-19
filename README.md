@@ -195,13 +195,33 @@ A growth is refused when the tier has no free buffer and its next slab would not
 
 Worst-case tier memory is exactly `sendBufferGrowthBudget`. Both base pools are bounded by `maxSockets`, since a socket holds exactly one buffer from each: with `slabSize = RingSocketManager.BasePoolSlabSize(maxSockets, maxBufferSlabs)` — `max(16, maxSockets / maxBufferSlabs)` — each pool tops out at `maxSockets` rounded up to a whole slab, `RingSocketManager.BasePoolSlabCount(maxSockets, maxBufferSlabs)` of them. `maxBufferSlabs` sets the slab *size*, not a ceiling on connections, so every socket slot is usable.
 
-`IORingGroup.Create(maxConnections: n)` with `maxRegisteredBuffers: 0` sizes its table from that same rule — `RingSocketManager.RequiredRegisteredBuffers(n)`, the no-growth overload — so `Create(maxConnections: n)` paired with `new RingSocketManager(ring, n)` always composes. That is a little more than `n × 2` whenever the slab does not divide `n` (1000 sockets need 2016). Pass the full `RequiredRegisteredBuffers(maxSockets, sendBufferSize, maxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs)` when the manager enables growth or uses a non-default `maxBufferSlabs`.
+`IORingGroup.Create(maxConnections: n)` with `maxRegisteredBuffers: 0` sizes its table from that same rule — `RingSocketManager.RequiredRegisteredBuffers(n)`, the no-growth overload — so `Create(maxConnections: n)` paired with `new RingSocketManager(ring, n)` always composes. That is a little more than `n × 2` whenever the slab does not divide `n` (1000 sockets need 2016). Pass the full `RequiredRegisteredBuffers(maxSockets, sendBufferSize, maxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs, initialRecvBufferSize, initialSendBufferSize)` when the manager enables growth, uses a non-default `maxBufferSlabs`, or turns on the initial pools below.
 
 #### Base pools grow and shrink with the population
 
 Each base pool starts at `initialBufferSlabs` slabs (default 1), adds a slab when the live one runs out, and gives a fully idle top slab back on a `Maintain()` call whose retention floor has decayed below the remaining capacity — never below `initialBufferSlabs`. At `maxSockets: 4096`, `maxBufferSlabs: 128`, a 64 KiB recv buffer and a 256 KiB send buffer, that is a 32-buffer slab per pool: 2 MiB + 8 MiB resident at boot, against the 96 MiB the previous defaults allocated up front and the 1.25 GiB the full set of base buffers costs at 4096 connections.
 
 Idle capacity comes back one slab per `Maintain()` call, and only from the top. Buffers are handed out from the lowest slab that has one free, so ordinary churn drains the newest slabs first and those are the ones that go; a long-lived connection holding a buffer in the top slab pins every slab beneath it until it disconnects. Expect the decay after `sendBufferRetentionWindows` quiet windows when the newest slabs are free, not as a guarantee.
+
+#### Initial pools: small buffers until the consumer promotes
+
+`initialRecvBufferSize` and `initialSendBufferSize` (default 0, off) give every new socket a small
+buffer from a third and fourth pool instead of a base one. The consumer calls
+`TryPromoteSendBuffer(socket)` and `TryPromoteRecvBuffer(socket)` when the connection has earned a
+full-size buffer — after credentials verify, for a game server — and the socket moves to the base
+pools. Nothing demotes. The point is resource exhaustion: an unauthenticated flood can fill the
+initial pools (at `maxSockets: 4096` and 4 KiB buffers, 32 MiB) but never touches the base pools.
+
+Send promotion is the growth swap without the budget: queued bytes copy across, bytes in flight
+retire with the old buffer, and `TryGrowSendBuffer` promotes first if the consumer never asked.
+Recv promotion is applied at the next recv completion, because a recv is armed against the current
+buffer almost always; the swap happens before that completion's `DataReceived` event, every
+readable byte moves across, and the next recv arms on the new buffer. Read `socket.RecvBuffer` per
+event rather than caching it.
+
+The smallest usable size is `IORingBuffer.MinimumSize`: the page size, except on the Windows legacy
+(pre-1803) path, where it is the 64 KiB allocation granularity. Both initial pools use the base slab
+rule and count in `RequiredRegisteredBuffers(...)` — pass the initial sizes there too.
 
 ## Threading Model
 

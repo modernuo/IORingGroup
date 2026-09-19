@@ -1066,4 +1066,44 @@ public class RingSocketManagerGrowthTests : IDisposable
 
         ring.CloseListener(listener);
     }
+
+    [Fact]
+    public void RecvBuffer_NeverChanges_WithoutAnInitialPool()
+    {
+        // There is no recv tier ladder: a socket keeps the recv buffer it was created with for its
+        // whole life, and the pool is bounded by maxSockets rounded to a slab.
+        Assert.Equal(0, _manager.InitialRecvBufferSize);
+        Assert.Equal(
+            RingSocketManager.BasePoolSlabCount(64, 4) * RingSocketManager.BasePoolSlabSize(64, 4),
+            _manager.RecvBufferPool.MaxSlabs * _manager.RecvBufferPool.SlabSize
+        );
+
+        var socket = Accept(out var client);
+        var recv = socket.RecvBuffer;
+        Assert.Equal(Base, recv.PhysicalSize);
+        Assert.False(_manager.TryPromoteRecvBuffer(socket));
+
+        client.Send(Pattern(512, 1));
+        for (var i = 0; i < 200 && socket.RecvBuffer.ReadableBytes < 512; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(1);
+        }
+
+        Assert.True(_manager.TryGrowSendBuffer(socket));
+        WaitForDrain(socket);
+        Assert.True(_manager.TryShrinkSendBuffer(socket));
+
+        Assert.Same(recv, socket.RecvBuffer);
+        Assert.Equal(512, socket.RecvBuffer.ReadableBytes);
+
+        client.Close();
+        while (_manager.ConnectedCount > 0)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(10);
+        }
+    }
 }

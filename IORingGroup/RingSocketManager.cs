@@ -1397,7 +1397,9 @@ public sealed class RingSocketManager : IDisposable
 
         if (!TryAcquireLazy(_recvBufferPool, out var next))
         {
-            return false; // Stays on the initial buffer; the deferred path retries at the next completion
+            // Stays on the initial buffer: the deferred path retries at the next completion, the
+            // immediate path reports false so the caller can retry.
+            return false;
         }
 
         var readable = socket.RecvBuffer.GetReadSpan();
@@ -1416,8 +1418,9 @@ public sealed class RingSocketManager : IDisposable
     /// socket still on its initial buffer is promoted to base instead, as a safety net for a
     /// consumer that never asked.
     /// </summary>
-    /// <returns>False if the socket is closing, already at the largest tier, or no buffer is available
-    /// within the growth budget; the socket keeps its current buffer.</returns>
+    /// <returns>False if the socket is closing, already at the largest tier, no buffer is available
+    /// within the growth budget, or promotion was tried first and the base pool could not supply a
+    /// buffer; the socket keeps its current buffer.</returns>
     public bool TryGrowSendBuffer(RingSocket socket)
     {
         if (!socket.Connected || socket.DisconnectPending)
