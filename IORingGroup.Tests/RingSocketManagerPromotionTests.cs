@@ -167,6 +167,28 @@ public class RingSocketManagerPromotionTests : IDisposable
         Assert.Equal(0, _manager.ConnectedCount);
     }
 
+    /// <summary>Closes every client, then pumps until the manager has released every slot and buffer.</summary>
+    private void CloseAllAndReap(List<Socket> clients)
+    {
+        for (var i = 0; i < clients.Count; i++)
+        {
+            clients[i].Close();
+        }
+
+        clients.Clear();
+
+        for (var i = 0; i < 500 && _manager.ConnectedCount > 0; i++)
+        {
+            _manager.ProcessCompletions(_events);
+            _manager.Submit();
+            Thread.Sleep(5);
+        }
+
+        // Retired buffers go back on the pass after their Disconnected event
+        _manager.ProcessCompletions(_events);
+        Assert.Equal(0, _manager.ConnectedCount);
+    }
+
     [Fact]
     public void Constructor_RejectsAnInitialSizeNotBelowBase()
     {
@@ -230,10 +252,7 @@ public class RingSocketManagerPromotionTests : IDisposable
         var expected = 2L * 16 * Base + 2L * 2 * 16 * Initial;
         Assert.Equal(expected, _manager.Maintain().BaseCapacityBytes);
 
-        for (var i = 0; i < clients.Count; i++)
-        {
-            CloseAndReap(clients[i]);
-        }
+        CloseAllAndReap(clients);
 
         _manager.Maintain(); // window records the 17 that were live
         var trimmed = _manager.Maintain(); // peak 0: the top slab of each initial pool goes back
