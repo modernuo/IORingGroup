@@ -348,6 +348,43 @@ public class RingSocketManagerPromotionTests : IDisposable
     }
 
     [Fact]
+    public void Grow_WhileTheInitialBufferIsRetiring_ReleasesTheBaseBufferAndKeepsTheRetiringOne()
+    {
+        var socket = Accept(out var client);
+        var first = Pattern(512, 1);
+        Write(socket, first);
+        _manager.ProcessSendQueue();
+        _manager.Submit(); // in flight from the initial buffer
+        var initial = socket.SendBuffer;
+
+        Assert.True(_manager.TryPromoteSendBuffer(socket));
+        Assert.Same(initial, socket.RetiringSendBuffer);
+        var baseBuffer = socket.SendBuffer;
+
+        var queued = Pattern(1024, 2);
+        Write(socket, queued); // sendable on base, never posted: base has nothing in flight
+
+        Assert.True(_manager.TryGrowSendBuffer(socket)); // base -> first tier while the initial buffer still retires
+
+        Assert.Equal(2 * Base, socket.SendBuffer.PhysicalSize);
+        Assert.Same(initial, socket.RetiringSendBuffer); // the single retiring slot is untouched
+        Assert.NotSame(baseBuffer, socket.SendBuffer);
+        Assert.Equal(0, _manager.SendBufferPool.InUse); // the base buffer went straight back
+        Assert.Equal(queued.Length, socket.SendBuffer.ReadableBytes);
+
+        var expected = new byte[first.Length + queued.Length];
+        first.CopyTo(expected, 0);
+        queued.CopyTo(expected, first.Length);
+        Assert.Equal(expected, ReadAll(client, expected.Length));
+
+        WaitForDrain(socket);
+        Assert.Null(socket.RetiringSendBuffer);
+        Assert.Equal(0, _manager.InitialSendPool!.InUse);
+
+        CloseAndReap(client);
+    }
+
+    [Fact]
     public void Shrink_ReturnsToBase_NeverToInitial()
     {
         var socket = Accept(out var client);
