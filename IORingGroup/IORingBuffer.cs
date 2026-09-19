@@ -146,7 +146,7 @@ public sealed partial class IORingBuffer : IDisposable
     /// <summary>
     /// Creates a new double-mapped circular buffer.
     /// </summary>
-    /// <param name="physicalSize">Physical size in bytes. Must be a power of 2 and a multiple of the platform allocation granularity (64 KB on Windows, the page size on Unix).</param>
+    /// <param name="physicalSize">Physical size in bytes. Must be a power of 2 and a multiple of <see cref="MinimumSize"/> for this platform and Windows path.</param>
     /// <returns>A new IORingBuffer instance.</returns>
     public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
 
@@ -178,18 +178,13 @@ public sealed partial class IORingBuffer : IDisposable
             throw new ArgumentException("Size must be a power of 2", paramName);
         }
 
-        // Windows places the second mapping at an offset of physicalSize and requires both the
-        // base address and the offset to be aligned to the 64 KB allocation granularity, not just
-        // the page size. Unix mappings only need page alignment. physicalSize is already validated
-        // as a power of 2, so on Windows this is effectively a 64 KB minimum-size check.
-        var alignment = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? 65536
-            : Environment.SystemPageSize;
-
+        // Both views are page mappings; the legacy Windows path alone needs allocation granularity.
+        // physicalSize is already a power of two, so this is a minimum-size check.
+        var alignment = MinimumSize;
         if (physicalSize % alignment != 0)
         {
             throw new ArgumentException(
-                $"Size must be a multiple of the allocation granularity ({alignment} bytes on this platform)",
+                $"Size must be a multiple of {alignment} bytes (the platform minimum buffer size)",
                 paramName
             );
         }
@@ -351,6 +346,20 @@ public sealed partial class IORingBuffer : IDisposable
     }
 
     #region Windows Implementation
+
+    private const int WindowsAllocationGranularity = 65536;
+
+    /// <summary>
+    /// Smallest size <see cref="Create(int)"/> accepts on this platform: the page size, except on the
+    /// Windows legacy path (Server 2012/2016), where MapViewOfFileEx places the second view at an
+    /// explicit address that must sit on the 64 KiB allocation granularity. The placeholder path
+    /// (Windows 10 1803 / Server 2019+) splits and maps at page granularity; a sub-granularity
+    /// reservation still occupies a 64 KiB granule of address space, but commits and pins only its pages.
+    /// </summary>
+    public static int MinimumSize =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && (ForceLegacyWindowsPath ?? !UsePlaceholderApi)
+            ? WindowsAllocationGranularity
+            : Environment.SystemPageSize;
 
     // VirtualAlloc2 and MapViewOfFile3 (and the MEM_*_PLACEHOLDER flags) are exported from
     // kernelbase.dll starting with Windows 10 1803 / Windows Server 2019. They are absent on

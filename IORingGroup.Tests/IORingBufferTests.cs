@@ -33,13 +33,42 @@ public class IORingBufferTests
     }
 
     [SkippableFact]
-    public void Create_BelowWindowsAllocationGranularity_ThrowsOnWindows()
+    public void PlaceholderPath_DoubleMapsASinglePage_OnWindows()
     {
         Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
-        // 32 KB is a page-aligned power of 2 but below the 64 KB Windows allocation
-        // granularity, so the second view could not be placed at offset physicalSize.
-        // This must fail fast with ArgumentException, not fault inside the mapping call.
-        Assert.Throws<ArgumentException>(() => IORingBuffer.Create(32768));
+        // A box without VirtualAlloc2/MapViewOfFile3 reports the legacy floor; nothing to prove there
+        Skip.If(IORingBuffer.MinimumSize != Environment.SystemPageSize);
+
+        // The placeholder split and the second view are page-granular: a sub-64 KiB buffer's mirror
+        // lands at +physicalSize, not at the next allocation-granularity boundary.
+        using var buffer = IORingBuffer.Create(Environment.SystemPageSize);
+        AssertWrapRoundTrips(buffer);
+    }
+
+    [SkippableFact]
+    public void LegacyPath_FloorIsTheAllocationGranularity_OnWindows()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+
+        // MapViewOfFileEx places the second view at an explicit address, and that address must sit
+        // on the 64 KiB allocation granularity, so the legacy path cannot go below it.
+        IORingBuffer.ForceLegacyWindowsPath = true;
+        try
+        {
+            Assert.Equal(Granularity, IORingBuffer.MinimumSize);
+            Assert.Throws<ArgumentException>(() => IORingBuffer.Create(32768));
+        }
+        finally
+        {
+            IORingBuffer.ForceLegacyWindowsPath = null;
+        }
+    }
+
+    [SkippableFact]
+    public void MinimumSize_IsThePageSize_OffWindows()
+    {
+        Skip.If(RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+        Assert.Equal(Environment.SystemPageSize, IORingBuffer.MinimumSize);
     }
 
     [Fact]
