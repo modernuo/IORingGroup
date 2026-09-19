@@ -602,4 +602,107 @@ public class RingSocketManagerPromotionTests : IDisposable
             ring.CloseListener(listener);
         }
     }
+
+    [Fact]
+    public void PromoteRecv_DeferredApplyThatFails_OnAFillingCompletion_CanBeRetriedAndSucceeds()
+    {
+        var registered = RingSocketManager.RequiredRegisteredBuffers(8, Base, Base, 0, 2, Initial, Initial);
+        using var ring = new FailingRegistrationRing(
+            System.Network.IORingGroup.Create(queueSize: 64, maxConnections: 8, maxRegisteredBuffers: registered)
+        );
+        using var manager = new RingSocketManager(
+            ring, maxSockets: 8, recvBufferSize: Base, sendBufferSize: Base,
+            initialBufferSlabs: 0, maxBufferSlabs: 2,
+            initialRecvBufferSize: Initial, initialSendBufferSize: Initial
+        );
+
+        var port = 27000 + Random.Shared.Next(1000);
+        var listener = ring.CreateListener("127.0.0.1", (ushort)port, 4);
+        var events = new RingSocketEvent[16];
+        Socket? client = null;
+
+        try
+        {
+            client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client.Connect(IPAddress.Loopback, port);
+            ring.PrepareAccept(listener, 0, 0, IORingUserData.EncodeAccept());
+            ring.Submit();
+
+            var completions = new Completion[1];
+            nint handle = -1;
+            for (var i = 0; i < 200 && handle <= 0; i++)
+            {
+                if (ring.PeekCompletions(completions) > 0)
+                {
+                    ring.AdvanceCompletionQueue(1);
+                    handle = completions[0].Result;
+                }
+                else
+                {
+                    Thread.Sleep(5);
+                }
+            }
+
+            Assert.True(handle > 0);
+            ring.ConfigureSocket(handle);
+            var socket = manager.CreateSocket(handle)!;
+            manager.Submit();
+
+            var first = Pattern(16, 1);
+            client.Send(first);
+            for (var i = 0; i < 500 && socket.RecvBuffer.ReadableBytes < first.Length; i++)
+            {
+                manager.ProcessCompletions(events);
+                manager.Submit();
+                Thread.Sleep(1);
+            }
+
+            Assert.True(socket.RecvPending); // armed against the initial buffer
+            Assert.True(manager.TryPromoteRecvBuffer(socket)); // deferred
+            Assert.True(socket.RecvPromotionPending);
+
+            // The next completion fills the buffer, and the base slab cannot be created at that moment
+            ring.FailRegistrationsAfter(0);
+            var capacity = Initial - 1;
+            var rest = Pattern(capacity - first.Length, 2);
+            client.Send(rest);
+            for (var i = 0; i < 500 && socket.RecvBuffer.ReadableBytes < capacity; i++)
+            {
+                manager.ProcessCompletions(events);
+                manager.Submit();
+                Thread.Sleep(1);
+            }
+
+            Assert.Equal(capacity, socket.RecvBuffer.ReadableBytes);
+            Assert.Equal(Initial, socket.RecvBuffer.PhysicalSize); // apply failed
+            Assert.True(socket.RecvPromotionPending);
+            Assert.False(socket.RecvPending); // nothing armed: no completion will retry
+
+            // The caller's retry is honored, not refused; once the ring accepts registrations it succeeds
+            ring.FailRegistrationsAfter(int.MaxValue);
+            Assert.True(manager.TryPromoteRecvBuffer(socket));
+            Assert.Equal(Base, socket.RecvBuffer.PhysicalSize);
+            Assert.False(socket.RecvPromotionPending);
+            Assert.True(socket.RecvPending); // re-armed on the new buffer
+            manager.Submit();
+
+            var expected = new byte[capacity];
+            first.CopyTo(expected, 0);
+            rest.CopyTo(expected, first.Length);
+            Assert.Equal(expected, socket.RecvBuffer.GetReadSpan().ToArray());
+        }
+        finally
+        {
+            client?.Close();
+            for (var i = 0; i < 500 && manager.ConnectedCount > 0; i++)
+            {
+                manager.ProcessCompletions(events);
+                manager.Submit();
+                Thread.Sleep(5);
+            }
+
+            manager.ProcessCompletions(events);
+            ring.CloseListener(listener);
+        }
+    }
 }

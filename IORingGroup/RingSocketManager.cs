@@ -1358,12 +1358,20 @@ public sealed class RingSocketManager : IDisposable
     /// <returns>
     /// True once the promotion is requested (a recv is armed; it applies at the next completion,
     /// retrying there if the base pool cannot supply) or already applied. False if the socket is not
-    /// on an initial buffer, is closing, a promotion is already pending, or - with nothing armed -
-    /// the base pool could not supply a buffer, in which case the caller may call again.
+    /// on an initial buffer, is closing, a promotion is already pending with a recv armed, or - with
+    /// nothing armed - the base pool could not supply a buffer, in which case the caller may call
+    /// again. A pending promotion with nothing armed is applied by this call instead of refused.
     /// </returns>
     public bool TryPromoteRecvBuffer(RingSocket socket)
     {
-        if (!OnInitialRecvBuffer(socket) || !socket.Connected || socket.DisconnectPending || socket.RecvPromotionPending)
+        if (!OnInitialRecvBuffer(socket) || !socket.Connected || socket.DisconnectPending)
+        {
+            return false;
+        }
+
+        // A pending promotion with a recv armed applies at that recv's completion; asking again
+        // changes nothing. With nothing armed there is no completion to wait for, so apply it now.
+        if (socket.RecvPromotionPending && socket.RecvPending)
         {
             return false;
         }
