@@ -591,6 +591,34 @@ public class RingSocketManagerPromotionTests : IDisposable
     }
 
     [Fact]
+    public void ResumeReceive_RearmsAfterTheConsumerDrainsAFullBuffer()
+    {
+        var socket = Accept(out var client);
+        var capacity = Initial - 1;
+        var fill = Pattern(capacity, 1);
+        client.Send(fill);
+        PumpUntilReadable(socket, capacity);
+        Assert.False(socket.RecvPending); // full: nothing armed
+
+        socket.RecvBuffer.CommitRead(capacity); // the consumer took everything
+        Assert.False(socket.RecvPending); // reading alone arms nothing
+
+        socket.ResumeReceive();
+        Assert.True(socket.RecvPending);
+        _manager.Submit();
+
+        var more = Pattern(64, 2);
+        client.Send(more);
+        PumpUntilReadable(socket, more.Length);
+        Assert.Equal(more, socket.RecvBuffer.GetReadSpan().ToArray());
+
+        // No-ops: already armed; and after disconnect
+        socket.ResumeReceive();
+        Assert.True(socket.RecvPending);
+        CloseAndReap(client);
+    }
+
+    [Fact]
     public void Disconnect_WithAPromotionPending_ReleasesTheInitialBuffer()
     {
         var socket = Accept(out var client);

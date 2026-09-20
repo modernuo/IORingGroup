@@ -947,6 +947,17 @@ public sealed class RingSocketManager : IDisposable
         socket.RecvPending = true;
     }
 
+    /// <summary>Re-arms a receive for a socket whose consumer has freed buffer space; see <see cref="RingSocket.ResumeReceive"/>.</summary>
+    internal void ResumeReceive(RingSocket socket)
+    {
+        if (socket.RecvPending || !socket.Connected || socket.DisconnectPending || socket.Aborting)
+        {
+            return;
+        }
+
+        PostRecv(socket);
+    }
+
     /// <summary>
     /// Maximum sends in flight per socket, taken from the ring so it can never exceed what the
     /// platform reserved at request-queue creation.

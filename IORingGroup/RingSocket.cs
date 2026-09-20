@@ -217,6 +217,14 @@ public sealed class RingSocket
     }
 
     /// <summary>
+    /// Arms a receive if none is armed and the buffer has free space. A completion that fills the
+    /// buffer arms nothing, so a consumer that then reads from <see cref="RecvBuffer"/> calls this
+    /// once it has freed space; a no-op while a receive is armed, the buffer is full, or the socket
+    /// is closing. Must be called from the ring's processing thread.
+    /// </summary>
+    public void ResumeReceive() => _manager.ResumeReceive(this);
+
+    /// <summary>
     /// Requests a graceful disconnect. The socket will be closed after all
     /// in-flight I/O operations complete, ensuring buffer safety.
     /// Must be called from the ring's processing thread.
