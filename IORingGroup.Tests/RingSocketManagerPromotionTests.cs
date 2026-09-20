@@ -573,11 +573,11 @@ public class RingSocketManagerPromotionTests : IDisposable
     }
 
     [Fact]
-    public void PromoteRecv_IsANoOpOncePromoted_AndRefusedWhileClosing()
+    public void PromoteRecv_ReportsAPendingRequestAsTrue_AndRefusesOncePromotedOrClosing()
     {
         var socket = Accept(out var client);
         Assert.True(_manager.TryPromoteRecvBuffer(socket));
-        Assert.False(_manager.TryPromoteRecvBuffer(socket)); // already pending
+        Assert.True(_manager.TryPromoteRecvBuffer(socket)); // already pending
         client.Send(Pattern(8, 1));
         PumpUntilReadable(socket, 8);
         Assert.Equal(Base, socket.RecvBuffer.PhysicalSize);
