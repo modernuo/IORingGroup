@@ -81,8 +81,10 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
             throw new ArgumentException("Queue size must be a power of 2", nameof(queueSize));
         }
 
-        // Default: one recv + one send buffer per connection
-        _maxExternalBuffers = maxRegisteredBuffers > 0 ? maxRegisteredBuffers : maxConnections * 2;
+        // Default: what RingSocketManager's base pools hand out at the default maxBufferSlabs
+        _maxExternalBuffers = maxRegisteredBuffers > 0
+            ? maxRegisteredBuffers
+            : RingSocketManager.RequiredRegisteredBuffers(maxConnections);
         _externalBufferPtrs = new nint[_maxExternalBuffers];
         _externalBufferLengths = new int[_maxExternalBuffers];
 
@@ -638,7 +640,7 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // =============================================================================
 
     // External buffer tracking (similar to Windows RIO)
-    // Size = maxConnections * 2 for recv + send buffer per connection
+    // Size = RingSocketManager.RequiredRegisteredBuffers(maxConnections) unless the caller overrides it
     private readonly int _maxExternalBuffers;
     private readonly nint[] _externalBufferPtrs;
     private readonly int[] _externalBufferLengths;

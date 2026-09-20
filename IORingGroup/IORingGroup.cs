@@ -25,13 +25,18 @@ public static class IORingGroup
     /// </summary>
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
     /// <param name="maxConnections">
-    /// Maximum concurrent connections; also the default registration table size
-    /// (<c>maxConnections * 2</c>) when <paramref name="maxRegisteredBuffers"/> is 0.
+    /// Maximum concurrent connections; also sizes the default registration table when
+    /// <paramref name="maxRegisteredBuffers"/> is 0.
     /// </param>
     /// <param name="maxRegisteredBuffers">
-    /// Size of the buffer registration table. 0 (default) means <c>maxConnections * 2</c>.
-    /// <see cref="RingSocketManager.RequiredRegisteredBuffers"/> computes the larger size a
-    /// <see cref="RingSocketManager"/> configuration needs.
+    /// Size of the buffer registration table. 0 (default) means
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int)"/> for
+    /// <paramref name="maxConnections"/>: both of a manager's base pools at the default
+    /// <c>maxBufferSlabs</c>. A manager configured for send buffer growth, or for a different
+    /// <c>maxBufferSlabs</c>, needs the value from
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int, int, long, int, int, int)"/> instead.
+    /// A manager configured with initial pools needs the same overload, with the initial sizes
+    /// passed, since this default covers only the base pools.
     /// </param>
     /// <returns>Platform-specific IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if the current platform is not supported.</exception>
@@ -87,7 +92,8 @@ public static class IORingGroup
     /// <param name="queueSize">Size of the submission and completion queues. Must be power of 2.</param>
     /// <param name="maxConnections">Maximum concurrent connections.</param>
     /// <param name="maxRegisteredBuffers">
-    /// Size of the buffer registration table. 0 (default) means <c>maxConnections * 2</c>.
+    /// Size of the buffer registration table. 0 (default) means
+    /// <see cref="RingSocketManager.RequiredRegisteredBuffers(int, int)"/> for <paramref name="maxConnections"/>.
     /// </param>
     /// <returns>Epoll-based IIORingGroup implementation.</returns>
     /// <exception cref="PlatformNotSupportedException">Thrown if not running on Linux.</exception>

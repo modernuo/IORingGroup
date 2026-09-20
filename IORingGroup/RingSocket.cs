@@ -47,8 +47,9 @@ public sealed class RingSocket
     /// <summary>
     /// Gets the receive buffer for incoming data.
     /// Data arrives here after recv completions.
+    /// Replaced by the manager when the socket is promoted from its initial buffer; read it per event.
     /// </summary>
-    public IORingBuffer RecvBuffer { get; }
+    public IORingBuffer RecvBuffer { get; internal set; }
 
     /// <summary>
     /// Gets the send buffer for outgoing data.
@@ -77,6 +78,11 @@ public sealed class RingSocket
     /// Gets whether a recv operation is currently in-flight.
     /// </summary>
     internal bool RecvPending { get; set; }
+
+    /// <summary>
+    /// A recv promotion was requested while a recv was armed; the manager applies it at the next completion.
+    /// </summary>
+    internal bool RecvPromotionPending { get; set; }
 
     /// <summary>
     /// Gets whether any send operation is currently in-flight.
@@ -209,6 +215,14 @@ public sealed class RingSocket
 
         _manager.QueueSend(this);
     }
+
+    /// <summary>
+    /// Arms a receive if none is armed and the buffer has free space. A completion that fills the
+    /// buffer arms nothing, so a consumer that then reads from <see cref="RecvBuffer"/> calls this
+    /// once it has freed space; a no-op while a receive is armed, the buffer is full, or the socket
+    /// is closing. Must be called from the ring's processing thread.
+    /// </summary>
+    public void ResumeReceive() => _manager.ResumeReceive(this);
 
     /// <summary>
     /// Requests a graceful disconnect. The socket will be closed after all

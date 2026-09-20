@@ -146,41 +146,56 @@ public sealed partial class IORingBuffer : IDisposable
     /// <summary>
     /// Creates a new double-mapped circular buffer.
     /// </summary>
-    /// <param name="physicalSize">Physical size in bytes. Must be a power of 2 and a multiple of the platform allocation granularity (64 KB on Windows, the page size on Unix).</param>
+    /// <param name="physicalSize">Physical size in bytes. Must be a power of 2 and a multiple of <see cref="MinimumSize"/> for this platform and Windows path.</param>
     /// <returns>A new IORingBuffer instance.</returns>
     public static IORingBuffer Create(int physicalSize) => Create(physicalSize, isPooled: false, poolIndex: -1);
+
+    /// <summary>
+    /// Throws if <paramref name="physicalSize"/> is not a buffer size this platform can double-map.
+    /// Callers that allocate lazily validate up front so a bad size fails where it was configured.
+    /// </summary>
+    /// <param name="physicalSize">Physical size in bytes.</param>
+    /// <param name="paramName">Name reported by the exception; defaults to the caller's argument.</param>
+    public static void ValidateSize(int physicalSize, [CallerArgumentExpression(nameof(physicalSize))] string? paramName = null)
+    {
+        if (physicalSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(paramName, "Size must be positive");
+        }
+
+        // Every platform reserves twice this; a size that does not survive the doubling would wrap
+        if (physicalSize > int.MaxValue / 2)
+        {
+            throw new ArgumentOutOfRangeException(
+                paramName,
+                $"Size must not exceed {int.MaxValue / 2} bytes, since the double mapping reserves twice it"
+            );
+        }
+
+        // Verify power of 2
+        if ((physicalSize & (physicalSize - 1)) != 0)
+        {
+            throw new ArgumentException("Size must be a power of 2", paramName);
+        }
+
+        // Both views are page mappings; the legacy Windows path alone needs allocation granularity.
+        // physicalSize is already a power of two, so this is a minimum-size check.
+        var alignment = MinimumSize;
+        if (physicalSize % alignment != 0)
+        {
+            throw new ArgumentException(
+                $"Size must be a multiple of {alignment} bytes (the platform minimum buffer size)",
+                paramName
+            );
+        }
+    }
 
     /// <summary>
     /// Creates a new double-mapped circular buffer with pool tracking.
     /// </summary>
     internal static IORingBuffer Create(int physicalSize, bool isPooled, int poolIndex)
     {
-        if (physicalSize <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(physicalSize), "Size must be positive");
-        }
-
-        // Verify power of 2
-        if ((physicalSize & (physicalSize - 1)) != 0)
-        {
-            throw new ArgumentException("Size must be a power of 2", nameof(physicalSize));
-        }
-
-        // Windows places the second mapping at an offset of physicalSize and requires both the
-        // base address and the offset to be aligned to the 64 KB allocation granularity, not just
-        // the page size. Unix mappings only need page alignment. physicalSize is already validated
-        // as a power of 2, so on Windows this is effectively a 64 KB minimum-size check.
-        var alignment = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? 65536
-            : Environment.SystemPageSize;
-
-        if (physicalSize % alignment != 0)
-        {
-            throw new ArgumentException(
-                $"Size must be a multiple of the allocation granularity ({alignment} bytes on this platform)",
-                nameof(physicalSize)
-            );
-        }
+        ValidateSize(physicalSize);
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -332,6 +347,20 @@ public sealed partial class IORingBuffer : IDisposable
 
     #region Windows Implementation
 
+    private const int WindowsAllocationGranularity = 65536;
+
+    /// <summary>
+    /// Smallest size <see cref="Create(int)"/> accepts on this platform: the page size, except on the
+    /// Windows legacy path (Server 2012/2016), where MapViewOfFileEx places the second view at an
+    /// explicit address that must sit on the 64 KiB allocation granularity. The placeholder path
+    /// (Windows 10 1803 / Server 2019+) splits and maps at page granularity; a sub-granularity
+    /// reservation still occupies a 64 KiB granule of address space, but commits and pins only its pages.
+    /// </summary>
+    public static int MinimumSize =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && (ForceLegacyWindowsPath ?? !UsePlaceholderApi)
+            ? WindowsAllocationGranularity
+            : Environment.SystemPageSize;
+
     // VirtualAlloc2 and MapViewOfFile3 (and the MEM_*_PLACEHOLDER flags) are exported from
     // kernelbase.dll starting with Windows 10 1803 / Windows Server 2019. They are absent on
     // Windows Server 2012, 2012 R2, and 2016. Resolve availability once so the hot path stays a
@@ -459,7 +488,9 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == nint.Zero)
         {
+            // Unmapping the first view frees its half; the second half is still a placeholder
             WindowsNative.UnmapViewOfFile(buffer);
+            WindowsNative.VirtualFree(region + physicalSize, 0, WindowsNative.MEM_RELEASE);
             WindowsNative.CloseHandle(handle);
             throw new InvalidOperationException($"MapViewOfFile3 (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -633,7 +664,7 @@ public sealed partial class IORingBuffer : IDisposable
         // Reserve virtual address space for both mappings
         var region = LinuxNative.mmap(
             nint.Zero,
-            (nuint)(physicalSize * 2),
+            (nuint)((long)physicalSize * 2),
             LinuxNative.PROT_NONE,
             LinuxNative.MAP_PRIVATE | LinuxNative.MAP_ANONYMOUS,
             -1,
@@ -658,7 +689,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (buffer == LinuxNative.MAP_FAILED)
         {
-            LinuxNative.munmap(region, (nuint)(physicalSize * 2));
+            LinuxNative.munmap(region, (nuint)((long)physicalSize * 2));
             LinuxNative.close(fd);
             throw new InvalidOperationException($"mmap (first) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -675,7 +706,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == LinuxNative.MAP_FAILED)
         {
-            LinuxNative.munmap(region, (nuint)(physicalSize * 2));
+            LinuxNative.munmap(region, (nuint)((long)physicalSize * 2));
             LinuxNative.close(fd);
             throw new InvalidOperationException($"mmap (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -744,7 +775,7 @@ public sealed partial class IORingBuffer : IDisposable
         // Reserve virtual address space for both mappings
         var region = BsdNative.mmap(
             nint.Zero,
-            (nuint)(physicalSize * 2),
+            (nuint)((long)physicalSize * 2),
             BsdNative.PROT_NONE,
             BsdNative.MAP_PRIVATE | BsdNative.MAP_ANON,
             -1,
@@ -769,7 +800,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (buffer == BsdNative.MAP_FAILED)
         {
-            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.munmap(region, (nuint)((long)physicalSize * 2));
             BsdNative.close(fd);
             throw new InvalidOperationException($"mmap (first) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -786,7 +817,7 @@ public sealed partial class IORingBuffer : IDisposable
 
         if (view2 == BsdNative.MAP_FAILED)
         {
-            BsdNative.munmap(region, (nuint)(physicalSize * 2));
+            BsdNative.munmap(region, (nuint)((long)physicalSize * 2));
             BsdNative.close(fd);
             throw new InvalidOperationException($"mmap (second) failed: {Marshal.GetLastPInvokeError()}");
         }
@@ -857,7 +888,7 @@ public sealed partial class IORingBuffer : IDisposable
         {
             if (_buffer != nint.Zero)
             {
-                LinuxNative.munmap(_buffer, (nuint)(_physicalSize * 2));
+                LinuxNative.munmap(_buffer, (nuint)((long)_physicalSize * 2));
             }
 
             if (_handle != nint.Zero)
@@ -870,7 +901,7 @@ public sealed partial class IORingBuffer : IDisposable
         {
             if (_buffer != nint.Zero)
             {
-                BsdNative.munmap(_buffer, (nuint)(_physicalSize * 2));
+                BsdNative.munmap(_buffer, (nuint)((long)_physicalSize * 2));
             }
 
             if (_handle != nint.Zero)

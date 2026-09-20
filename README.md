@@ -102,7 +102,7 @@ ring.CloseListener(listener);
 ```csharp
 using System.Network;
 
-using var ring = IORingGroup.Create();
+using var ring = IORingGroup.Create(maxConnections: 4096);
 using var manager = new RingSocketManager(ring, maxSockets: 4096);
 
 // Set up listener
@@ -175,8 +175,8 @@ using var manager = new RingSocketManager(
 
 - `maxSendBufferSize` is the ceiling a socket can grow to; 0 (the default) means growth is disabled. It must be a power of two, no smaller than `sendBufferSize`, and no larger than 256 MiB.
 - `sendBufferGrowthBudget` caps how many bytes the tier pools may hold in total; a positive value below `RingSocketManager.MinimumSendBufferGrowthBudget(sendBufferSize)` throws, since tier buffers are only ever handed out a slab at a time.
-- `RequiredRegisteredBuffers(...)` computes the registration table size these settings need — pass it as `IORingGroup.Create(maxRegisteredBuffers:)` so the ring and the manager can't drift out of sync. The manager cross-checks the two in its constructor and throws when the ring's table is too small, so a mismatch surfaces at startup instead of at an accept or a growth.
-- Call `manager.Maintain()` about once a minute from the ring thread. It rotates each tier pool's usage window, trims at most one idle slab per tier down to the recent peak, and returns a `SendBufferMaintenance` snapshot (buffers released, growth refusals, tier capacity/usage). Its `TierInUse` and `TierRetainFloor` are buffer *counts* summed across tiers of different sizes; use `manager.GetSendBufferTierStats(tier)` when you need one tier's real numbers.
+- `RequiredRegisteredBuffers(...)` computes the registration table size these settings need — pass it as `IORingGroup.Create(maxRegisteredBuffers:)` so the ring and the manager can't drift out of sync. The manager cross-checks the two in its constructor and throws when the ring's table is too small, so a mismatch surfaces at startup instead of at an accept or a growth. A Windows RIO ring registers at most 65,535 buffers, since a posted operation identifies its buffer with a 16-bit index — roughly 32k sockets at one recv and one send buffer each — and `Create` throws above that rather than let an id narrow into another socket's buffer.
+- Call `manager.Maintain()` about once a minute from the ring thread. It rotates every pool's usage window, trims at most one idle slab per pool down to the recent peak, and returns a `SendBufferMaintenance` snapshot (buffers released, growth refusals, tier capacity/usage, plus `BaseBuffersReleased` and `BaseCapacityBytes` for the two base pools). Its `TierInUse` and `TierRetainFloor` are buffer *counts* summed across tiers of different sizes; use `manager.GetSendBufferTierStats(tier)` when you need one tier's real numbers.
 
 #### Budget per tier, not just in total
 
@@ -193,9 +193,42 @@ A growth is refused when the tier has no free buffer and its next slab would not
 
 #### What bounds memory, and what bounds connections
 
-Worst-case tier memory is exactly `sendBufferGrowthBudget`. The base pools are bounded separately, and not by `maxSockets`: with `slabSize = max(64, maxSockets / maxBufferSlabs)`, the recv pool tops out at `maxBufferSlabs × slabSize` buffers and the base send pool at `maxBufferSlabs × (slabSize / 4)` — a quarter of the recv pool.
+Worst-case tier memory is exactly `sendBufferGrowthBudget`. Both base pools are bounded by `maxSockets`, since a socket holds exactly one buffer from each: with `slabSize = RingSocketManager.BasePoolSlabSize(maxSockets, maxBufferSlabs)` — `max(16, maxSockets / maxBufferSlabs)` — each pool tops out at `maxSockets` rounded up to a whole slab, `RingSocketManager.BasePoolSlabCount(maxSockets, maxBufferSlabs)` of them. `maxBufferSlabs` sets the slab *size*, not a ceiling on connections, so every socket slot is usable.
 
-For large `maxSockets` that quarter, not `maxSockets`, is what actually bounds concurrent connections: the configuration above allows 4096 sockets but only `32 × 32 = 1024` base send buffers (256 MiB of them), and `CreateSocket` returns null once they are all handed out. Raise `maxBufferSlabs`, or size `maxSockets` against the send pool rather than the socket table, if every slot has to be usable at once.
+`IORingGroup.Create(maxConnections: n)` with `maxRegisteredBuffers: 0` sizes its table from that same rule — `RingSocketManager.RequiredRegisteredBuffers(n)`, the no-growth overload — so `Create(maxConnections: n)` paired with `new RingSocketManager(ring, n)` always composes. That is a little more than `n × 2` whenever the slab does not divide `n` (1000 sockets need 2016). Pass the full `RequiredRegisteredBuffers(maxSockets, sendBufferSize, maxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs, initialRecvBufferSize, initialSendBufferSize)` when the manager enables growth, uses a non-default `maxBufferSlabs`, or turns on the initial pools below.
+
+#### Base pools grow and shrink with the population
+
+Each base pool starts at `initialBufferSlabs` slabs (default 1), adds a slab when the live one runs out, and gives a fully idle top slab back on a `Maintain()` call whose retention floor has decayed below the remaining capacity — never below `initialBufferSlabs`. At `maxSockets: 4096`, `maxBufferSlabs: 128`, a 64 KiB recv buffer and a 256 KiB send buffer, that is a 32-buffer slab per pool: 2 MiB + 8 MiB resident at boot, against the 96 MiB the previous defaults allocated up front and the 1.25 GiB the full set of base buffers costs at 4096 connections.
+
+Idle capacity comes back one slab per `Maintain()` call, and only from the top. Buffers are handed out from the lowest slab that has one free, so ordinary churn drains the newest slabs first and those are the ones that go; a long-lived connection holding a buffer in the top slab pins every slab beneath it until it disconnects. Expect the decay after `sendBufferRetentionWindows` quiet windows when the newest slabs are free, not as a guarantee.
+
+#### Initial pools: small buffers until the consumer promotes
+
+`initialRecvBufferSize` and `initialSendBufferSize` (default 0, off) give every new socket a small
+buffer from a third and fourth pool instead of a base one. The consumer calls
+`TryPromoteSendBuffer(socket)` and `TryPromoteRecvBuffer(socket)` when the connection has earned a
+full-size buffer — after credentials verify, for a game server — and the socket moves to the base
+pools. Nothing demotes. The point is resource exhaustion: an unauthenticated flood can fill the
+initial pools (at `maxSockets: 4096` and 4 KiB buffers, 32 MiB) but never touches the base pools.
+
+Send promotion is the growth swap without the budget: queued bytes copy across, bytes in flight
+retire with the old buffer, and `TryGrowSendBuffer` promotes first if the consumer never asked.
+That promote-first path is the consumer's own way into the base pool — gate it on the consumer's
+notion of a verified peer (ModernUO refuses it until credentials verify) or the guarantee above is
+only as strong as the consumer's send path.
+Recv promotion is applied at the next recv completion, because a recv is armed against the current
+buffer almost always; the swap happens before that completion's `DataReceived` event, every
+readable byte moves across, and the next recv arms on the new buffer. Read `socket.RecvBuffer` per
+event rather than caching it.
+
+The smallest usable size is `IORingBuffer.MinimumSize`: the page size, except on the Windows legacy
+(pre-1803) path, where it is the 64 KiB allocation granularity. Both initial pools use the base slab
+rule and count in `RequiredRegisteredBuffers(...)` — pass the initial sizes there too.
+
+A completion that fills a buffer arms no receive; a consumer that reads from `RecvBuffer` outside a
+completion calls `socket.ResumeReceive()` once it has freed space — at 4 KiB a burst of small
+packets can fill the buffer in one completion.
 
 ## Threading Model
 

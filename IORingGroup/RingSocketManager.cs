@@ -2,6 +2,7 @@
 // Copyright (c) 2025, ModernUO
 
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace System.Network;
@@ -146,6 +147,10 @@ public sealed class RingSocketManager : IDisposable
     private readonly IORingBufferPool[] _sendTiers; // index 0 = 2 x base
     private readonly int _maxSockets;
 
+    // Pre-auth pools: a socket starts here when configured and is promoted to base on request
+    private readonly IORingBufferPool? _initialRecvPool;
+    private readonly IORingBufferPool? _initialSendPool;
+
     private int _growthRefusals;
 
     // The budget, not this cap, bounds growth
@@ -153,6 +158,9 @@ public sealed class RingSocketManager : IDisposable
 
     // Slab capped at 8 MiB (floor 4 buffers) so the minimum budget stays sane
     private const int TierSlabByteCap = 8 * 1024 * 1024;
+
+    // A tiny socket table would otherwise land on one-buffer base slabs
+    private const int MinimumBaseSlabSize = 16;
 
     /// <summary>
     /// Hard ceiling on <see cref="MaxSendBufferSize"/>; above this a tier's slab byte count stops fitting the arithmetic that bounds it.
@@ -167,6 +175,18 @@ public sealed class RingSocketManager : IDisposable
 
     /// <summary>Bytes of tier-pool capacity allowed across all tiers.</summary>
     public long SendBufferGrowthBudget { get; }
+
+    /// <summary>Size of the recv buffer a socket starts with, or 0 when sockets start on the base pool.</summary>
+    public int InitialRecvBufferSize { get; }
+
+    /// <summary>Size of the send buffer a socket starts with, or 0 when sockets start on the base pool.</summary>
+    public int InitialSendBufferSize { get; }
+
+    // Test seams
+    internal IORingBufferPool RecvBufferPool => _recvBufferPool;
+    internal IORingBufferPool SendBufferPool => _sendBufferPool;
+    internal IORingBufferPool? InitialRecvPool => _initialRecvPool;
+    internal IORingBufferPool? InitialSendPool => _initialSendPool;
 
     // Socket storage
     private readonly RingSocket?[] _sockets;
@@ -207,10 +227,13 @@ public sealed class RingSocketManager : IDisposable
     /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
     /// <param name="recvBufferSize">Size of each receive buffer (default 64KB).</param>
     /// <param name="sendBufferSize">Size of each send buffer (default 256KB).</param>
-    /// <param name="initialBufferSlabs">Initial buffer pool slabs (default 8).</param>
+    /// <param name="initialBufferSlabs">
+    /// Slabs each base pool allocates up front and never trims below (default 1); the rest arrive a
+    /// slab at a time as connections do.
+    /// </param>
     /// <param name="maxBufferSlabs">
-    /// Upper bound on base pool slabs (default 32); a small <paramref name="maxSockets"/> lowers
-    /// this and <paramref name="initialBufferSlabs"/> to what the sockets can occupy.
+    /// Divisor setting base slab size (default 128): <see cref="BasePoolSlabSize"/> buffers per slab,
+    /// and as many slabs as <paramref name="maxSockets"/> needs.
     /// </param>
     /// <param name="maxSendBufferSize">
     /// Largest send buffer a socket may grow to. 0 (default) means <paramref name="sendBufferSize"/>,
@@ -222,18 +245,34 @@ public sealed class RingSocketManager : IDisposable
     /// value must be at least <see cref="MinimumSendBufferGrowthBudget"/> (one slab).
     /// </param>
     /// <param name="sendBufferRetentionWindows">
-    /// Number of <see cref="Maintain"/> windows a tier pool's peak usage stays in force (default 15).
+    /// Number of <see cref="Maintain"/> windows a pool's peak usage stays in force (default 15).
+    /// </param>
+    /// <param name="initialRecvBufferSize">
+    /// A request for the recv buffer a socket starts with, promoted to <paramref name="recvBufferSize"/>
+    /// by <see cref="TryPromoteRecvBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise
+    /// the request is raised to <see cref="IORingBuffer.MinimumSize"/> and to a power of two; if that
+    /// reaches <paramref name="recvBufferSize"/> the pool is off. The effective size is reported by
+    /// <see cref="InitialRecvBufferSize"/>.
+    /// </param>
+    /// <param name="initialSendBufferSize">
+    /// A request for the send buffer a socket starts with, promoted to <paramref name="sendBufferSize"/>
+    /// by <see cref="TryPromoteSendBuffer"/>. 0 (default) starts sockets on the base pool. Otherwise
+    /// the request is raised to <see cref="IORingBuffer.MinimumSize"/> and to a power of two; if that
+    /// reaches <paramref name="sendBufferSize"/> the pool is off. The effective size is reported by
+    /// <see cref="InitialSendBufferSize"/>.
     /// </param>
     public RingSocketManager(
         IIORingGroup ring,
         int maxSockets,
         int recvBufferSize = 64 * 1024,
         int sendBufferSize = 256 * 1024,
-        int initialBufferSlabs = 8,
-        int maxBufferSlabs = 32,
+        int initialBufferSlabs = 1,
+        int maxBufferSlabs = 128,
         int maxSendBufferSize = 0,
         long sendBufferGrowthBudget = 0,
-        int sendBufferRetentionWindows = 15)
+        int sendBufferRetentionWindows = 15,
+        int initialRecvBufferSize = 0,
+        int initialSendBufferSize = 0)
     {
         _ring = ring ?? throw new ArgumentNullException(nameof(ring));
 
@@ -242,10 +281,13 @@ public sealed class RingSocketManager : IDisposable
             throw new ArgumentOutOfRangeException(nameof(maxSockets), "Must be positive");
         }
 
-        if (sendBufferSize <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(sendBufferSize), "Must be positive");
-        }
+        // Named for this constructor's parameters rather than the pool's, and before anything is
+        // allocated: the pools fill lazily, so an unusable size must not wait for the first accept
+        IORingBuffer.ValidateSize(recvBufferSize);
+        IORingBuffer.ValidateSize(sendBufferSize);
+
+        InitialRecvBufferSize = CoerceInitialSize(initialRecvBufferSize, recvBufferSize, nameof(initialRecvBufferSize));
+        InitialSendBufferSize = CoerceInitialSize(initialSendBufferSize, sendBufferSize, nameof(initialSendBufferSize));
 
         if (sendBufferRetentionWindows < 1)
         {
@@ -281,7 +323,10 @@ public sealed class RingSocketManager : IDisposable
         }
 
         // Fail here rather than at an accept or growth where the cause is invisible
-        var needed = RequiredRegisteredBuffers(maxSockets, sendBufferSize, MaxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs);
+        var needed = RequiredRegisteredBuffers(
+            maxSockets, sendBufferSize, MaxSendBufferSize, sendBufferGrowthBudget, maxBufferSlabs,
+            InitialRecvBufferSize, InitialSendBufferSize
+        );
         if (ring.MaxRegisteredBuffers > 0 && ring.MaxRegisteredBuffers < needed)
         {
             throw new ArgumentException(
@@ -300,14 +345,10 @@ public sealed class RingSocketManager : IDisposable
         _completions = new Completion[maxSockets];
         _nextFreeSlot = 0;
 
-        // Create buffer pools
-        // Estimate slab size based on max sockets
-        var slabSize = BufferPoolSlabSize(maxSockets, maxBufferSlabs);
-        var sendSlabSize = SendPoolSlabSize(slabSize);
-
-        // One buffer per socket per base pool; slabs beyond that could never be acquired
-        var recvSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, slabSize));
-        var sendSlabs = Math.Min(maxBufferSlabs, SlabsPerSocketSet(maxSockets, sendSlabSize));
+        // Both base pools hand out one buffer per socket, so they are sized identically
+        var slabSize = BasePoolSlabSize(maxSockets, maxBufferSlabs);
+        var baseSlabs = BasePoolSlabCount(maxSockets, maxBufferSlabs);
+        var baseInitialSlabs = Math.Min(initialBufferSlabs, baseSlabs);
 
         // long: an int doubling past 1 GiB wraps and loops forever
         var tierCount = 0;
@@ -326,19 +367,52 @@ public sealed class RingSocketManager : IDisposable
                 ring,
                 slabSize: slabSize,
                 bufferSize: recvBufferSize,
-                initialSlabs: Math.Min(initialBufferSlabs, recvSlabs),
-                maxSlabs: recvSlabs
+                initialSlabs: baseInitialSlabs,
+                maxSlabs: baseSlabs,
+                retentionWindows: sendBufferRetentionWindows,
+                minSlabs: baseInitialSlabs
             );
             created.Add(_recvBufferPool);
 
             _sendBufferPool = new IORingBufferPool(
                 ring,
-                slabSize: sendSlabSize, // Fewer send buffers typically needed
+                slabSize: slabSize,
                 bufferSize: sendBufferSize,
-                initialSlabs: Math.Min(initialBufferSlabs / 2, sendSlabs),
-                maxSlabs: sendSlabs
+                initialSlabs: baseInitialSlabs,
+                maxSlabs: baseSlabs,
+                retentionWindows: sendBufferRetentionWindows,
+                minSlabs: baseInitialSlabs
             );
             created.Add(_sendBufferPool);
+
+            // Same slab rule as base: one buffer per socket, a flood fills them and retention keeps them
+            if (InitialRecvBufferSize > 0)
+            {
+                _initialRecvPool = new IORingBufferPool(
+                    ring,
+                    slabSize: slabSize,
+                    bufferSize: InitialRecvBufferSize,
+                    initialSlabs: baseInitialSlabs,
+                    maxSlabs: baseSlabs,
+                    retentionWindows: sendBufferRetentionWindows,
+                    minSlabs: baseInitialSlabs
+                );
+                created.Add(_initialRecvPool);
+            }
+
+            if (InitialSendBufferSize > 0)
+            {
+                _initialSendPool = new IORingBufferPool(
+                    ring,
+                    slabSize: slabSize,
+                    bufferSize: InitialSendBufferSize,
+                    initialSlabs: baseInitialSlabs,
+                    maxSlabs: baseSlabs,
+                    retentionWindows: sendBufferRetentionWindows,
+                    minSlabs: baseInitialSlabs
+                );
+                created.Add(_initialSendPool);
+            }
 
             var tierSize = sendBufferSize;
             for (var i = 0; i < tierCount; i++)
@@ -369,25 +443,58 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Buffers per slab in the base recv pool; shared with <see cref="RequiredRegisteredBuffers"/> so the two cannot drift.
+    /// An initial size is a request, not a contract: 0 means no pool; anything else is raised to the
+    /// platform floor and to a power of two, and if that leaves no room below the base size the pool
+    /// is off. The effective size is what <see cref="InitialRecvBufferSize"/> and
+    /// <see cref="InitialSendBufferSize"/> report.
     /// </summary>
-    private static int BufferPoolSlabSize(int maxSockets, int maxBufferSlabs) =>
-        Math.Max(64, maxSockets / maxBufferSlabs);
+    private static int CoerceInitialSize(int requested, int baseSize, string paramName)
+    {
+        if (requested == 0)
+        {
+            return 0;
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegative(requested, paramName);
+
+        var size = Math.Max(requested, IORingBuffer.MinimumSize);
+        if (size > int.MaxValue / 2)
+        {
+            throw new ArgumentOutOfRangeException(paramName, "Too large to double-map");
+        }
+
+        size = (int)BitOperations.RoundUpToPowerOf2((uint)size);
+        IORingBuffer.ValidateSize(size, paramName);
+
+        // The legacy Windows mapping path floors at 64 KiB, which can equal the base recv size
+        return size >= baseSize ? 0 : size;
+    }
 
     /// <summary>
-    /// Buffers per slab in the base send pool: a quarter of the recv pool's.
+    /// Buffers per slab in either base pool; shared with <see cref="RequiredRegisteredBuffers"/> so the two cannot drift.
     /// </summary>
-    private static int SendPoolSlabSize(int recvSlabSize) => recvSlabSize / 4;
+    /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
+    /// <param name="maxBufferSlabs">Slabs <paramref name="maxSockets"/> is divided into, floored at <see cref="MinimumBaseSlabSize"/> buffers.</param>
+    public static int BasePoolSlabSize(int maxSockets, int maxBufferSlabs)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
+
+        return Math.Max(MinimumBaseSlabSize, maxSockets / maxBufferSlabs);
+    }
 
     /// <summary>
-    /// Slabs of <paramref name="slabSize"/> buffers needed before every one of
-    /// <paramref name="maxSockets"/> sockets holds one; a base pool can never use more than this.
+    /// Slabs of <see cref="BasePoolSlabSize"/> buffers a base pool needs before every one of <paramref name="maxSockets"/> sockets holds one.
     /// </summary>
-    private static int SlabsPerSocketSet(int maxSockets, int slabSize) => (maxSockets - 1) / slabSize + 1;
+    /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
+    /// <param name="maxBufferSlabs">Divisor setting base slab size; see <see cref="BasePoolSlabSize"/>.</param>
+    public static int BasePoolSlabCount(int maxSockets, int maxBufferSlabs)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
 
-    /// <summary>Buffers those slabs hold.</summary>
-    private static int RoundUpToSlabs(int maxSockets, int slabSize) =>
-        SlabsPerSocketSet(maxSockets, slabSize) * slabSize;
+        return (maxSockets - 1) / BasePoolSlabSize(maxSockets, maxBufferSlabs) + 1;
+    }
 
     /// <summary>
     /// Buffers per slab in the tier pool holding buffers of <paramref name="tierSize"/> bytes.
@@ -409,36 +516,60 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Registration table size for this configuration: what both base pools can hand out plus
-    /// the first-tier buffers the growth budget can hold.
+    /// Registration table size for a manager with send buffer growth disabled: what both base pools
+    /// can hand out. This is what <see cref="IORingGroup.Create"/> sizes its table to by default.
+    /// </summary>
+    /// <param name="maxSockets">Maximum number of concurrent sockets.</param>
+    /// <param name="maxBufferSlabs">Divisor setting base slab size; see <see cref="BasePoolSlabSize"/>.</param>
+    public static int RequiredRegisteredBuffers(int maxSockets, int maxBufferSlabs = 128)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
+
+        checked
+        {
+            return BasePoolSlabCount(maxSockets, maxBufferSlabs) * BasePoolSlabSize(maxSockets, maxBufferSlabs) * 2;
+        }
+    }
+
+    /// <summary>
+    /// Registration table size for this configuration: what both base pools can hand out, the
+    /// first-tier buffers the growth budget can hold, and one more base-sized set per initial pool.
     /// </summary>
     /// <remarks>
-    /// A socket holds at most one base recv and one base send buffer, even mid-swap (a shrink
-    /// acquires before it releases), so each base pool is bounded by <paramref name="maxSockets"/> rounded to slabs.
+    /// A socket holds at most one recv and one send buffer per pool class, even mid-swap (a shrink
+    /// or promotion acquires before it releases), so each pool is bounded by <paramref name="maxSockets"/>
+    /// rounded to slabs. Initial pools count in full: a flood can fill them and retention keeps
+    /// them while authenticated sockets fill the base pools. A non-zero initial size here always
+    /// counts as a pool, even though the constructor may coerce that request down to 0 (its floor
+    /// reaching the base size) once it knows the platform; sizing for a pool that ends up off is
+    /// merely conservative, never too small.
     /// </remarks>
     public static int RequiredRegisteredBuffers(
         int maxSockets,
         int sendBufferSize,
         int maxSendBufferSize,
         long sendBufferGrowthBudget,
-        int maxBufferSlabs = 32)
+        int maxBufferSlabs = 128,
+        int initialRecvBufferSize = 0,
+        int initialSendBufferSize = 0)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSockets);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sendBufferSize);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBufferSlabs);
+        ArgumentOutOfRangeException.ThrowIfNegative(initialRecvBufferSize);
+        ArgumentOutOfRangeException.ThrowIfNegative(initialSendBufferSize);
 
         checked
         {
-            var slabSize = BufferPoolSlabSize(maxSockets, maxBufferSlabs);
-            var sendSlabSize = SendPoolSlabSize(slabSize);
-            var recvMax = Math.Min(maxBufferSlabs * slabSize, RoundUpToSlabs(maxSockets, slabSize));
-            var sendMax = Math.Min(maxBufferSlabs * sendSlabSize, RoundUpToSlabs(maxSockets, sendSlabSize));
+            var perPool = BasePoolSlabCount(maxSockets, maxBufferSlabs) * BasePoolSlabSize(maxSockets, maxBufferSlabs);
+            var baseMax = perPool * 2;
 
             var tierHeadroom = maxSendBufferSize > sendBufferSize && sendBufferGrowthBudget > 0
                 ? (int)(sendBufferGrowthBudget / (sendBufferSize * 2L))
                 : 0;
 
-            return recvMax + sendMax + tierHeadroom;
+            var initialPools = (initialRecvBufferSize > 0 ? 1 : 0) + (initialSendBufferSize > 0 ? 1 : 0);
+
+            return baseMax + tierHeadroom + perPool * initialPools;
         }
     }
 
@@ -465,43 +596,75 @@ public sealed class RingSocketManager : IDisposable
             return null;
         }
 
-        if (!_recvBufferPool.TryAcquire(out var recvBuffer))
+        if (!TryAcquireLazy(_initialRecvPool ?? _recvBufferPool, out var recvBuffer))
         {
             return null;
         }
 
-        if (!_sendBufferPool.TryAcquire(out var sendBuffer))
+        // One unwind for every exit that is not a live socket, thrown ones included: an argument
+        // error propagates by design and must not take the recv buffer with it
+        var owned = false;
+        IORingBuffer? sendBuffer = null;
+        try
         {
-            _recvBufferPool.Release(recvBuffer!);
-            return null;
-        }
+            if (!TryAcquireLazy(_initialSendPool ?? _sendBufferPool, out sendBuffer))
+            {
+                return null;
+            }
 
-        var connId = _ring.RegisterSocket(socketHandle);
-        if (connId < 0)
+            var connId = _ring.RegisterSocket(socketHandle);
+            if (connId < 0)
+            {
+                return null;
+            }
+
+            var generation = ++_generations[slotId];
+
+            var socket = new RingSocket(
+                this,
+                slotId,
+                socketHandle,
+                connId,
+                generation,
+                recvBuffer!,
+                sendBuffer!
+            );
+
+            _sockets[slotId] = socket;
+            ConnectedCount++;
+
+            try
+            {
+                PostRecv(socket);
+            }
+            catch
+            {
+                // Nothing is outstanding: PostRecv marks RecvPending only once the op is built, so the
+                // socket can be unpublished here and the finally below reclaims both buffers
+                _sockets[slotId] = null;
+                ConnectedCount--;
+                Unregister(socket);
+                CloseHandle(socket);
+
+                throw;
+            }
+
+            owned = true; // the socket holds the buffers now and releases them when it finalizes
+
+            return socket;
+        }
+        finally
         {
-            _recvBufferPool.Release(recvBuffer!);
-            _sendBufferPool.Release(sendBuffer!);
-            return null;
+            if (!owned)
+            {
+                ReleaseRecvBuffer(recvBuffer!);
+
+                if (sendBuffer != null)
+                {
+                    ReleaseSendBuffer(sendBuffer);
+                }
+            }
         }
-
-        var generation = ++_generations[slotId];
-
-        var socket = new RingSocket(
-            this,
-            slotId,
-            socketHandle,
-            connId,
-            generation,
-            recvBuffer!,
-            sendBuffer!
-        );
-
-        _sockets[slotId] = socket;
-        ConnectedCount++;
-
-        PostRecv(socket);
-
-        return socket;
     }
 
     /// <summary>
@@ -784,6 +947,17 @@ public sealed class RingSocketManager : IDisposable
         socket.RecvPending = true;
     }
 
+    /// <summary>Re-arms a receive for a socket whose consumer has freed buffer space; see <see cref="RingSocket.ResumeReceive"/>.</summary>
+    internal void ResumeReceive(RingSocket socket)
+    {
+        if (socket.RecvPending || !socket.Connected || socket.DisconnectPending || socket.Aborting)
+        {
+            return;
+        }
+
+        PostRecv(socket);
+    }
+
     /// <summary>
     /// Maximum sends in flight per socket, taken from the ring so it can never exceed what the
     /// platform reserved at request-queue creation.
@@ -888,6 +1062,12 @@ public sealed class RingSocketManager : IDisposable
         }
 
         socket.RecvBuffer.CommitWrite(result);
+
+        // Before the event: the consumer reads this completion through socket.RecvBuffer
+        if (socket.RecvPromotionPending)
+        {
+            PromoteRecvBufferNow(socket);
+        }
 
         if (socket is { DisconnectPending: false, RecvBuffer.WritableBytes: > 0 })
         {
@@ -1040,11 +1220,30 @@ public sealed class RingSocketManager : IDisposable
         return -1;
     }
 
+    /// <summary>Returns a recv buffer to the pool it came from.</summary>
+    private void ReleaseRecvBuffer(IORingBuffer buffer)
+    {
+        if (_initialRecvPool != null && buffer.PhysicalSize == _initialRecvPool.BufferSize)
+        {
+            _initialRecvPool.Release(buffer);
+        }
+        else
+        {
+            _recvBufferPool.Release(buffer);
+        }
+    }
+
     /// <summary>
     /// Returns a send buffer to the pool it came from.
     /// </summary>
     private void ReleaseSendBuffer(IORingBuffer buffer)
     {
+        if (_initialSendPool != null && buffer.PhysicalSize == _initialSendPool.BufferSize)
+        {
+            _initialSendPool.Release(buffer);
+            return;
+        }
+
         var tier = TierIndexOf(buffer);
         if (tier < 0)
         {
@@ -1083,46 +1282,44 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
-        return pool.TryAcquire(out buffer);
+        return TryAcquireLazy(pool, out buffer);
     }
 
     /// <summary>
-    /// Moves the socket's queued-but-unsent bytes into the next larger send buffer. Bytes already
-    /// handed to the transport stay in the old buffer, which is released once they complete.
+    /// Acquires from a pool that fills lazily, reporting a slab the ring or the OS refused as plain
+    /// exhaustion. The pool still throws so its own failures stay visible; the manager is the boundary
+    /// where a caller that cannot take an exception - an accept, a grow, a shrink - fails soft instead.
     /// </summary>
-    /// <returns>False if the socket is closing, already at the largest tier, or the growth budget
-    /// cannot supply a buffer.</returns>
-    public bool TryGrowSendBuffer(RingSocket socket)
+    private static bool TryAcquireLazy(IORingBufferPool pool, out IORingBuffer? buffer)
     {
-        if (!socket.Connected || socket.DisconnectPending)
+        try
         {
+            return pool.TryAcquire(out buffer);
+        }
+        catch (InvalidOperationException)
+        {
+            buffer = null;
             return false;
         }
+    }
 
+    /// <summary>True when the socket still holds the send buffer it was created with from the initial pool.</summary>
+    private bool OnInitialSendBuffer(RingSocket socket) =>
+        _initialSendPool != null && socket.SendBuffer.PhysicalSize == _initialSendPool.BufferSize;
+
+    /// <summary>
+    /// Makes <paramref name="next"/> the socket's send buffer: queued-but-unsent bytes move across;
+    /// bytes already handed to the transport stay in the old buffer, which is released once they
+    /// complete. Shared by growth and promotion so the two cannot drift.
+    /// </summary>
+    private void SwapSendBuffer(RingSocket socket, IORingBuffer next)
+    {
         var current = socket.SendBuffer;
-        var tier = TierIndexOf(current) + 1;
-        if (tier >= _sendTiers.Length)
-        {
-            return false;
-        }
-
-        // Only one retiring slot
-        if (socket.RetiringSendBuffer != null && current.InFlightBytes != 0)
-        {
-            Debug.Assert(false, "growth with a retiring buffer found bytes in flight on the current buffer");
-            return false;
-        }
-
-        if (!TryAcquireTier(tier, out var next))
-        {
-            _growthRefusals++;
-            return false;
-        }
 
         var unsent = current.SendableBytes;
         if (unsent > 0)
         {
-            current.GetSendableSpan().CopyTo(next!.GetWriteSpan());
+            current.GetSendableSpan().CopyTo(next.GetWriteSpan());
             next.CommitWrite(unsent);
             current.DiscardSendable();
         }
@@ -1133,18 +1330,167 @@ public sealed class RingSocketManager : IDisposable
         }
         else
         {
-            // The guard above refused the retiring case
-            Debug.Assert(socket.RetiringSendBuffer == null, "growth would drop an unretired send buffer");
+            // The callers refused the retiring case
+            Debug.Assert(socket.RetiringSendBuffer == null, "swap would drop an unretired send buffer");
             socket.RetiringSendBuffer = current;
         }
 
-        socket.SendBuffer = next!;
+        socket.SendBuffer = next;
+    }
+
+    /// <summary>
+    /// A socket on an initial send buffer may already have one retiring; a second cannot be parked.
+    /// </summary>
+    private static bool CanSwapSendBuffer(RingSocket socket)
+    {
+        if (socket.RetiringSendBuffer != null && socket.SendBuffer.InFlightBytes != 0)
+        {
+            Debug.Assert(false, "swap with a retiring buffer found bytes in flight on the current buffer");
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Moves a socket from its initial send buffer to a base one. Unbudgeted: the base pool is sized
+    /// for every socket, so this fails only when a slab cannot be created.
+    /// </summary>
+    /// <returns>False if the socket is not on an initial buffer, is closing, or the base pool has no buffer.</returns>
+    public bool TryPromoteSendBuffer(RingSocket socket)
+    {
+        if (!OnInitialSendBuffer(socket) || !socket.Connected || socket.DisconnectPending || !CanSwapSendBuffer(socket))
+        {
+            return false;
+        }
+
+        if (!TryAcquireLazy(_sendBufferPool, out var next))
+        {
+            return false;
+        }
+
+        SwapSendBuffer(socket, next!);
+        return true;
+    }
+
+    /// <summary>True when the socket still holds the recv buffer it was created with from the initial pool.</summary>
+    private bool OnInitialRecvBuffer(RingSocket socket) =>
+        _initialRecvPool != null && socket.RecvBuffer.PhysicalSize == _initialRecvPool.BufferSize;
+
+    /// <summary>
+    /// Moves a socket from its initial recv buffer to a base one. A recv is normally armed against
+    /// the current buffer, so the swap is applied at the next recv completion, before that
+    /// completion's event is returned; only a full initial buffer (nothing armed) swaps at once.
+    /// </summary>
+    /// <returns>
+    /// True when the promotion is requested now, is already pending, or is already applied. False if
+    /// the socket is not on an initial buffer, is closing, or - with nothing armed - the base pool
+    /// could not supply a buffer, in which case the caller may call again.
+    /// </returns>
+    public bool TryPromoteRecvBuffer(RingSocket socket)
+    {
+        if (!OnInitialRecvBuffer(socket) || !socket.Connected || socket.DisconnectPending)
+        {
+            return false;
+        }
+
+        // Already requested and a recv is armed: it applies at that recv's completion. Reporting
+        // true lets the caller wait for it instead of treating the request as refused.
+        if (socket.RecvPromotionPending && socket.RecvPending)
+        {
+            return true;
+        }
+
+        socket.RecvPromotionPending = true;
+
+        if (!socket.RecvPending)
+        {
+            // Full buffer: nothing is armed, so no completion can apply this later. Swap now and
+            // re-arm on the new buffer, or report the failure so the caller can try again.
+            if (!PromoteRecvBufferNow(socket))
+            {
+                socket.RecvPromotionPending = false;
+                return false;
+            }
+
+            PostRecv(socket);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Applies a pending recv promotion: every readable byte (an unconsumed partial packet plus the
+    /// completion just committed) moves to a base buffer and the initial one goes back to its pool.
+    /// Nothing may be armed against the old buffer when this runs.
+    /// </summary>
+    private bool PromoteRecvBufferNow(RingSocket socket)
+    {
+        Debug.Assert(!socket.RecvPending, "recv promotion applied with a recv armed");
+
+        if (!TryAcquireLazy(_recvBufferPool, out var next))
+        {
+            // Stays on the initial buffer: the deferred path retries at the next completion, the
+            // immediate path reports false so the caller can retry.
+            return false;
+        }
+
+        var readable = socket.RecvBuffer.GetReadSpan();
+        readable.CopyTo(next!.GetWriteSpan());
+        next.CommitWrite(readable.Length);
+
+        ReleaseRecvBuffer(socket.RecvBuffer);
+        socket.RecvBuffer = next;
+        socket.RecvPromotionPending = false;
+        return true;
+    }
+
+    /// <summary>
+    /// Moves the socket's queued-but-unsent bytes into the next larger send buffer. Bytes already
+    /// handed to the transport stay in the old buffer, which is released once they complete. A
+    /// socket still on its initial buffer is promoted to base instead, as a safety net for a
+    /// consumer that never asked.
+    /// </summary>
+    /// <returns>False if the socket is closing, already at the largest tier, no buffer is available
+    /// within the growth budget, or promotion was tried first and the base pool could not supply a
+    /// buffer; the socket keeps its current buffer.</returns>
+    public bool TryGrowSendBuffer(RingSocket socket)
+    {
+        if (!socket.Connected || socket.DisconnectPending)
+        {
+            return false;
+        }
+
+        if (OnInitialSendBuffer(socket))
+        {
+            return TryPromoteSendBuffer(socket);
+        }
+
+        var tier = TierIndexOf(socket.SendBuffer) + 1;
+        if (tier >= _sendTiers.Length)
+        {
+            return false;
+        }
+
+        if (!CanSwapSendBuffer(socket))
+        {
+            return false;
+        }
+
+        if (!TryAcquireTier(tier, out var next))
+        {
+            _growthRefusals++;
+            return false;
+        }
+
+        SwapSendBuffer(socket, next!);
         return true;
     }
 
     /// <summary>
     /// Returns a drained socket to a base-size send buffer. No copy: nothing is readable.
     /// </summary>
+    /// <returns>False if the socket is busy or the base pool has no buffer; it keeps its larger one.</returns>
     public bool TryShrinkSendBuffer(RingSocket socket)
     {
         if (!socket.Connected || socket.RetiringSendBuffer != null || socket.SendPending ||
@@ -1153,7 +1499,7 @@ public sealed class RingSocketManager : IDisposable
             return false;
         }
 
-        if (!_sendBufferPool.TryAcquire(out var baseBuffer))
+        if (!TryAcquireLazy(_sendBufferPool, out var baseBuffer))
         {
             return false;
         }
@@ -1165,7 +1511,7 @@ public sealed class RingSocketManager : IDisposable
 
     /// <summary>Snapshot returned by <see cref="Maintain"/>.</summary>
     /// <param name="BuffersReleased">Buffers returned to the OS by this call, summed across tiers.</param>
-    /// <param name="GrowthRefusals">Budget refusals since the previous call, which resets the counter.</param>
+    /// <param name="GrowthRefusals">Growths refused by the budget, or by a slab the ring would not take, since the previous call, which resets the counter.</param>
     /// <param name="TierCapacityBytes">Slab capacity allocated across every tier pool, in bytes.</param>
     /// <param name="TierInUse">
     /// Buffers handed out, summed across tiers (a count; see <see cref="GetSendBufferTierStats"/> per tier).
@@ -1173,12 +1519,16 @@ public sealed class RingSocketManager : IDisposable
     /// <param name="TierRetainFloor">
     /// Retention floors summed across tiers, in buffers; same caveat as <paramref name="TierInUse"/>.
     /// </param>
+    /// <param name="BaseBuffersReleased">Buffers the base and initial pools returned to the OS by this call.</param>
+    /// <param name="BaseCapacityBytes">Slab capacity allocated across the base and initial pools, in bytes.</param>
     public readonly record struct SendBufferMaintenance(
         int BuffersReleased,
         int GrowthRefusals,
         long TierCapacityBytes,
         int TierInUse,
-        int TierRetainFloor
+        int TierRetainFloor,
+        int BaseBuffersReleased,
+        long BaseCapacityBytes
     );
 
     /// <summary>One growth tier's pool usage, in buffers of <paramref name="BufferSize"/> bytes.</summary>
@@ -1202,7 +1552,7 @@ public sealed class RingSocketManager : IDisposable
     }
 
     /// <summary>
-    /// Rotates each tier pool's usage window and trims at most one idle slab per tier; call once a minute from the ring thread.
+    /// Rotates every pool's usage window and trims at most one idle slab per pool; call once a minute from the ring thread.
     /// </summary>
     public SendBufferMaintenance Maintain()
     {
@@ -1216,9 +1566,27 @@ public sealed class RingSocketManager : IDisposable
             floor += _sendTiers[i].RetainFloor;
         }
 
+        // The base and initial pools never trim below the slabs they were built with
+        var baseReleased = _recvBufferPool.Maintain() + _sendBufferPool.Maintain();
+        var baseCapacity = _recvBufferPool.CapacityBytes + _sendBufferPool.CapacityBytes;
+
+        if (_initialRecvPool != null)
+        {
+            baseReleased += _initialRecvPool.Maintain();
+            baseCapacity += _initialRecvPool.CapacityBytes;
+        }
+
+        if (_initialSendPool != null)
+        {
+            baseReleased += _initialSendPool.Maintain();
+            baseCapacity += _initialSendPool.CapacityBytes;
+        }
+
         var refusals = _growthRefusals;
         _growthRefusals = 0;
-        return new SendBufferMaintenance(released, refusals, TierCapacityBytes, inUse, floor);
+        return new SendBufferMaintenance(
+            released, refusals, TierCapacityBytes, inUse, floor, baseReleased, baseCapacity
+        );
     }
 
     private static int EmitSent(RingSocket socket, int result, Span<RingSocketEvent> events, int eventIndex)
@@ -1254,7 +1622,7 @@ public sealed class RingSocketManager : IDisposable
         for (var i = 0; i < _releasePending.Count; i++)
         {
             var socket = _releasePending[i];
-            _recvBufferPool.Release(socket.RecvBuffer);
+            ReleaseRecvBuffer(socket.RecvBuffer);
             ReleaseSendBuffer(socket.SendBuffer);
 
             // Finalized mid-swap; never drained
@@ -1297,6 +1665,8 @@ public sealed class RingSocketManager : IDisposable
         // Dispose buffer pools
         _recvBufferPool.Dispose();
         _sendBufferPool.Dispose();
+        _initialRecvPool?.Dispose();
+        _initialSendPool?.Dispose();
 
         for (var i = 0; i < _sendTiers.Length; i++)
         {
