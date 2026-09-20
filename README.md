@@ -226,6 +226,10 @@ The smallest usable size is `IORingBuffer.MinimumSize`: the page size, except on
 (pre-1803) path, where it is the 64 KiB allocation granularity. Both initial pools use the base slab
 rule and count in `RequiredRegisteredBuffers(...)` — pass the initial sizes there too.
 
+A completion that fills a buffer arms no receive; a consumer that reads from `RecvBuffer` outside a
+completion calls `socket.ResumeReceive()` once it has freed space — at 4 KiB a burst of small
+packets can fill the buffer in one completion.
+
 ## Threading Model
 
 IORingGroup is designed for **single-threaded** event loops. The ring, the manager, and all socket operations must be called from the same thread:
