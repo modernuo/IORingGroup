@@ -788,7 +788,11 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     // =============================================================================
 
     /// <inheritdoc/>
-    public nint CreateListener(string bindAddress, ushort port, int backlog)
+    public nint CreateListener(string bindAddress, ushort port, int backlog) =>
+        CreateListener(bindAddress, port, backlog, dualMode: false);
+
+    /// <inheritdoc/>
+    public nint CreateListener(string bindAddress, ushort port, int backlog, bool dualMode)
     {
         if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Bsd, out var addr))
         {
@@ -820,6 +824,17 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         // Disable SO_LINGER
         var linger = new linger { l_onoff = 0, l_linger = 0 };
         Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
+
+        // Explicit either way: the OS default differs (Linux usually 0, Windows and BSD 1).
+        if (addr.IsIPv6)
+        {
+            var v6Only = dualMode ? 0 : 1;
+            if (Darwin.setsockopt(fd, SocketAddressLayout.IPPROTO_IPV6, SocketAddressLayout.Bsd.Ipv6V6Only, (nint)(&v6Only), sizeof(int)) < 0)
+            {
+                Darwin.close(fd);
+                return -1;
+            }
+        }
 
         fixed (byte* sa = addr.Bytes)
         {

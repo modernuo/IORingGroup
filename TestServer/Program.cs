@@ -29,6 +29,8 @@ public class Program
 
     private static volatile bool _running = true;
     private static bool _quietMode;
+    private static string _bindAddress = "0.0.0.0";
+    private static bool _dualMode;
     private static int _benchmarkDuration; // 0 = run until clients disconnect
 
     // User data encoding for operations
@@ -106,6 +108,15 @@ public class Program
             {
                 backend = ServerBackend.IORing;
             }
+            else if ((arg.Equals("--bind", StringComparison.OrdinalIgnoreCase) ||
+                      arg.Equals("-B", StringComparison.Ordinal)) && i + 1 < args.Length)
+            {
+                _bindAddress = args[++i];
+            }
+            else if (arg.Equals("--dual-mode", StringComparison.OrdinalIgnoreCase))
+            {
+                _dualMode = true;
+            }
             else if (arg.Equals("--benchmark", StringComparison.OrdinalIgnoreCase) ||
                      arg.Equals("-b", StringComparison.OrdinalIgnoreCase))
             {
@@ -158,11 +169,13 @@ public class Program
         Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
         Console.WriteLine($"Backend: {backend}");
         Console.WriteLine($"Benchmark mode: {benchmarkMode}, Duration: {(_benchmarkDuration > 0 ? $"{_benchmarkDuration}s" : "unlimited")}, Quiet: {_quietMode}");
-        Console.WriteLine($"Port: {Port}");
-        Console.WriteLine("Usage: TestServer [--ioring|--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--affinity|-a <mask>]");
+        Console.WriteLine($"Bind: {_bindAddress}{(_dualMode ? " (dual mode)" : "")}, Port: {Port}");
+        Console.WriteLine("Usage: TestServer [--ioring|--rio|-r] [--pollgroup|-p] [--benchmark|-b] [--duration|-d <seconds>] [--quiet|-q] [--affinity|-a <mask>] [--bind|-B <address>] [--dual-mode]");
         Console.WriteLine("  --ioring|--rio|-r: Windows RIO / Linux io_uring / Darwin kqueue (zero-copy echo)");
         Console.WriteLine("  --epoll|-e: Linux epoll (explicit fallback, for benchmarking)");
         Console.WriteLine("  --pollgroup|-p: Cross-platform poll-based (wepoll/epoll/kqueue)");
+        Console.WriteLine("  --bind|-B: Listen address, IPv4 or IPv6 (default 0.0.0.0)");
+        Console.WriteLine("  --dual-mode: With an IPv6 --bind, also accept IPv4 clients");
         Console.WriteLine("Press Ctrl+C to exit.\n");
 
         Console.CancelKeyPress += (_, e) =>
@@ -213,7 +226,7 @@ public class Program
             Console.WriteLine($"Buffer pool created: {_bufferPool.TotalCapacity} buffers ({_bufferPool.BufferSize} bytes each)");
 
             // Create listener using the ring's native method
-            var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
+            var listener = ring.CreateListener(_bindAddress, Port, ListenBacklog, _dualMode);
             if (listener == -1)
             {
                 throw new InvalidOperationException("Failed to create listener");
@@ -665,7 +678,7 @@ public class Program
             );
             Console.WriteLine($"Buffer pool created: {_bufferPool.TotalCapacity} buffers ({_bufferPool.BufferSize} bytes each)");
 
-            var listener = ring.CreateListener("0.0.0.0", Port, ListenBacklog);
+            var listener = ring.CreateListener(_bindAddress, Port, ListenBacklog, _dualMode);
             if (listener == -1)
             {
                 throw new InvalidOperationException("Failed to create listener");
@@ -777,9 +790,15 @@ public class Program
         // Initialize pool before anything else to avoid allocations during benchmark
         InitializePollPool(MaxClients);
 
-        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        var bindAddress = IPAddress.Parse(_bindAddress.Trim('[', ']'));
+        using var listener = new Socket(bindAddress.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, false);
-        listener.Bind(new IPEndPoint(IPAddress.Any, Port));
+        if (bindAddress.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            listener.DualMode = _dualMode;
+        }
+
+        listener.Bind(new IPEndPoint(bindAddress, Port));
         listener.NoDelay = true;
         listener.Listen(ListenBacklog);
         listener.Blocking = false;

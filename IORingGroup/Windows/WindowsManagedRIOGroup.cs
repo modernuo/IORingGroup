@@ -113,8 +113,14 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     private readonly uint _rioMaxConnections;
     private readonly RioConnection* _connections;
 
+    private struct OwnedListener
+    {
+        public nint Socket;
+        public int Family; // AcceptEx's accept socket must match it
+    }
+
     // Owned listeners
-    private nint* _ownedListeners;
+    private OwnedListener* _ownedListeners;
     private uint _ownedListenerCount;
     private uint _ownedListenerCapacity;
 
@@ -305,7 +311,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         // Step 8: Initialize owned listeners array
         _ownedListenerCapacity = 16;
-        _ownedListeners = (nint*)NativeMemory.AllocZeroed(16, (nuint)sizeof(nint));
+        _ownedListeners = (OwnedListener*)NativeMemory.AllocZeroed(16, (nuint)sizeof(OwnedListener));
     }
 
     // Releases ctor-acquired kernel resources on a failed construction step.
@@ -1046,7 +1052,11 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // =========================================================================
 
     /// <inheritdoc/>
-    public nint CreateListener(string bindAddress, ushort port, int backlog)
+    public nint CreateListener(string bindAddress, ushort port, int backlog) =>
+        CreateListener(bindAddress, port, backlog, dualMode: false);
+
+    /// <inheritdoc/>
+    public nint CreateListener(string bindAddress, ushort port, int backlog, bool dualMode)
     {
         if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Windows, out var addr))
         {
@@ -1070,6 +1080,17 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         var mode = 1u;
         ioctlsocket(listener, FIONBIO, &mode);
 
+        // Explicit either way: the OS default differs (Linux usually 0, Windows and BSD 1).
+        if (addr.IsIPv6)
+        {
+            var v6Only = dualMode ? 0 : 1;
+            if (setsockopt(listener, SocketAddressLayout.IPPROTO_IPV6, SocketAddressLayout.Windows.Ipv6V6Only, &v6Only, sizeof(int)) < 0)
+            {
+                closesocket(listener);
+                return -1;
+            }
+        }
+
         fixed (byte* sa = addr.Bytes)
         {
             if (bind(listener, sa, addr.Bytes.Length) == SOCKET_ERROR)
@@ -1089,11 +1110,11 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         if (_ownedListenerCount >= _ownedListenerCapacity)
         {
             var newCapacity = _ownedListenerCapacity * 2;
-            var newArray = (nint*)NativeMemory.Realloc(_ownedListeners, newCapacity * (nuint)sizeof(nint));
+            var newArray = (OwnedListener*)NativeMemory.Realloc(_ownedListeners, newCapacity * (nuint)sizeof(OwnedListener));
             _ownedListeners = newArray;
             _ownedListenerCapacity = newCapacity;
         }
-        _ownedListeners[_ownedListenerCount++] = listener;
+        _ownedListeners[_ownedListenerCount++] = new OwnedListener { Socket = listener, Family = addr.Family };
 
         // Cache AcceptEx function pointer
         if (_fnAcceptEx == null)
@@ -1140,7 +1161,7 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         // Remove from owned listeners
         for (uint i = 0; i < _ownedListenerCount; i++)
         {
-            if (_ownedListeners[i] == listener)
+            if (_ownedListeners[i].Socket == listener)
             {
                 for (var j = i; j < _ownedListenerCount - 1; j++)
                 {
@@ -1200,6 +1221,26 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     // AcceptEx Support
     // =========================================================================
 
+    /// <summary>
+    /// Address family of <paramref name="listenSocket"/>: recorded for listeners this ring created,
+    /// read back from the socket for one created elsewhere.
+    /// </summary>
+    private int GetListenerFamily(nint listenSocket)
+    {
+        for (uint i = 0; i < _ownedListenerCount; i++)
+        {
+            if (_ownedListeners[i].Socket == listenSocket)
+            {
+                return _ownedListeners[i].Family;
+            }
+        }
+
+        // SOCKADDR_STORAGE; the family is its leading host-order ushort.
+        var storage = stackalloc byte[128];
+        var len = 128;
+        return getsockname(listenSocket, storage, &len) == 0 ? *(ushort*)storage : AF_INET;
+    }
+
     private bool PostAcceptEx(nint listenSocket, ulong userData)
     {
         // Load AcceptEx if not already done
@@ -1230,8 +1271,8 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
 
         var ctx = &_acceptPool[slot];
 
-        // Create accept socket with WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO
-        ctx->AcceptSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, null, 0,
+        // Must match the listener's family: a mismatched socket still accepts, but getpeername fails.
+        ctx->AcceptSocket = WSASocketW(GetListenerFamily(listenSocket), SOCK_STREAM, IPPROTO_TCP, null, 0,
             WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
         if (ctx->AcceptSocket == INVALID_SOCKET)
         {
@@ -1469,9 +1510,9 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         {
             for (uint i = 0; i < _ownedListenerCount; i++)
             {
-                if (_ownedListeners[i] != INVALID_SOCKET)
+                if (_ownedListeners[i].Socket != INVALID_SOCKET)
                 {
-                    closesocket(_ownedListeners[i]);
+                    closesocket(_ownedListeners[i].Socket);
                 }
             }
             NativeMemory.Free(_ownedListeners);

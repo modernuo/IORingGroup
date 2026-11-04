@@ -230,6 +230,22 @@ A completion that fills a buffer arms no receive; a consumer that reads from `Re
 completion calls `socket.ResumeReceive()` once it has freed space — at 4 KiB a burst of small
 packets can fill the buffer in one completion.
 
+## Listeners and IPv6
+
+`CreateListener` takes a dotted-quad IPv4 address or an IPv6 address, bracketed or not
+(`"0.0.0.0"`, `"127.0.0.1"`, `"::"`, `"[::1]"`, `"fe80::1%3"`). Host names, ports and shorthand
+IPv4 forms such as `"127.1"` are rejected with -1 rather than binding somewhere unexpected.
+
+IPv6 listeners are v6-only by default on every platform, so `"0.0.0.0"` and `"::"` can share a
+port — Linux would otherwise let `"::"` claim IPv4 too and fail the second bind. To serve both
+families from one socket, opt in to dual mode; IPv4 clients then appear as `::ffff:a.b.c.d`:
+
+```csharp
+var listener = ring.CreateListener("::", 5000, backlog: 128, dualMode: true);
+```
+
+Accepted sockets carry no address family assumptions, so everything after the accept is unchanged.
+
 ## Threading Model
 
 IORingGroup is designed for **single-threaded** event loops. The ring, the manager, and all socket operations must be called from the same thread:
