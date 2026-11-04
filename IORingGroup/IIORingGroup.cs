@@ -142,10 +142,13 @@ public interface IIORingGroup : IDisposable
     /// <summary>
     /// Creates a listening socket bound to the specified address and port.
     /// </summary>
-    /// <param name="bindAddress">IP address to bind to (e.g., "0.0.0.0" for all interfaces).</param>
+    /// <param name="bindAddress">
+    /// Dotted-quad IPv4 address to bind to ("0.0.0.0", null or empty for all interfaces).
+    /// Host names and shorthand forms such as "127.1" are rejected.
+    /// </param>
     /// <param name="port">Port number to listen on.</param>
     /// <param name="backlog">Maximum pending connections queue length.</param>
-    /// <returns>Listener socket handle on success, -1 on failure.</returns>
+    /// <returns>Listener socket handle on success, -1 on failure or an unparseable address.</returns>
     /// <remarks>
     /// The socket is created with platform-optimal flags:
     /// - Non-blocking mode

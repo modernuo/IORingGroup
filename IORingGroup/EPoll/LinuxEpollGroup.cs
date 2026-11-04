@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -1021,8 +1020,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// <inheritdoc/>
     public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
+        if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Linux, out var addr))
+        {
+            return -1;
+        }
+
         // Create non-blocking TCP socket
-        var fd = Syscalls.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+        var fd = Syscalls.socket(addr.Family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
         if (fd < 0)
         {
             return -1;
@@ -1042,15 +1046,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         Syscalls.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(LingerOption));
 
-        // Parse and bind address
-        var addr = new sockaddr_in
-        {
-            sin_family = AF_INET,
-            sin_port = BinaryPrimitives.ReverseEndianness(port),
-            sin_addr = ParseIPv4(bindAddress)
-        };
-
-        if (Syscalls.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
+        if (Syscalls.bind(fd, (nint)addr.Data, addr.Length) < 0)
         {
             Syscalls.close(fd);
             return -1;
@@ -1304,31 +1300,6 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     /// Gets the number of registered external buffers.
     /// </summary>
     public int ExternalBufferCount => _externalBufferCount;
-
-    // =============================================================================
-    // Helpers
-    // =============================================================================
-
-    private static uint ParseIPv4(string address)
-    {
-        if (address == "0.0.0.0")
-        {
-            return 0; // INADDR_ANY
-        }
-
-        var parts = address.Split('.');
-        if (parts.Length != 4)
-        {
-            return 0;
-        }
-
-        return (uint)(
-            byte.Parse(parts[0]) |
-            (byte.Parse(parts[1]) << 8) |
-            (byte.Parse(parts[2]) << 16) |
-            (byte.Parse(parts[3]) << 24)
-        );
-    }
 
     // =============================================================================
     // Dispose

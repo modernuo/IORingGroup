@@ -423,7 +423,7 @@ internal static unsafe class RIOInterop
     public static extern int setsockopt(nint s, int level, int optname, void* optval, int optlen);
 
     [DllImport("ws2_32.dll")]
-    public static extern int bind(nint s, sockaddr_in* name, int namelen);
+    public static extern int bind(nint s, byte* name, int namelen);
 
     [DllImport("ws2_32.dll")]
     public static extern int listen(nint s, int backlog);
