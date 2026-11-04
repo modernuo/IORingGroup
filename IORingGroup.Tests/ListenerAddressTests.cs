@@ -464,6 +464,71 @@ public class ListenerAddressTests
         }
     }
 
+    /// <summary>
+    /// Two listeners on one port, one per family: the accept event says which one the connection
+    /// came through, which the local port alone cannot.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void AcceptEvent_ReportsListenerIndex(string backend)
+    {
+        Skip.IfNot(Socket.OSSupportsIPv6, "IPv6 unavailable");
+        using var ring = CreateRing(backend);
+        using var manager = new RingSocketManager(ring, maxSockets: 4, recvBufferSize: 64 * 1024, sendBufferSize: 64 * 1024);
+
+        var v4 = ring.CreateListener("127.0.0.1", 0, 16);
+        Assert.NotEqual(-1, v4);
+        var port = (ushort)GetLocalEndPoint(v4).Port;
+        var v6 = ring.CreateListener("::1", port, 16);
+
+        try
+        {
+            Assert.NotEqual(-1, v6);
+            ring.PrepareAccept(v4, 0, 0, IORingUserData.EncodeAccept(0));
+            ring.PrepareAccept(v6, 0, 0, IORingUserData.EncodeAccept(1));
+
+            using var client6 = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+            client6.Connect(IPAddress.IPv6Loopback, port);
+            Assert.Equal(1, WaitForAccept(manager));
+
+            using var client4 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            client4.Connect(IPAddress.Loopback, port);
+            Assert.Equal(0, WaitForAccept(manager));
+        }
+        finally
+        {
+            ring.CloseListener(v4);
+            if (v6 != -1)
+            {
+                ring.CloseListener(v6);
+            }
+        }
+
+        static int WaitForAccept(RingSocketManager manager)
+        {
+            var events = new RingSocketEvent[8];
+            var deadline = Environment.TickCount64 + 5000;
+            while (Environment.TickCount64 < deadline)
+            {
+                manager.Submit();
+                var count = manager.ProcessCompletions(events);
+                for (var i = 0; i < count; i++)
+                {
+                    if (events[i].Type == RingSocketEventType.Accept)
+                    {
+                        Assert.True(events[i].AcceptedSocketHandle >= 0, $"accept failed: {events[i].AcceptedSocketHandle}");
+                        manager.Ring.CloseSocket(events[i].AcceptedSocketHandle);
+                        return events[i].ListenerIndex;
+                    }
+                }
+
+                Thread.Sleep(1);
+            }
+
+            return -1;
+        }
+    }
+
     /// <summary>Posts an accept on <paramref name="listener"/> and waits for it to succeed.</summary>
     internal static void AssertAccepts(IIORingGroup ring, nint listener) => ring.CloseSocket(Accept(ring, listener));
 

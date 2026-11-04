@@ -246,6 +246,10 @@ var listener = ring.CreateListener("::", 5000, backlog: 128, dualMode: true);
 
 Accepted sockets carry no address family assumptions, so everything after the accept is unchanged.
 
+With several listeners, post each one's accepts with `IORingUserData.EncodeAccept(index)`; the
+manager's `Accept` event reports it back as `ListenerIndex`, so you can re-arm the right listener
+even when an IPv4 and an IPv6 listener share a port.
+
 ## Threading Model
 
 IORingGroup is designed for **single-threaded** event loops. The ring, the manager, and all socket operations must be called from the same thread:
