@@ -48,8 +48,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     private readonly bool[] _isDirty;
     private int _dirtyCount;
 
-    // Accept operations (dictionary keyed by listener FD — typically 1-2 listeners)
-    private readonly Dictionary<int, PendingOp> _pendingAccepts = new();
+    // Posted accepts per listener FD (typically 1-2 listeners), oldest first. Each posted accept
+    // completes once, so one readiness event can take as many connections as there are posted.
+    private readonly Dictionary<int, AcceptQueue> _pendingAccepts = new();
     private readonly HashSet<int> _acceptsSubmitted = new();
 
     // User-space completion queue (ring buffer)
@@ -222,7 +223,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
 
             foreach (var kvp in _pendingAccepts)
             {
-                if (!_acceptsSubmitted.Contains(kvp.Key))
+                if (kvp.Value.Count > 0 && !_acceptsSubmitted.Contains(kvp.Key))
                 {
                     pendingCount++;
                 }
@@ -247,50 +248,38 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PreparePollAdd(nint fd, PollMask mask, ulong userData)
     {
-        // Store as a pending accept entry (poll operations use the accept dictionary)
-        _pendingAccepts[(int)fd] = new PendingOp
+        // Store as a pending accept entry (poll operations use the accept dictionary), replacing
+        // anything queued on the fd
+        var queue = GetAcceptQueue((int)fd);
+        queue.Clear();
+        queue.Enqueue(new PendingOp
         {
             Opcode = (byte)IORingOp.PollAdd,
             Fd = (int)fd,
             Flags = (int)mask,
             UserData = userData
-        };
+        });
     }
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PreparePollRemove(ulong userData)
     {
-        // Scan and remove from _pendingAccepts
-        int? toRemove = null;
-        foreach (var kvp in _pendingAccepts)
-        {
-            if (kvp.Value.UserData == userData)
-            {
-                toRemove = kvp.Key;
-                break;
-            }
-        }
-
-        if (toRemove.HasValue)
-        {
-            _acceptsSubmitted.Remove(toRemove.Value);
-            _pendingAccepts.Remove(toRemove.Value);
-        }
+        RemovePendingAccept(userData);
     }
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void PrepareAccept(nint listenFd, nint addr, nint addrLen, ulong userData)
     {
-        _pendingAccepts[(int)listenFd] = new PendingOp
+        GetAcceptQueue((int)listenFd).Enqueue(new PendingOp
         {
             Opcode = (byte)IORingOp.Accept,
             Fd = (int)listenFd,
             Addr = addr,
             Addr2 = addrLen,
             UserData = userData
-        };
+        });
     }
 
     /// <inheritdoc/>
@@ -363,21 +352,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
             }
         }
 
-        int? toRemove = null;
-        foreach (var kvp in _pendingAccepts)
-        {
-            if (kvp.Value.UserData == targetUserData)
-            {
-                toRemove = kvp.Key;
-                break;
-            }
-        }
-
-        if (toRemove.HasValue)
-        {
-            _acceptsSubmitted.Remove(toRemove.Value);
-            _pendingAccepts.Remove(toRemove.Value);
-        }
+        RemovePendingAccept(targetUserData);
 
         AddCompletion(userData, 0);
     }
@@ -503,7 +478,7 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         foreach (var kvp in _pendingAccepts)
         {
             var listenFd = kvp.Key;
-            if (_acceptsSubmitted.Contains(listenFd))
+            if (kvp.Value.Count == 0 || _acceptsSubmitted.Contains(listenFd))
             {
                 continue;
             }
@@ -674,10 +649,9 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
                     var listenFd = DecodeAcceptData(data);
                     _acceptsSubmitted.Remove(listenFd);
 
-                    if (_pendingAccepts.TryGetValue(listenFd, out var acceptOp))
+                    if (_pendingAccepts.TryGetValue(listenFd, out var queue))
                     {
-                        _pendingAccepts.Remove(listenFd);
-                        ExecuteAccept(ref acceptOp);
+                        ExecuteAccepts(queue);
                     }
                 }
                 else
@@ -748,26 +722,132 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         }
     }
 
-    private void ExecuteAccept(ref PendingOp op)
+    /// <summary>
+    /// Takes connections for the posted accepts, oldest first, until the backlog is empty.
+    /// The listener is edge-triggered, so stopping after one would leave the rest of a burst to
+    /// one connection per loop pass.
+    /// </summary>
+    private void ExecuteAccepts(AcceptQueue queue)
     {
-        var addrLen = op.Addr2 != 0 ? (int*)op.Addr2 : null;
-        var result = Syscalls.accept(op.Fd, op.Addr, addrLen);
-
-        if (result < 0)
+        // The completion ring does not check for overflow.
+        while (queue.Count > 0 && CompletionQueueCount < _cqEntries.Length)
         {
+            ref var op = ref queue.Peek();
+            var addrLen = op.Addr2 != 0 ? (int*)op.Addr2 : null;
+            var result = Syscalls.accept(op.Fd, op.Addr, addrLen);
+
+            if (result >= 0)
+            {
+                AddCompletion(op.UserData, result);
+                queue.Dequeue();
+                continue;
+            }
+
             var errno = Marshal.GetLastPInvokeError();
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                // No connection ready yet — re-queue the accept
-                _pendingAccepts[op.Fd] = op;
+                // Backlog drained; the remaining accepts stay posted.
                 return;
             }
 
+            // An error such as EMFILE repeats on every call; report it once per readiness event
+            // rather than failing every posted accept.
             AddCompletion(op.UserData, -errno);
+            queue.Dequeue();
+            return;
         }
-        else
+    }
+
+    private AcceptQueue GetAcceptQueue(int listenFd)
+    {
+        if (!_pendingAccepts.TryGetValue(listenFd, out var queue))
         {
-            AddCompletion(op.UserData, result);
+            queue = new AcceptQueue();
+            _pendingAccepts[listenFd] = queue;
+        }
+
+        return queue;
+    }
+
+    private void RemovePendingAccept(ulong userData)
+    {
+        foreach (var kvp in _pendingAccepts)
+        {
+            if (kvp.Value.Remove(userData))
+            {
+                if (kvp.Value.Count == 0)
+                {
+                    _acceptsSubmitted.Remove(kvp.Key);
+                }
+
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// FIFO of posted accepts for one listener. Grows to the number a consumer keeps posted and is
+    /// then reused, so posting and completing accepts does not allocate.
+    /// </summary>
+    private sealed class AcceptQueue
+    {
+        private PendingOp[] _ops = new PendingOp[4];
+        private int _head;
+
+        public int Count { get; private set; }
+
+        public void Enqueue(in PendingOp op)
+        {
+            if (Count == _ops.Length)
+            {
+                var grown = new PendingOp[_ops.Length * 2];
+                for (var i = 0; i < Count; i++)
+                {
+                    grown[i] = _ops[(_head + i) % _ops.Length];
+                }
+
+                _ops = grown;
+                _head = 0;
+            }
+
+            _ops[(_head + Count) % _ops.Length] = op;
+            Count++;
+        }
+
+        public ref PendingOp Peek() => ref _ops[_head];
+
+        public void Dequeue()
+        {
+            _head = (_head + 1) % _ops.Length;
+            Count--;
+        }
+
+        public void Clear()
+        {
+            _head = 0;
+            Count = 0;
+        }
+
+        /// <summary>Removes the first op posted with <paramref name="userData"/>, keeping order.</summary>
+        public bool Remove(ulong userData)
+        {
+            for (var i = 0; i < Count; i++)
+            {
+                if (_ops[(_head + i) % _ops.Length].UserData != userData)
+                {
+                    continue;
+                }
+
+                for (var j = i; j < Count - 1; j++)
+                {
+                    _ops[(_head + j) % _ops.Length] = _ops[(_head + j + 1) % _ops.Length];
+                }
+
+                Count--;
+                return true;
+            }
+
+            return false;
         }
     }
 
