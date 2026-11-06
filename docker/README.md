@@ -37,6 +37,14 @@ BACKEND_FLAG=--ioring docker compose -f docker/docker-compose.yml \
   --abort-on-container-exit --exit-code-from client
 ```
 
+Over IPv6 (the server binds `::` and the client dials its fixed address on an
+IPv6-enabled network; add the io_uring overlay and `BACKEND_FLAG=--ioring` for
+that backend):
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.ipv6.yml   up --build --abort-on-container-exit --exit-code-from client
+```
+
 Tear down between runs:
 
 ```bash

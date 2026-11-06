@@ -426,6 +426,9 @@ internal static unsafe class RIOInterop
     public static extern int bind(nint s, byte* name, int namelen);
 
     [DllImport("ws2_32.dll")]
+    public static extern int getsockname(nint s, byte* name, int* namelen);
+
+    [DllImport("ws2_32.dll")]
     public static extern int listen(nint s, int backlog);
 
     [DllImport("ws2_32.dll")]

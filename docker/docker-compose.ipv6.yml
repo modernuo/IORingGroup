@@ -1,0 +1,30 @@
+# Overlay: run the ping-pong echo test over IPv6 between containers. The server
+# binds "::" (v6-only) and the client connects to the server's fixed IPv6
+# address, so a pass proves the IPv6 listener and accept path end to end.
+# Combine with docker-compose.iouring.yml (BACKEND_FLAG=--ioring) for io_uring.
+services:
+  server:
+    command: ["/app/server/TestServer", "${BACKEND_FLAG:---epoll}", "--quiet", "--bind", "::"]
+    networks:
+      ionet:
+        ipv6_address: fd00:10::10
+
+  client:
+    command:
+      - "/app/client/TestClient"
+      - "--host"
+      - "fd00:10::10"
+      - "--port"
+      - "5000"
+      - "--benchmark"
+      - "${MESSAGES:-1000}"
+      - "--connections"
+      - "${CONNECTIONS:-50}"
+      - "--pingpong"
+
+networks:
+  ionet:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:10::/64

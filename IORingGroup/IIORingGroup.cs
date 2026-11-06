@@ -143,8 +143,9 @@ public interface IIORingGroup : IDisposable
     /// Creates a listening socket bound to the specified address and port.
     /// </summary>
     /// <param name="bindAddress">
-    /// Dotted-quad IPv4 address to bind to ("0.0.0.0", null or empty for all interfaces).
-    /// Host names and shorthand forms such as "127.1" are rejected.
+    /// IP address to bind to: a dotted-quad IPv4 address ("0.0.0.0", null or empty for all IPv4
+    /// interfaces) or an IPv6 address, optionally bracketed ("::", "[::1]", "fe80::1%3").
+    /// Host names, ports and shorthand forms such as "127.1" are rejected.
     /// </param>
     /// <param name="port">Port number to listen on.</param>
     /// <param name="backlog">Maximum pending connections queue length.</param>
@@ -155,9 +156,29 @@ public interface IIORingGroup : IDisposable
     /// - TCP_NODELAY (Nagle disabled)
     /// - SO_REUSEADDR enabled (allows bind over TIME_WAIT sockets)
     /// - SO_LINGER disabled
+    /// - IPV6_V6ONLY enabled for IPv6 addresses, so "0.0.0.0" and "::" on one port can coexist
+    ///   on every platform; use <see cref="CreateListener(string, ushort, int, bool)"/> for one
+    ///   socket that accepts both
     /// On Windows RIO, the socket includes WSA_FLAG_REGISTERED_IO for AcceptEx compatibility.
     /// </remarks>
     nint CreateListener(string bindAddress, ushort port, int backlog);
+
+    /// <summary>
+    /// Creates a listening socket, optionally accepting IPv4 clients on an IPv6 address.
+    /// </summary>
+    /// <param name="bindAddress">As for <see cref="CreateListener(string, ushort, int)"/>.</param>
+    /// <param name="port">Port number to listen on.</param>
+    /// <param name="backlog">Maximum pending connections queue length.</param>
+    /// <param name="dualMode">
+    /// For an IPv6 address, clears IPV6_V6ONLY so "::" also accepts IPv4 clients, which then
+    /// appear as IPv4-mapped addresses (::ffff:a.b.c.d). Ignored for IPv4 addresses.
+    /// </param>
+    /// <returns>Listener socket handle on success, -1 on failure or an unparseable address.</returns>
+    /// <remarks>
+    /// The default serves implementations outside this package, which can only refuse dual mode.
+    /// </remarks>
+    nint CreateListener(string bindAddress, ushort port, int backlog, bool dualMode) =>
+        dualMode ? -1 : CreateListener(bindAddress, port, backlog);
 
     /// <summary>
     /// Closes a listener socket created by <see cref="CreateListener"/>.

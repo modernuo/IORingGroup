@@ -526,7 +526,11 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     // =============================================================================
 
     /// <inheritdoc/>
-    public nint CreateListener(string bindAddress, ushort port, int backlog)
+    public nint CreateListener(string bindAddress, ushort port, int backlog) =>
+        CreateListener(bindAddress, port, backlog, dualMode: false);
+
+    /// <inheritdoc/>
+    public nint CreateListener(string bindAddress, ushort port, int backlog, bool dualMode)
     {
         if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Linux, out var addr))
         {
@@ -556,6 +560,17 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         // Disable SO_LINGER
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
+
+        // Explicit either way: the OS default differs (Linux usually 0, Windows and BSD 1).
+        if (addr.IsIPv6)
+        {
+            var v6Only = dualMode ? 0 : 1;
+            if (LinuxIORing.setsockopt(fd, SocketAddressLayout.IPPROTO_IPV6, SocketAddressLayout.Linux.Ipv6V6Only, (nint)(&v6Only), sizeof(int)) < 0)
+            {
+                LinuxIORing.close(fd);
+                return -1;
+            }
+        }
 
         fixed (byte* sa = addr.Bytes)
         {
