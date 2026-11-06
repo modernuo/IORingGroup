@@ -821,10 +821,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         var linger = new linger { l_onoff = 0, l_linger = 0 };
         Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
 
-        if (Darwin.bind(fd, (nint)addr.Data, addr.Length) < 0)
+        fixed (byte* sa = addr.Bytes)
         {
-            Darwin.close(fd);
-            return -1;
+            if (Darwin.bind(fd, (nint)sa, addr.Bytes.Length) < 0)
+            {
+                Darwin.close(fd);
+                return -1;
+            }
         }
 
         if (Darwin.listen(fd, backlog) < 0)

@@ -1070,10 +1070,13 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         var mode = 1u;
         ioctlsocket(listener, FIONBIO, &mode);
 
-        if (bind(listener, addr.Data, addr.Length) == SOCKET_ERROR)
+        fixed (byte* sa = addr.Bytes)
         {
-            closesocket(listener);
-            return -1;
+            if (bind(listener, sa, addr.Bytes.Length) == SOCKET_ERROR)
+            {
+                closesocket(listener);
+                return -1;
+            }
         }
 
         if (listen(listener, backlog) == SOCKET_ERROR)

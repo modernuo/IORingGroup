@@ -37,23 +37,14 @@ public class NativeSocketAddressTests
     }
 
     [Fact]
-    public unsafe void TryCreate_Linux_EncodesSockaddrIn()
+    public void TryCreate_EncodesPortAndAddress()
     {
         Assert.True(NativeSocketAddress.TryCreate("127.0.0.1", 2593, SocketAddressLayout.Linux, out var addr));
 
-        Assert.Equal(16, addr.Length);
-        Assert.Equal(2, addr.Family);
-        byte[] expected = [0x02, 0x00, 0x0A, 0x21, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
-        Assert.Equal(expected, new ReadOnlySpan<byte>(addr.Data, addr.Length).ToArray());
-    }
-
-    [Fact]
-    public unsafe void TryCreate_Bsd_PrefixesLength()
-    {
-        Assert.True(NativeSocketAddress.TryCreate("10.1.2.3", 80, SocketAddressLayout.Bsd, out var addr));
-
-        byte[] expected = [16, 0x02, 0x00, 0x50, 10, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0];
-        Assert.Equal(expected, new ReadOnlySpan<byte>(addr.Data, addr.Length).ToArray());
+        // Family bytes differ by platform; port and address sit at the same offsets everywhere.
+        Assert.Equal(16, addr.Bytes.Length);
+        byte[] expected = [0x0A, 0x21, 127, 0, 0, 1];
+        Assert.Equal(expected, addr.Bytes.Slice(2, 6).ToArray());
     }
 
     [Fact]

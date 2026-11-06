@@ -1046,10 +1046,13 @@ public sealed unsafe partial class LinuxEpollGroup : IIORingGroup
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         Syscalls.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(LingerOption));
 
-        if (Syscalls.bind(fd, (nint)addr.Data, addr.Length) < 0)
+        fixed (byte* sa = addr.Bytes)
         {
-            Syscalls.close(fd);
-            return -1;
+            if (Syscalls.bind(fd, (nint)sa, addr.Bytes.Length) < 0)
+            {
+                Syscalls.close(fd);
+                return -1;
+            }
         }
 
         if (Syscalls.listen(fd, backlog) < 0)

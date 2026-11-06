@@ -1,54 +1,46 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 
 namespace System.Network;
 
 /// <summary>
-/// Address family numbers and sockaddr layout of one platform's socket API.
+/// Address family numbers of one platform's socket API.
 /// </summary>
 internal readonly struct SocketAddressLayout
 {
     /// <summary>AF_INET.</summary>
     public readonly int InterNetwork;
 
-    /// <summary>BSD-derived systems prefix sockaddr with a length byte and use a one-byte family.</summary>
-    public readonly bool LengthPrefixed;
+    private SocketAddressLayout(int interNetwork) => InterNetwork = interNetwork;
 
-    private SocketAddressLayout(int interNetwork, bool lengthPrefixed)
-    {
-        InterNetwork = interNetwork;
-        LengthPrefixed = lengthPrefixed;
-    }
+    public static SocketAddressLayout Windows => new(2);
 
-    public static SocketAddressLayout Windows => new(2, false);
+    public static SocketAddressLayout Linux => new(2);
 
-    public static SocketAddressLayout Linux => new(2, false);
-
-    public static SocketAddressLayout Bsd => new(2, true);
+    public static SocketAddressLayout Bsd => new(2);
 }
 
 /// <summary>
-/// A listener's bind address encoded as a native sockaddr.
+/// A listener's bind address as a native sockaddr.
 /// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal unsafe struct NativeSocketAddress
+internal readonly struct NativeSocketAddress
 {
-    /// <summary>sizeof(sockaddr_in).</summary>
-    public const int MaxLength = 16;
-
-    /// <summary>The sockaddr bytes; pass <c>Data</c> and <see cref="Length"/> to bind.</summary>
-    public fixed byte Data[MaxLength];
-
-    /// <summary>Bytes of <see cref="Data"/> in use.</summary>
-    public int Length;
+    private readonly SocketAddress _socketAddress;
 
     /// <summary>Address family to create the socket with.</summary>
-    public int Family;
+    public int Family { get; }
+
+    private NativeSocketAddress(SocketAddress socketAddress, int family)
+    {
+        _socketAddress = socketAddress;
+        Family = family;
+    }
+
+    /// <summary>The sockaddr bytes to pass to bind.</summary>
+    public ReadOnlySpan<byte> Bytes => _socketAddress.Buffer.Span[.._socketAddress.Size];
 
     /// <summary>
     /// Parses a bind address. Null or empty means every IPv4 interface.
@@ -68,7 +60,7 @@ internal unsafe struct NativeSocketAddress
 
         if (!IPAddress.TryParse(bindAddress, out var parsed) ||
             parsed.AddressFamily != AddressFamily.InterNetwork ||
-            parsed.ToString() != bindAddress)
+            !IsCanonical(parsed, bindAddress))
         {
             address = IPAddress.None;
             return false;
@@ -84,34 +76,22 @@ internal unsafe struct NativeSocketAddress
     /// <returns>False when the address is not one <see cref="TryParseBindAddress"/> accepts.</returns>
     public static bool TryCreate(string? bindAddress, ushort port, in SocketAddressLayout layout, out NativeSocketAddress result)
     {
-        result = default;
         if (!TryParseBindAddress(bindAddress, out var address))
         {
+            result = default;
             return false;
         }
 
-        var bytes = MemoryMarshal.CreateSpan(ref result.Data[0], MaxLength);
-
-        // sockaddr_in: family(2) port(2) addr(4) zero(8); BSD splits family into len(1) family(1).
-        result.Length = 16;
-        result.Family = layout.InterNetwork;
-        WriteFamily(bytes, layout, result.Length, result.Family);
-        BinaryPrimitives.WriteUInt16BigEndian(bytes[2..], port);
-        address.TryWriteBytes(bytes.Slice(4, 4), out _);
+        // Serialize() writes the running platform's own sockaddr layout: native family number,
+        // and on BSD the sin_len byte.
+        result = new NativeSocketAddress(new IPEndPoint(address, port).Serialize(), layout.InterNetwork);
         return true;
     }
 
-    private static void WriteFamily(Span<byte> bytes, in SocketAddressLayout layout, int length, int family)
+    // The round trip rejects every non-canonical spelling IPAddress.TryParse still accepts.
+    private static bool IsCanonical(IPAddress address, string text)
     {
-        if (layout.LengthPrefixed)
-        {
-            bytes[0] = (byte)length;
-            bytes[1] = (byte)family;
-        }
-        else
-        {
-            // sa_family_t is a host-order 16-bit field.
-            MemoryMarshal.Write(bytes, (ushort)family);
-        }
+        Span<char> formatted = stackalloc char[15]; // "255.255.255.255"
+        return address.TryFormat(formatted, out var written) && formatted[..written].SequenceEqual(text);
     }
 }

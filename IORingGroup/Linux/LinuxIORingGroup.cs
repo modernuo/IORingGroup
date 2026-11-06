@@ -557,10 +557,13 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
 
-        if (LinuxIORing.bind(fd, (nint)addr.Data, addr.Length) < 0)
+        fixed (byte* sa = addr.Bytes)
         {
-            LinuxIORing.close(fd);
-            return -1;
+            if (LinuxIORing.bind(fd, (nint)sa, addr.Bytes.Length) < 0)
+            {
+                LinuxIORing.close(fd);
+                return -1;
+            }
         }
 
         if (LinuxIORing.listen(fd, backlog) < 0)
