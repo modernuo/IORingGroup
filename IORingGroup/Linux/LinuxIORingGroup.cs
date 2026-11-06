@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Buffers.Binary;
 using System.Network.Linux;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -529,9 +528,14 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
+        if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Linux, out var addr))
+        {
+            return -1;
+        }
+
         // Create non-blocking TCP socket
         var fd = LinuxIORing.socket(
-            LinuxIORing.AF_INET,
+            addr.Family,
             LinuxIORing.SOCK_STREAM | LinuxIORing.SOCK_NONBLOCK,
             LinuxIORing.IPPROTO_TCP
         );
@@ -553,18 +557,13 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
         var linger = new LingerOption { OnOff = 0, Seconds = 0 };
         LinuxIORing.setsockopt(fd, LinuxIORing.SOL_SOCKET, LinuxIORing.SO_LINGER, (nint)(&linger), sizeof(LingerOption));
 
-        // Parse and bind address
-        var addr = new sockaddr_in
+        fixed (byte* sa = addr.Bytes)
         {
-            sin_family = LinuxIORing.AF_INET,
-            sin_port = BinaryPrimitives.ReverseEndianness(port),
-            sin_addr = ParseIPv4(bindAddress)
-        };
-
-        if (LinuxIORing.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
-        {
-            LinuxIORing.close(fd);
-            return -1;
+            if (LinuxIORing.bind(fd, (nint)sa, addr.Bytes.Length) < 0)
+            {
+                LinuxIORing.close(fd);
+                return -1;
+            }
         }
 
         if (LinuxIORing.listen(fd, backlog) < 0)
@@ -749,36 +748,6 @@ public sealed unsafe class LinuxIORingGroup : IIORingGroup
     /// Gets the number of registered external buffers.
     /// </summary>
     public int ExternalBufferCount => _externalBufferCount;
-
-    private static uint ParseIPv4(string address)
-    {
-        if (address == "0.0.0.0")
-        {
-            return 0; // INADDR_ANY
-        }
-
-        var parts = address.Split('.');
-        if (parts.Length != 4)
-        {
-            return 0;
-        }
-
-        return (uint)(
-            byte.Parse(parts[0]) |
-            (byte.Parse(parts[1]) << 8) |
-            (byte.Parse(parts[2]) << 16) |
-            (byte.Parse(parts[3]) << 24)
-        );
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct sockaddr_in
-    {
-        public ushort sin_family;
-        public ushort sin_port;
-        public uint sin_addr;
-        public ulong sin_zero;
-    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LingerOption

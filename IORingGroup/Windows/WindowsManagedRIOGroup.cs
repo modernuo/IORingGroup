@@ -1048,10 +1048,15 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
     /// <inheritdoc/>
     public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
+        if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Windows, out var addr))
+        {
+            return -1;
+        }
+
         EnsureWinsockInitialized();
 
         // Listener MUST have WSA_FLAG_REGISTERED_IO for AcceptEx sockets to work with RIO
-        var listener = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, null, 0, WSA_FLAG_REGISTERED_IO);
+        var listener = WSASocketW(addr.Family, SOCK_STREAM, IPPROTO_TCP, null, 0, WSA_FLAG_REGISTERED_IO);
         if (listener == INVALID_SOCKET)
         {
             return -1;
@@ -1065,28 +1070,13 @@ public sealed unsafe class WindowsManagedRIOGroup : IIORingGroup
         var mode = 1u;
         ioctlsocket(listener, FIONBIO, &mode);
 
-        // Bind
-        var addr = new sockaddr_in
+        fixed (byte* sa = addr.Bytes)
         {
-            sin_family = AF_INET,
-            sin_port = htons(port)
-        };
-
-        if (!string.IsNullOrEmpty(bindAddress) && bindAddress != "0.0.0.0")
-        {
-            uint addrVal;
-            if (inet_pton(AF_INET, bindAddress, &addrVal) != 1)
+            if (bind(listener, sa, addr.Bytes.Length) == SOCKET_ERROR)
             {
                 closesocket(listener);
                 return -1;
             }
-            addr.sin_addr = addrVal;
-        }
-
-        if (bind(listener, &addr, sizeof(sockaddr_in)) == SOCKET_ERROR)
-        {
-            closesocket(listener);
-            return -1;
         }
 
         if (listen(listener, backlog) == SOCKET_ERROR)

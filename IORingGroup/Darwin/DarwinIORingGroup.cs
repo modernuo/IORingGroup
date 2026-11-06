@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, ModernUO
 
-using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -791,8 +790,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// <inheritdoc/>
     public nint CreateListener(string bindAddress, ushort port, int backlog)
     {
+        if (!NativeSocketAddress.TryCreate(bindAddress, port, SocketAddressLayout.Bsd, out var addr))
+        {
+            return -1;
+        }
+
         // Create TCP socket
-        var fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        var fd = Darwin.socket(addr.Family, SOCK_STREAM, IPPROTO_TCP);
         if (fd < 0)
         {
             return -1;
@@ -817,19 +821,13 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
         var linger = new linger { l_onoff = 0, l_linger = 0 };
         Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, (nint)(&linger), sizeof(linger));
 
-        // Parse and bind address
-        var addr = new sockaddr_in
+        fixed (byte* sa = addr.Bytes)
         {
-            sin_len = (byte)sizeof(sockaddr_in),
-            sin_family = AF_INET,
-            sin_port = BinaryPrimitives.ReverseEndianness(port),
-            sin_addr = ParseIPv4(bindAddress)
-        };
-
-        if (Darwin.bind(fd, (nint)(&addr), sizeof(sockaddr_in)) < 0)
-        {
-            Darwin.close(fd);
-            return -1;
+            if (Darwin.bind(fd, (nint)sa, addr.Bytes.Length) < 0)
+            {
+                Darwin.close(fd);
+                return -1;
+            }
         }
 
         if (Darwin.listen(fd, backlog) < 0)
@@ -1047,29 +1045,7 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     /// </summary>
     public int ExternalBufferCount => _externalBufferCount;
 
-    private static uint ParseIPv4(string address)
-    {
-        if (address == "0.0.0.0")
-        {
-            return 0; // INADDR_ANY
-        }
-
-        var parts = address.Split('.');
-        if (parts.Length != 4)
-        {
-            return 0;
-        }
-
-        return (uint)(
-            byte.Parse(parts[0]) |
-            (byte.Parse(parts[1]) << 8) |
-            (byte.Parse(parts[2]) << 16) |
-            (byte.Parse(parts[3]) << 24)
-        );
-    }
-
     // Socket constants for macOS/BSD
-    private const int AF_INET = 2;
     private const int SOCK_STREAM = 1;
     private const int IPPROTO_TCP = 6;
     private const int SOL_SOCKET = 0xFFFF;
@@ -1085,16 +1061,6 @@ public sealed unsafe partial class DarwinIORingGroup : IIORingGroup
     private const int EINPROGRESS = 36;
     private const int EINTR = 4;
     private const int ECANCELED = 89;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct sockaddr_in
-    {
-        public byte sin_len;
-        public byte sin_family;
-        public ushort sin_port;
-        public uint sin_addr;
-        public ulong sin_zero;
-    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct linger

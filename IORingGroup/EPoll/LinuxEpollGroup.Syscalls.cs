@@ -12,7 +12,6 @@ public sealed unsafe partial class LinuxEpollGroup
     private const int EFD_NONBLOCK = 0x800;
 
     // Socket constants (duplicated from LinuxIORing for backend independence)
-    private const int AF_INET = 2;
     private const int SOCK_STREAM = 1;
     private const int SOCK_NONBLOCK = 0x800;
     private const int IPPROTO_TCP = 6;
@@ -85,15 +84,6 @@ public sealed unsafe partial class LinuxEpollGroup
 
         [LibraryImport("libc", SetLastError = true)]
         public static partial long write(int fd, nint buf, nuint count);
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct sockaddr_in
-    {
-        public ushort sin_family;
-        public ushort sin_port;
-        public uint sin_addr;
-        public ulong sin_zero;
     }
 
     [StructLayout(LayoutKind.Sequential)]
